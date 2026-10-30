@@ -696,7 +696,11 @@ fn build_rocm_kernels() {
             )
         })
         .collect();
-    let separate_files: Vec<PathBuf> = glob_paths("kernels/cuda/ffi_supra.cu");
+    // accum_tu.cu: stepAccum's call graph force-inlined in its own TU, as on CUDA (Step 1b).
+    let separate_files: Vec<PathBuf> = ["kernels/cuda/ffi_supra.cu", "kernels/cuda/accum_tu.cu"]
+        .iter()
+        .flat_map(|p| glob_paths(p))
+        .collect();
 
     let amalg_path = out_dir.join("remaining_kernels_rocm.cu");
     let mut amalg = String::new();
@@ -730,6 +734,14 @@ fn build_rocm_kernels() {
         "-I",
         kernel_dir_str,
     ];
+    // witgen.h's non-virtual buffer objects (one indirect call less per witness access) on
+    // Linux; Windows builds, and RISC0_HIP_WITGEN_VIRTUAL=1, keep the virtual ones.
+    println!("cargo:rerun-if-env-changed=RISC0_HIP_WITGEN_VIRTUAL");
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows")
+        && env::var("RISC0_HIP_WITGEN_VIRTUAL").as_deref() != Ok("1")
+    {
+        local_flags.push("-DRISC0_HIP_DIRECT_BUFS");
+    }
     local_flags.extend(risc0_build_kernel::hip_host_flags());
     let local_sources_key = risc0_build_kernel::kernel_sources_key(
         &[
@@ -769,7 +781,7 @@ fn build_rocm_kernels() {
         },
     );
 
-    // Compile ffi_supra.cu separately (uses sppark types, can't be in same TU)
+    // Compile ffi_supra.cu (uses sppark types, can't be in same TU) and accum_tu.cu separately.
     // Also cached
     let mut all_objs = vec![eval_check_obj.clone(), remaining_obj];
     for cu in &separate_files {

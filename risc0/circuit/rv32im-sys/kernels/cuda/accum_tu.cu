@@ -3,8 +3,14 @@
 // The step_TopAccum call graph only, renamed (_A) and force-inlined, compiled as a
 // whole-program TU (not -dc).
 #define RISC0_ROWS_POW2 1
+// ROCm: stepAccum reads no row another thread writes (witgen.h, buffers.h).
+#define RISC0_HIP_ROWS_PRIVATE 1
 #include "witgen.h"
+#ifdef __HIPCC__
+#include <hip/hip_runtime.h>
+#else
 #include <cuda_runtime.h>
+#endif
 
 namespace risc0::circuit::rv32im_v2::cuda {
 static __device__ __forceinline__ NondetRegStruct back_NondetReg_A(ExecContext& ctx,

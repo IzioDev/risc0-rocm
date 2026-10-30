@@ -66,8 +66,8 @@ static const auto rv32imEventSynchronize = cudaEventSynchronize;
 #include <cub/device/device_scan.cuh>
 #endif
 
-#ifndef __HIPCC__
 void risc0_rv32im_launch_stepAccumTU(unsigned, unsigned, cudaStream_t, void*, uint32_t, const uint32_t*);
+#ifndef __HIPCC__
 void risc0_rv32im_launch_par_stepExecTU(unsigned, unsigned, cudaStream_t, void*, uint32_t, uint32_t);
 #endif
 static bool g_verbose = (std::getenv("RISC0_VERBOSE") != nullptr);
@@ -765,6 +765,16 @@ static bool envOn(const char* name) {
   return !(e && e[0] == '0');
 }
 
+// ROCm: stepAccum from accum_tu.cu (as on CUDA, plus non-virtual buffer objects and accesses
+// without compiler barriers; see witgen.h) unless RISC0_HIP_ACCUM_TU=0, which runs steps.cu's
+// stepAccum.
+#ifdef __HIPCC__
+static bool accumTu() {
+  static const bool on = envOn("RISC0_HIP_ACCUM_TU");
+  return on;
+}
+#endif
+
 // witgen_tu.cu (par_stepExec's call graph in a standalone noinline TU): on unless
 // RISC0_CUDA_WITGEN_TU=0.
 static bool witgenTu() {
@@ -1165,18 +1175,20 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
         perm = vals.Current();
       }
 #endif
-#ifndef __HIPCC__
       // accum_tu.cu: the stepAccum call graph force-inlined in a whole-program TU (no ABI
       // calls or stack-resident buffer objects), the only accum step CUDA builds carry (see
       // accum_tu_gen.py). It needs power-of-two rows (RISC0_ROWS_POW2): rows = 2^po2.
       auto pow2 = [](size_t r) { return r && (r & (r - 1)) == 0; };
+#ifdef __HIPCC__
+      if (!accumTu() || !pow2(buffers->data.rows) || !pow2(buffers->accum.rows)) {
+        stepAccum<<<cfg.grid, cfg.block, 0, stream>>>(d_ctx, lastCycle, perm);
+      } else
+#else
       if (!pow2(buffers->data.rows) || !pow2(buffers->accum.rows)) {
         throw std::runtime_error("rv32im accum: rows must be a power of two");
       }
-      risc0_rv32im_launch_stepAccumTU(cfg.grid.x, cfg.block.x, stream, d_ctx, lastCycle, perm);
-#else
-      stepAccum<<<cfg.grid, cfg.block, 0, stream>>>(d_ctx, lastCycle, perm);
 #endif
+      risc0_rv32im_launch_stepAccumTU(cfg.grid.x, cfg.block.x, stream, d_ctx, lastCycle, perm);
 
       size_t rows = buffers->accum.rows;
 #ifdef __HIPCC__
@@ -1255,6 +1267,7 @@ const char* risc0_circuit_rv32im_cuda_warmup() {
     par_stepExec<<<1, 1, 0, stream>>>(nullptr, 0, 0);
 #ifdef __HIPCC__
     stepAccum<<<1, 1, 0, stream>>>(nullptr, 0);
+    risc0_rv32im_launch_stepAccumTU(1, 1, stream, nullptr, 0, nullptr);
     finalizeZeroizeAccum<<<1, 1, 0, stream>>>(nullptr, 0);
 #endif
     injectCycleCols<<<1, 1, 0, stream>>>(nullptr, nullptr, 0, 0, 0, 0, 0, 0, 0);

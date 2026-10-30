@@ -24,7 +24,7 @@ struct Buffer {
   size_t cols;
   bool checked;  // retained for FFI layout compatibility
 
-#ifdef __HIPCC__
+#if defined(__HIPCC__) && !defined(RISC0_HIP_ROWS_PRIVATE)
   // HIP/AMDGPU: compiler barrier prevents reordering/coalescing of cross-row
   // reads/writes. The SHA2 precompile does back-references at distance 68;
   // without barriers hip-clang at -O2+ can reorder loads that produce a
@@ -38,6 +38,17 @@ struct Buffer {
     Fp v = buf[col * rows + row];
     asm volatile("" ::: "memory");
     return v;
+  }
+#elif defined(__HIP_DEVICE_COMPILE__)
+  // RISC0_HIP_ROWS_PRIVATE (no row is written by another thread of the launch): no barriers,
+  // and global rather than FLAT accesses (the generic pointer made every load FLAT, which also
+  // waits on the LDS counter).
+  __device__ void set(size_t row, size_t col, Fp val) {
+    ((__attribute__((address_space(1))) uint32_t*)(uint32_t*)buf)[col * rows + row] = val.asRaw();
+  }
+  __device__ Fp get(size_t row, size_t col) {
+    return Fp::fromRaw(
+        ((const __attribute__((address_space(1))) uint32_t*)(const uint32_t*)buf)[col * rows + row]);
   }
 #else
   __device__ void set(size_t row, size_t col, Fp val) {
