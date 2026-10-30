@@ -138,7 +138,9 @@ struct FpExt {
   // representations, and then reduce module x^4 - B, which means powers >= 4 get shifted back 4 and
   // multiplied by -beta.  We could write this as a double loops with some if's and hope it gets
   // unrolled properly, but it's small enough to just hand write.
-#if defined(__CUDA_ARCH__) && defined(EF_EXT_LAZY)
+// EF_EXT_LAZY on ROCm too (eval_check_ef_hip.cu): 219 vs 226 ms per po2 20 eval_check on
+// gfx1100, 265 vs 271 ms on gfx1201.
+#if (defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)) && defined(EF_EXT_LAZY)
   // Inlined: as an out-of-line call (IGC's default for this size) every call
   // passed operands through private memory and drained the pipeline; that
   // calling convention, not the arithmetic, dominated the Intel eval_check.
@@ -151,7 +153,7 @@ struct FpExt {
 #endif
 #endif
   constexpr FpExt operator*(FpExt rhs) const {
-#if defined(__CUDA_ARCH__) && defined(EF_EXT_LAZY)
+#if (defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)) && defined(EF_EXT_LAZY)
     // Lazy reduction: fold NBETA into b (3 Montgomery muls), then each output
     // coefficient is a 4-term dot product of raw Montgomery values summed
     // exactly in 64 bits (as 32-bit lo/hi words with explicit carries; IGC

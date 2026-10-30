@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Regenerate kernels/cuda/eval_check_ef.cu from the generated circuit.
+"""Regenerate kernels/cuda/eval_check_ef.cu (CUDA) and eval_check_ef_hip.cu (ROCm)
+from the generated circuit.
 
 usage: regen.py [--check]
 
@@ -46,9 +47,13 @@ Each pass prints what it did; EXPECT pins those lines, so a change in the
 circuit or a pass that changes the shape of the kernel fails here first: re-run
 the bit-exactness battery on the new kernel before updating the pins.
 
-The result is committed, so the CUDA build needs no Python. Re-run this after
+The ROCm kernel, eval_check_ef_hip.cu, is the chain's output after
+HIP_LAST (remat_lu.py) in to_hip.py's HIP forms: mksm2.py's shared-memory
+words cap the occupancy on RDNA, and mksub.py's splits only add calls there.
+
+The results are committed, so the GPU builds need no Python. Re-run this after
 changing the generated circuit (kernels/cxx/rust_poly_fp_*.cpp) or any of the
-passes; --check (run in CI) fails if the committed file is out of date.
+passes; --check (run in CI) fails if a committed file is out of date.
 """
 
 import difflib
@@ -57,9 +62,15 @@ import subprocess
 import sys
 import tempfile
 
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import to_hip  # noqa: E402
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SYS = os.path.normpath(os.path.join(HERE, '..', '..', '..'))  # rv32im-sys
 OUT = os.path.join(SYS, 'kernels', 'cuda', 'eval_check_ef.cu')
+OUT_HIP = os.path.join(SYS, 'kernels', 'cuda', 'eval_check_ef_hip.cu')
+HIP_LAST = 'remat_lu.py'
 NS = 'namespace risc0::circuit::rv32im_v2 {'
 
 # mksub.py cut points: function, body lines, cut line, live values passed to the tail (+ input
@@ -113,6 +124,18 @@ POST_HEADER = '''//
 // (remat_lu.py), the per-phase 64 hottest slab words in shared memory
 // (mksm2.py) and every chain function split in two at its narrowest point
 // (mksub.py). The rematerialisation relies on data, accum and mix being
+// read-only for the whole kernel.
+'''
+HIP_POST_HEADER = '''//
+// ROCm build (kernels/cuda/evalfast/regen.py): the CUDA post-passes through
+// remat_lu.py (remat, lazyfp, close and linkext with the C++ 64-bit
+// multiply-adds, accfirst_cuda, the mksplit2 phase split, remat_lu), without
+// mksm2.py's shared-memory slab words, which cap the occupancy on RDNA, or
+// mksub.py's splits, in to_hip.py's HIP forms, with ef_fpext.h's lazy FpExt
+// multiply. At po2 20 with 64-wide waves and EF_MINB 4 (build.rs): 214 ms on an
+// RX 7900 XTX (gfx1100) and 255 ms on an RX 9070 XT (gfx1201), against 326 and
+// 454 ms for the previous ROCm kernel (the generator's output before its CUDA
+// post-passes). The rematerialisation relies on data, accum and mix being
 // read-only for the whole kernel.
 '''
 HEADER_END = '// kernel happens to tolerate them.\n'
@@ -179,30 +202,43 @@ def main():
                     sys.exit('regen: EXPECT failed: %s did not print\n  %s\nit printed:\n%s'
                              % (tool, line, log))
             gen = nxt
+            if tool == HIP_LAST:
+                with open(gen, newline='') as f:
+                    hip = f.read()
         with open(gen, newline='') as f:
             new = f.read()
-    assert new.count(HEADER_END) == 1
-    new = new.replace(HEADER_END, HEADER_END + POST_HEADER)
-    bad = [i + 1 for i, l in enumerate(new.split('\n')) if l != l.rstrip()]
-    if bad:
-        sys.exit('regen: trailing whitespace on %d generated lines (first: %d)' % (len(bad), bad[0]))
-    try:
-        with open(OUT, newline='') as f:
-            old = f.read()
-    except FileNotFoundError:
-        old = ''
-    if check:
-        if old != new:
-            diff = difflib.unified_diff(old.splitlines(True), new.splitlines(True),
-                                        'committed/eval_check_ef.cu', 'regenerated/eval_check_ef.cu')
-            sys.stdout.writelines(list(diff)[:200])
-            sys.exit('regen: kernels/cuda/eval_check_ef.cu is out of date; '
-                     'run kernels/cuda/evalfast/regen.py and commit the result')
-        print('regen: kernels/cuda/eval_check_ef.cu is up to date')
-    else:
-        with open(OUT, 'w', newline='') as f:
-            f.write(new)
-        print('regen: wrote %s' % OUT)
+    outputs = []
+    for path, text, post in ((OUT, new, POST_HEADER), (OUT_HIP, to_hip.convert(hip), HIP_POST_HEADER)):
+        assert text.count(HEADER_END) == 1
+        text = text.replace(HEADER_END, HEADER_END + post)
+        bad = [i + 1 for i, l in enumerate(text.split('\n')) if l != l.rstrip()]
+        if bad:
+            sys.exit('regen: trailing whitespace on %d generated lines of %s (first: %d)'
+                     % (len(bad), os.path.basename(path), bad[0]))
+        outputs.append((path, text))
+    stale = []
+    for path, text in outputs:
+        name = 'kernels/cuda/' + os.path.basename(path)
+        try:
+            with open(path, newline='') as f:
+                old = f.read()
+        except FileNotFoundError:
+            old = ''
+        if check:
+            if old != text:
+                diff = difflib.unified_diff(old.splitlines(True), text.splitlines(True),
+                                            'committed/' + name, 'regenerated/' + name)
+                sys.stdout.writelines(list(diff)[:200])
+                stale.append(name)
+            else:
+                print('regen: %s is up to date' % name)
+        else:
+            with open(path, 'w', newline='') as f:
+                f.write(text)
+            print('regen: wrote %s' % path)
+    if stale:
+        sys.exit('regen: %s out of date; run kernels/cuda/evalfast/regen.py and commit the result'
+                 % ' and '.join(stale))
 
 
 if __name__ == '__main__':

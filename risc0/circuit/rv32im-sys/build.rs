@@ -315,7 +315,7 @@ fn build_cuda_kernels() {
 
     // Step 1: Compile eval_check_ef.cu WITHOUT -dc (standalone mode). It is the
     // generated evalfast kernel (kernels/cuda/evalfast/regen.py); ROCm builds
-    // eval_check_ef_hip.cu, an earlier output of it. Standalone,
+    // eval_check_ef_hip.cu, its ROCm output. Standalone,
     // NVCC sees the whole poly_fp call chain in one translation unit; with -dc it would
     // compile relocatable code.
     //
@@ -551,8 +551,8 @@ fn build_rocm_kernels() {
 
     // Step 1: Compile eval_check standalone with hipcc: the evalfast kernel
     // (eval_check_ef_hip.cu, see its header) unless RISC0_HIP_EVAL_CHECK=combined selects the original
-    // eval_check_combined.cu. On an RX 9070 XT (gfx1201) evalfast needs 9.3 KB of scratch per
-    // lane against the original's 16.8 KB, and a po2 20 eval_check takes ~470 ms against 845 ms.
+    // eval_check_combined.cu. A po2 20 eval_check takes ~255 ms on an RX 9070 XT (gfx1201) against
+    // the original's 845 ms, and ~214 ms on an RX 7900 XTX (gfx1100).
     // For the original, -mllvm -amdgpu-early-inline-all=false prevents OOM on this large kernel
     // (21 functions, 2154 column reads).
     //
@@ -604,10 +604,11 @@ fn build_rocm_kernels() {
         "-Wno-unused-parameter",
     ];
     if evalfast {
-        // Measured on an RX 9070 XT at po2 20: 64-wide waves and an occupancy target of 4 blocks
-        // (EF_MINB, the launch bounds' minimum) take eval_check from 603 to ~470 ms. Not 8, the
-        // fastest (392 ms): ROCm 7.2 miscompiles that combination, and nearly every call after
-        // the first few returns wrong values (5, 6 and 10 were correct in 300 calls each).
+        // 64-wide waves and an occupancy target of 4 blocks (EF_MINB, the launch bounds' minimum):
+        // the fastest at po2 20 on both an RX 7900 XTX and an RX 9070 XT (3 and 5 within 2%,
+        // 32-wide waves 5-20% slower). On the previous kernel, ROCm 7.2 miscompiled EF_MINB 8:
+        // nearly every call after the first few returned wrong values (5, 6 and 10 were correct
+        // in 300 calls each).
         eval_check_flags.extend(["-mwavefrontsize64", "-DEF_MINB=4"]);
     } else {
         eval_check_flags.extend([
