@@ -1,6 +1,22 @@
 #include "ff/baby_bear.hpp"
 #include "ntt/ntt.cuh"
 
+#include <cstdlib>
+#include <cstring>
+
+#ifdef __HIPCC__
+#ifndef cudaErrorInvalidValue
+#define cudaErrorInvalidValue hipErrorInvalidValue
+#endif
+// ROCm: commit_coeffs_lde, the expand+NTT and the bit reversal run the batched kernels of ntt_x.cuh /
+// ntt_q.cuh (see hip_expand_ntt). RISC0_HIP_NTT=0 restores sppark's per-pass path. Read on every call
+// so that one process can run and compare both paths.
+static bool hip_fast_ntt() {
+  const char* e = std::getenv("RISC0_HIP_NTT");
+  return !(e && e[0] == '0');
+}
+#endif
+
 // Expose protected bit_rev from NTT base class
 struct NTT_helper : public NTT {
     using NTT::bit_rev;
@@ -305,6 +321,10 @@ sppark_batch_iNTT_zk_shift(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly
 #ifndef __HIPCC__
 static bool nttq_expand_ntt(const gpu_t& gpu, fr_t* d_out, fr_t* d_in, uint32_t lg,
                             uint32_t lg_blowup, uint32_t poly_count);
+#else
+static bool hip_expand_ntt(const gpu_t& gpu, fr_t* d_out, fr_t* d_in, uint32_t lg,
+                           uint32_t lg_blowup, uint32_t poly_count);
+static void hip_bit_reverse(const gpu_t& gpu, fr_t* d_inout, uint32_t lg, uint32_t poly_count);
 #endif
 
 extern "C" RustError::by_value
@@ -322,6 +342,11 @@ sppark_batch_expand_NTT(fr_t* d_out, fr_t* d_in,
   try {
 #ifndef __HIPCC__
     if (nttq_expand_ntt(gpu, d_out, d_in, lg_domain_size, lg_blowup, poly_count)) {
+      gpu.sync();
+      return RustError{cudaSuccess};
+    }
+#else
+    if (hip_fast_ntt() && hip_expand_ntt(gpu, d_out, d_in, lg_domain_size, lg_blowup, poly_count)) {
       gpu.sync();
       return RustError{cudaSuccess};
     }
@@ -369,6 +394,13 @@ sppark_batch_bit_reverse(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_c
   const gpu_t& gpu = select_gpu(-1);
 
   try {
+#ifdef __HIPCC__
+    if (hip_fast_ntt()) {
+      hip_bit_reverse(gpu, d_inout, lg_domain_size, poly_count);
+      gpu.sync();
+      return RustError{cudaSuccess};
+    }
+#endif
     for (uint32_t i = 0; i < poly_count; i++) {
       NTT_helper::bit_rev(&d_inout[i * domain_size], &d_inout[i * domain_size],
                           lg_domain_size, gpu);
@@ -385,8 +417,7 @@ sppark_batch_bit_reverse(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_c
   return RustError{cudaSuccess};
 }
 
-#ifndef __HIPCC__
-// Fused commit NTT and its batched helpers (ntt_x.cuh; CUDA only, untested on ROCm).
+// Fused commit NTT and its batched helpers (ntt_x.cuh, ntt_q.cuh).
 #include "ntt_x.cuh"
 
 // Two-pass LDE of bit-reversed coefficients (d_in is restored to bit-reversed order).
@@ -400,6 +431,33 @@ static bool nttq_expand_ntt(const gpu_t& gpu, fr_t* d_out, fr_t* d_in, uint32_t 
   return true;
 }
 
+#ifdef __HIPCC__
+// LDE of bit-reversed coefficients for the check group and FRI: the expand is folded into the
+// first CT pass (zero-padded input synthesized on load, trivial levels skipped), all columns in one
+// launch per pass. nttq's two-pass LDE (NTT_EXPAND=q in NTTQ_TUNE builds) is no faster at lg 20
+// and slower at the other sizes (opt-artifacts r0amd/ntt texp, chkexp).
+static bool hip_expand_ntt(const gpu_t& gpu, fr_t* d_out, fr_t* d_in, uint32_t lg,
+                           uint32_t lg_blowup, uint32_t poly_count) {
+  const uint32_t lg_ext = lg + lg_blowup;
+  if (lg < 4 || lg_ext > 23 || lg_blowup == 0 || lg_blowup >= 6)
+    return false;
+#ifdef NTTQ_TUNE
+  if (const char* e = std::getenv("NTT_EXPAND")) {
+    if (e[0] == 'b') return false;
+    if (e[0] == 'q') return nttq_expand_ntt(gpu, d_out, d_in, lg, lg_blowup, poly_count);
+  }
+#endif
+  const size_t n = (size_t)1 << lg, N = n << lg_blowup;
+  ct_x(gpu, poly_count, d_in, n, lg_blowup, d_out, N, (int)lg_ext, true);
+  return true;
+}
+
+static void hip_bit_reverse(const gpu_t& gpu, fr_t* d_inout, uint32_t lg, uint32_t poly_count) {
+  bitrev_batched(gpu, d_inout, lg, poly_count);
+}
+#endif
+
+#ifndef __HIPCC__
 // Batched iNTT + zk-shift: the per-column iNTTs, then one zk-shift kernel over all columns.
 extern "C" RustError::by_value
 sppark_batch_iNTT_zk_shift_fused(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_count) {
@@ -441,6 +499,8 @@ sppark_batch_bit_reverse_tiled(fr_t* d_inout, uint32_t lg_domain_size, uint32_t 
   return RustError{cudaSuccess};
 }
 
+#endif // __HIPCC__
+
 // Fused commit: d_coeffs = the natural-order zk-shifted coefficients of d_witness and
 // d_evaluated = their 2^lg_blowup LDE, in L2-sized column chunks. d_witness is unchanged.
 // Bit-exact with iNTT + zk-shift + expand + NTT + bit reversal for lg_domain_size 10..23.
@@ -461,4 +521,3 @@ sppark_commit_coeffs_lde(fr_t* d_coeffs, fr_t* d_evaluated, const fr_t* d_witnes
   }
   return RustError{cudaSuccess};
 }
-#endif // __HIPCC__

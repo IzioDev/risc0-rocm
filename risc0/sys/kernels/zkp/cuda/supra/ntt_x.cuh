@@ -451,6 +451,16 @@ static void ct_steps(int lg, int st[3], int& n) {
     else if (lg <= 18) { int s = lg/2; st[0] = s + lg%2; st[1] = s; n = 2; }
     else { int s = lg/3, rem = lg%3; st[0] = s; st[1] = s + (lg==29); st[2] = s + (lg==29 ? 1 : rem); n = 3; }
 }
+#ifdef __HIPCC__
+// RDNA4 (gfx12): the last CT pass, whose rows are 2^stage elements apart, runs at a third of the
+// other passes' bandwidth when it is long (lg 22: 7,7,8 = 12 + 12 + 40 ms for 211 columns on an
+// RX 9070 XT; 8,8,6 = 12 + 12 + 17 ms). Keep it short there; RDNA3 keeps sppark's split.
+static bool hip_is_gfx12(int dev) {
+    static int v[16] = {};
+    if (v[dev] == 0) v[dev] = std::strncmp(gpu_props(dev).gcnArchName, "gfx12", 5) == 0 ? 1 : 2;
+    return v[dev] == 1;
+}
+#endif
 static void gs_steps(int lg, int st[3], int& n) {
     if (lg <= 10) { st[0] = lg; n = 1; }
     else if (lg <= 18) { int s = lg/2; st[0] = s; st[1] = s + lg%2; n = 2; }
@@ -464,6 +474,12 @@ static void ct_x(const stream_t& s, unsigned cols, const fr_t* in, size_t in_str
     const auto& p = NTTParameters::all(false)[s];
     X_launcher L{p, s, cols, false};
     int st[3], n; ct_steps(lg, st, n);
+#ifdef __HIPCC__
+    if (n == 3 && hip_is_gfx12(s.id())) {
+        st[0] = st[1] = (lg + 2) / 3;
+        st[2] = lg - 2 * st[0];
+    }
+#endif
     int stage = 0;
     for (int i = 0; i < n; i++) {
         XArgs a{i == 0 ? in : out, out, i == 0 ? in_stride : out_stride, out_stride,

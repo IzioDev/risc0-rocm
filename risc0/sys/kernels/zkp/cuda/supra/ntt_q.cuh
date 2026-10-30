@@ -139,7 +139,6 @@ pass_k(const fr_t* __restrict__ in, fr_t* __restrict__ out, size_t ics, size_t o
                 }
             } else {
                 #pragma unroll
-                #pragma unroll
                 for (int m = 0; m < 16; m++) v[m] = src[(size_t)m * LP1 * S];
                 reg_dft<4>(v, r16);
             }
@@ -306,8 +305,17 @@ static void pass(cudaStream_t st, unsigned LOGL, unsigned TB, unsigned cols, con
                  const fr_t* lo = nullptr, const fr_t* hi = nullptr, fr_t scale = fr_t(1), unsigned flags = 0)
 {
 #define NTTQ_INST(LL, TT, MB) if (LOGL == LL && TB == TT) { launch<LL, TT, MODE, MB>(st, cols, in, out, ics, ocs, lgX, rows_in, LT, tw, lo, hi, scale, flags); return; }
+#ifndef __HIPCC__
     NTTQ_INST(8, 16, 4) NTTQ_INST(8, 32, 2) NTTQ_INST(9, 16, 2) NTTQ_INST(9, 32, 1)
     NTTQ_INST(9, 8, 3) NTTQ_INST(10, 8, 2) NTTQ_INST(11, 8, 1)
+#else
+    // Shared memory is capped at 64 KB per block: no (9, 32) or (11, 8); (11, 4) instead.
+    NTTQ_INST(8, 16, 4) NTTQ_INST(8, 32, 2) NTTQ_INST(9, 16, 2)
+    NTTQ_INST(9, 8, 3) NTTQ_INST(10, 8, 2) NTTQ_INST(11, 4, 1)
+#ifdef NTTQ_TUNE
+    NTTQ_INST(10, 4, 2) NTTQ_INST(8, 8, 4) NTTQ_INST(9, 4, 4)
+#endif
+#endif
 #undef NTTQ_INST
     throw cuda_error(cudaErrorInvalidValue, "nttq: no instance");
 }
@@ -347,6 +355,28 @@ static const Tables& tables(const gpu_t& gpu, unsigned lgN, unsigned lgLr, unsig
 // forward row line 2^FR (coset column 2^(lg-FR)), TB per pass, side streams, columns per forward
 // launch, columns per inverse chunk.
 struct Cfg { unsigned IR, FR, ITC, ITR, FTC, FTR, NS, CHF, CHI; };
+#ifdef __HIPCC__
+// ROCm schedule, measured on RX 7900 XTX (gfx1100) and RX 9070 XT (gfx1201) with 211 columns
+// (opt-artifacts r0amd/ntt sweep2): instances that fit 64 KB of shared memory, no side streams
+// (the forward chunk's T2 stays in the Infinity Cache).
+static Cfg cfg(unsigned lg) {
+#ifdef NTTQ_TUNE
+    if (const char* e = getenv("NTTQ_CFG")) {
+        Cfg c;
+        if (sscanf(e, "%u,%u,%u,%u,%u,%u,%u,%u,%u", &c.IR, &c.FR, &c.ITC, &c.ITR, &c.FTC, &c.FTR, &c.NS, &c.CHF, &c.CHI) == 9)
+            return c;
+    }
+#endif
+    switch (lg) {
+    case 16: return Cfg{8, 8, 32, 32, 32, 32, 0, 32, 32};
+    case 17: return Cfg{8, 9, 16, 32, 32, 16, 0, 16, 16};
+    case 18: return Cfg{9, 10, 16, 16, 16, 8, 0, 8, 8};
+    case 19: return Cfg{10, 10, 8, 8, 16, 8, 0, 4, 4};
+    case 20: return Cfg{10, 10, 8, 8, 8, 8, 0, 2, 4};
+    default: return Cfg{11, 10, 8, 4, 4, 8, 0, 1, 1};   // 21
+    }
+}
+#else
 static Cfg cfg(unsigned lg) {
     switch (lg) {
     case 16: return Cfg{8, 8, 16, 16, 16, 16, 0, 32, 32};
@@ -357,6 +387,7 @@ static Cfg cfg(unsigned lg) {
     default: return Cfg{10, 10, 8, 8, 8, 8, 2, 1, 1};   // 21
     }
 }
+#endif
 
 static bool supported(unsigned lg, unsigned lgB) { return lgB == 2 && lg >= 16 && lg <= 21; }
 

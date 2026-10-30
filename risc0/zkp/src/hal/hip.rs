@@ -233,6 +233,15 @@ pub fn recursion_device() -> Option<i32> {
     })
 }
 
+/// The batched NTT kernels of `ntt_x.cuh`/`ntt_q.cuh` (fused commit, expand+NTT, bit reversal).
+/// `RISC0_HIP_NTT=0` falls back to sppark's per-pass NTTs; the kernels read the same variable.
+fn hip_fast_ntt() -> bool {
+    static FAST: OnceLock<bool> = OnceLock::new();
+    *FAST.get_or_init(
+        || !matches!(std::env::var("RISC0_HIP_NTT").as_deref(), Ok(v) if v.starts_with('0')),
+    )
+}
+
 /// Release all cached GPU buffers back to the HIP runtime.
 ///
 /// The HAL keeps a pool of freed GPU buffers per device for reuse. Call this before operations
@@ -1218,6 +1227,42 @@ impl<HH: HipHash + ?Sized> Hal for HipHal<HH> {
         }
     }
 
+    fn has_commit_coeffs_lde(&self, po2: usize) -> bool {
+        // The range sppark_commit_coeffs_lde is verified bit-exact for on gfx1100 and gfx1201.
+        hip_fast_ntt() && (10..=23).contains(&po2)
+    }
+
+    fn commit_coeffs_lde(
+        &self,
+        coeffs: &Self::Buffer<Self::Elem>,
+        evaluated: &Self::Buffer<Self::Elem>,
+        witness: &Self::Buffer<Self::Elem>,
+        count: usize,
+    ) {
+        let row_size = witness.size() / count;
+        assert_eq!(row_size * count, witness.size());
+        assert_eq!(coeffs.size(), witness.size());
+        let n_bits = log2_ceil(row_size);
+        assert_eq!(row_size, 1 << n_bits);
+        let lg_blowup = log2_ceil(crate::INV_RATE);
+        assert_eq!(evaluated.size(), witness.size() << lg_blowup);
+        assert!(n_bits + lg_blowup < Self::Elem::MAX_ROU_PO2);
+        Self::sync_stream();
+        let err = unsafe {
+            sppark_commit_coeffs_lde(
+                coeffs.as_device_ptr(),
+                evaluated.as_device_ptr(),
+                witness.as_device_ptr(),
+                n_bits as u32,
+                lg_blowup as u32,
+                count as u32,
+            )
+        };
+        if err.code != 0 {
+            panic!("Failure during commit_coeffs_lde: {err}");
+        }
+    }
+
     fn mix_poly_coeffs(
         &self,
         output: &Self::Buffer<Self::ExtElem>,
@@ -1702,5 +1747,10 @@ mod tests {
     #[test]
     fn mix_poly_coeffs() {
         testutil::mix_poly_coeffs(HipHalSha256::new());
+    }
+
+    #[test]
+    fn commit_coeffs_lde() {
+        testutil::commit_coeffs_lde(HipHalSha256::new());
     }
 }
