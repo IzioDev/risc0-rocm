@@ -447,14 +447,16 @@ fn build_rocm_kernels() {
     let out_dir = env::var("OUT_DIR").map(PathBuf::from).unwrap();
     let kernel_dir = std::fs::canonicalize("kernels/cuda").unwrap();
 
-    // Single-TU approach: amalgamate all .cu files EXCEPT ffi_supra.cu and sppark.cu
-    // (which use sppark types that conflict with risc0's fpext.h in the same TU).
+    // Single-TU approach: amalgamate all .cu files EXCEPT ffi_supra.cu, eval_check.cu, sppark.cu
+    // and eval_check_split.cu (which use sppark types that conflict with risc0's fpext.h in the
+    // same TU).
     let cu_files = glob_paths("kernels/cuda/*.cu");
     // Three-group approach:
     // Group A (risc0 types): ffi.cu + step_*.cu — amalgamated
     // Group B (sppark eval): ffi_supra.cu + eval_check.cu — amalgamated
-    // Group C (sppark host): sppark.cu — compiled separately (gpu_t.cuh's fmt()
-    //   can't compile for device when combined with device kernels)
+    // Group C, each compiled separately: sppark.cu (sppark host: gpu_t.cuh's fmt()
+    //   can't compile for device when combined with device kernels) and
+    //   eval_check_split.cu (sppark types, with its own poly_mix; as on CUDA)
     let mut risc0_amalg = String::new();
     let mut supra_amalg = String::new();
     let mut separate_files = Vec::new();
@@ -462,7 +464,7 @@ fn build_rocm_kernels() {
         let name = cu.file_name().unwrap().to_str().unwrap();
         let abs = std::fs::canonicalize(cu).unwrap();
         let line = format!("#include \"{}\"\n", abs.display());
-        if name == "sppark.cu" {
+        if name == "sppark.cu" || name == "eval_check_split.cu" {
             separate_files.push(cu.clone());
         } else if name == "ffi_supra.cu" || name == "eval_check.cu" {
             supra_amalg.push_str(&line);
@@ -514,8 +516,8 @@ fn build_rocm_kernels() {
         obj_files.push(obj);
     }
 
-    // Compile separate files (e.g. sppark.cu) individually — these contain host-only
-    // code (gpu_t.cuh) that can't be in the same TU as device kernels.
+    // Compile separate files individually: sppark.cu contains host-only code (gpu_t.cuh) that
+    // can't be in the same TU as device kernels; eval_check_split.cu uses sppark types.
     for cu in &separate_files {
         let name = cu.file_name().unwrap().to_str().unwrap();
         let obj_name = format!("{}.{obj_ext}", name.trim_end_matches(".cu"));
