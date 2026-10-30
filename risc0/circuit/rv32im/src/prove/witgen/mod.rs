@@ -14,7 +14,7 @@
 
 pub(crate) mod bigint;
 pub(crate) mod byte_poly;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub(crate) mod cuda_stage;
 pub(crate) mod paged_map;
 pub(crate) mod poseidon2;
@@ -29,13 +29,14 @@ use anyhow::{Context, Result};
 
 static VERBOSE: LazyLock<bool> = LazyLock::new(|| std::env::var("RISC0_VERBOSE").is_ok());
 
-/// On CUDA the witgen kernel writes the five per-cycle columns (CYCLE_COLS) from the uploaded
-/// cycles, so the host injector leaves them out (5 of its ~5.1 entries per row at po2=20).
-/// Part of the witgen staging feature (`RISC0_CUDA_WITGEN_STAGE=0` keeps them in the injector).
+/// On CUDA and ROCm the witgen kernel writes the five per-cycle columns (CYCLE_COLS) from the
+/// uploaded cycles, so the host injector leaves them out (5 of its ~5.1 entries per row at
+/// po2=20). Part of the witgen staging feature (`RISC0_CUDA_WITGEN_STAGE=0` keeps them in the
+/// injector).
 static DEFER_CYCLE_COLS: LazyLock<bool> = LazyLock::new(|| {
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     return cuda_stage::enabled();
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(any(feature = "cuda", feature = "rocm")))]
     false
 });
 
@@ -107,7 +108,7 @@ impl PreflightResults {
         let (injector, bigint_rows) = build_injector(&trace, cycles);
         // Stage the trace for the GPU upload here, on the preflight thread, off the critical path.
         let tp2 = std::time::Instant::now();
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
         {
             trace.staged = cuda_stage::stage(&trace);
         }
@@ -273,10 +274,11 @@ where
         };
         let code = MetaBuffer::new("code", hal, cycles, REGCOUNT_CODE, false);
         let tw1 = std::time::Instant::now();
-        // On CUDA, zero-fill the data buffer instead of INVALID-filling it, so the zeroize
-        // pass over it after witgen can be skipped: the cells witgen doesn't write end up 0
-        // either way (replay-verified: the witness after zeroize is unchanged).
-        let zero_data = cfg!(feature = "cuda");
+        // On CUDA (and with circuit HALs that take it, e.g. HIP), zero-fill the data buffer
+        // instead of INVALID-filling it, so the zeroize pass over it after witgen can be skipped:
+        // the cells witgen doesn't write end up 0 either way (replay-verified: the witness after
+        // zeroize is unchanged). Not for the CPU HAL: its checked sets expect INVALID.
+        let zero_data = cfg!(feature = "cuda") || circuit_hal.takes_zeroed_data();
         let data = scope!("alloc(data)", {
             if zero_data {
                 MetaBuffer {

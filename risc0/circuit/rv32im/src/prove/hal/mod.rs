@@ -112,6 +112,13 @@ pub(crate) trait CircuitWitnessGenerator<H: Hal> {
         false
     }
 
+    /// Whether `generate_witness` can take a zero-filled data buffer instead of an INVALID-filled
+    /// one (see `WitnessGenerator::hal_generate_witness`): its writes are not checked against
+    /// the cells' initial value.
+    fn takes_zeroed_data(&self) -> bool {
+        false
+    }
+
     fn generate_witness(
         &self,
         mode: StepMode,

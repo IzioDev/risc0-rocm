@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Pinned staging of the preflight trace for the CUDA witgen upload.
+//! Pinned staging of the preflight trace for the CUDA and HIP witgen upload.
 //!
 //! The witgen FFI used to copy the trace (cycles, txns, bigint bytes: ~124 MB at po2=20) into
 //! a pinned buffer on the proving thread, with the GPU idle (~9.5 ms/segment). The preflight
@@ -26,6 +26,12 @@
 //! thread proves with another device current anyway, the CUDA library stops using the staged
 //! traces and [`enabled`] turns off (see `stagingDeviceOk` in ffi.cu); the pinned memory is
 //! registered portable, so a trace staged before that is still valid in any context.
+//!
+//! On ROCm (the same library, built with hipcc) the device is looked up per call, so staging
+//! stays on with several devices: a trace prefetched by another device's proving thread
+//! (`RISC0_PARALLEL_STARK`) is then copied again on its own device's stream, as unstaged.
+//! Measured at po2=20 (RX 7900 XTX / RX 9070 XT), the proving thread's copy into its pinned
+//! buffer left the GPU idle ~5 ms/segment and the upload ~8.7 ms more.
 //!
 //! [`release`] (a HAL release hook) frees what the pools hold.
 
@@ -69,10 +75,10 @@ static POOL: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 static RETIRED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 const MAX_RETIRED: usize = 4;
 
-/// HAL release hook (`risc0_zkp::hal::cuda::register_release_hook`): the device buffers of the
-/// staged-trace slots not in use, and, unless `device_only`, the pinned slots, the recycled
-/// trace vectors and word-transaction maps (all rebuilt on demand). Never blocks on the pools'
-/// locks.
+/// HAL release hook (`risc0_zkp::hal::{cuda,hip}::register_release_hook`): the device buffers
+/// of the staged-trace slots not in use, and, unless `device_only`, the pinned slots, the
+/// recycled trace vectors and word-transaction maps (all rebuilt on demand). Never blocks on the
+/// pools' locks.
 pub(crate) fn release(device_only: bool) {
     if let Err(err) = ffi_wrap(|| unsafe { risc0_circuit_rv32im_cuda_release_slots() }) {
         tracing::debug!("cuda_stage: release_slots failed: {err}");
@@ -115,7 +121,8 @@ static READY: Mutex<Vec<Weak<StagedTrace>>> = Mutex::new(Vec::new());
 
 /// Start the device copy of the staged traces that are ready, on a side stream overlapping the
 /// GPU work in flight. Call on the proving thread (GPU lock held), between segments' GPU work:
-/// the CUDA HAL calls it once eval_check is done, while the finalize kernels run.
+/// the CUDA HAL calls it once eval_check is done, while the finalize kernels run (the HIP HAL
+/// also just before eval_check).
 pub(crate) fn prefetch_ready() {
     if !enabled() {
         return;

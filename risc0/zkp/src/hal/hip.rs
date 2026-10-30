@@ -248,9 +248,49 @@ fn hip_fast_ntt() -> bool {
 /// that need the maximum available VRAM (e.g. Groth16 BN254 proving via sppark which uses its own
 /// allocator). Releases every device's pool.
 pub fn clear_buffer_pool() {
+    release_buffer_pools(false);
+}
+
+/// The pools and, through the release hooks (`device_only`: see [register_release_hook]), the
+/// caches the circuit crates keep outside them.
+fn release_buffer_pools(device_only: bool) {
+    run_release_hooks(device_only);
     // Take the pools out first, so the hipFrees run without the lock held.
     let pools = std::mem::take(&mut *buffer_pools());
     drop(pools);
+}
+
+/// Caches kept outside this HAL's pool by the circuit crates: device scratch of their kernel
+/// libraries, and host staging pools (pinned buffers, recycled trace vectors).
+static RELEASE_HOOKS: Mutex<Vec<fn(bool)>> = Mutex::new(Vec::new());
+
+/// Register `hook` (once) to release a cache that `clear_buffer_pool` cannot see, as
+/// `hal::cuda::register_release_hook`: called with `device_only = false` by [clear_buffer_pool],
+/// and with `device_only = true` when an allocation fails or would not fit mid-proof (free
+/// device memory not in use right now). It must not block on locks its own code may hold around
+/// a device allocation (use `try_lock`).
+pub fn register_release_hook(hook: fn(bool)) {
+    let mut hooks = RELEASE_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+    if !hooks.iter().any(|h| std::ptr::fn_addr_eq(*h, hook)) {
+        hooks.push(hook);
+    }
+}
+
+fn run_release_hooks(device_only: bool) {
+    let hooks = RELEASE_HOOKS
+        .try_lock()
+        .map(|h| h.clone())
+        .unwrap_or_default();
+    for hook in hooks {
+        hook(device_only);
+    }
+}
+
+/// Called by raw device allocations in the kernel libraries (`risc0_cuda_malloc` in
+/// `device_alloc.h`: the rv32im preflight slots, nttq scratch) when hipMalloc fails: releases the
+/// pools, so the allocation can be retried, as `RawBuffer::new` does for the HAL's own.
+extern "C" fn drain_pool_on_oom() {
+    let _ = std::panic::catch_unwind(|| release_buffer_pools(true));
 }
 
 /// Room to leave on the device beyond a new allocation before the pool is kept.
@@ -275,7 +315,7 @@ fn release_pool_unless_fits(size: usize) {
     let err = unsafe { risc0_sys::hip::hipMemGetInfo(&mut free, &mut total) };
     if err == risc0_sys::hip::HIP_SUCCESS && free < size.saturating_add(POOL_RELEASE_HEADROOM) {
         tracing::debug!("releasing {pooled} pooled bytes: {size} requested, {free} free");
-        clear_buffer_pool();
+        release_buffer_pools(true);
     }
 }
 
@@ -523,7 +563,7 @@ impl RawBuffer {
             release_pool_unless_fits(size);
             HipDeviceBuffer::uninitialized(size).unwrap_or_else(|_| {
                 // OOM: clear the buffer pool to free cached GPU memory and retry.
-                clear_buffer_pool();
+                release_buffer_pools(true);
                 // Clear the stale HIP error from the failed hipMalloc above.
                 // Without this, sppark's cudaGetLastError() picks up the old
                 // "out of memory" error and panics even though the retry succeeds.
@@ -754,6 +794,8 @@ impl<HH: HipHash + ?Sized> HipHal<HH> {
         if err.code != 0 {
             panic!("Failure during sppark_init: {err}");
         }
+        static OOM_HOOK: Once = Once::new();
+        OOM_HOOK.call_once(|| unsafe { risc0_zkp_cuda_set_oom_hook(drain_pool_on_oom) });
 
         let mut max_threads: i32 = 0;
         hip_check(unsafe {

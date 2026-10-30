@@ -149,7 +149,7 @@ extern "C" {
     pub fn risc0_circuit_rv32im_cuda_eval_check_dep() -> *const std::os::raw::c_char;
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 extern "C" {
     /// Witgen with an optional pinned staging buffer holding cycles|txns|bigint_bytes back to
     /// back (`staged`, kept alive by the caller until the witgen's stream work is done), and

@@ -209,7 +209,18 @@ static void growDevSlot(DevSlot* sl, size_t bytes) {
 static cudaStream_t getCopyStream() {
   static cudaStream_t s_streams[16] = {};
   int dev = getCachedDevice();
+#ifdef __HIPCC__
+  // At the lowest priority, which ROCm serves from hardware queues of its own: on a queue shared
+  // with other streams (GPU_MAX_HW_QUEUES, 4), the event recorded after a prefetch copy held
+  // their kernels and copies until the copy was done (~9 ms at po2=20).
+  if (!s_streams[dev]) {
+    int least = 0, greatest = 0;
+    CUDA_OK(hipDeviceGetStreamPriorityRange(&least, &greatest));
+    CUDA_OK(hipStreamCreateWithPriority(&s_streams[dev], hipStreamNonBlocking, least));
+  }
+#else
   if (!s_streams[dev]) CUDA_OK(cudaStreamCreateWithFlags(&s_streams[dev], cudaStreamNonBlocking));
+#endif
   return s_streams[dev];
 }
 
@@ -714,7 +725,6 @@ __global__ void majorKeys(const PreflightCycle* cycles, uint32_t* keys, uint32_t
   }
 }
 
-#ifndef __HIPCC__
 // finalizeAccum fused with eltwise_zeroize_fp(accum) (INVALID -> 0), one pass over all rows.
 // Same result as finalizeAccum followed by the zeroize: machine cells are finalized (an unset
 // one counting as 0), every other cell is only zeroized. prev[] (last 4 columns, row back1) is
@@ -749,7 +759,6 @@ __global__ void finalizeZeroizeAccum(DeviceAccumContext* ctx, uint32_t lastCycle
     for (size_t c = 0; c < cols; c++) z(c * rows + cycle);
   }
 }
-#endif
 
 static bool envOn(const char* name) {
   const char* e = getenv(name);
@@ -1207,13 +1216,9 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
       }
 #endif
 
-#ifndef __HIPCC__
       // finalizeAccum fused with the INVALID -> 0 zeroize of the accum buffer.
       auto cfgz = getSimpleConfig(rows);
       finalizeZeroizeAccum<<<cfgz.grid, cfgz.block, 0, stream>>>(d_ctx, lastCycle);
-#else
-      finalizeAccum<<<cfg.grid, cfg.block, 0, stream>>>(d_ctx, lastCycle);
-#endif
       // Last reader of this segment's device preflight: a prefetch into its slot waits for this.
       if (DevSlot* sl = get_cache().a_slot) {
         std::lock_guard<std::recursive_mutex> lk(g_slots_mu);
@@ -1238,11 +1243,7 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
 // 1 when risc0_circuit_rv32im_cuda_accum also zeroizes accum (finalizeZeroizeAccum), so the
 // caller skips its separate eltwise_zeroize of the accum buffer.
 int risc0_circuit_rv32im_cuda_accum_zeroizes() {
-#ifdef __HIPCC__
-  return 0;
-#else
   return 1;
-#endif
 }
 
 const char* risc0_circuit_rv32im_cuda_warmup() {
@@ -1254,7 +1255,7 @@ const char* risc0_circuit_rv32im_cuda_warmup() {
     par_stepExec<<<1, 1, 0, stream>>>(nullptr, 0, 0);
 #ifdef __HIPCC__
     stepAccum<<<1, 1, 0, stream>>>(nullptr, 0);
-    finalizeAccum<<<1, 1, 0, stream>>>(nullptr, 0);
+    finalizeZeroizeAccum<<<1, 1, 0, stream>>>(nullptr, 0);
 #endif
     injectCycleCols<<<1, 1, 0, stream>>>(nullptr, nullptr, 0, 0, 0, 0, 0, 0, 0);
     majorKeys<<<1, 1, 0, stream>>>(nullptr, nullptr, nullptr, 0, 0);

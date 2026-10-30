@@ -81,8 +81,8 @@ pub(crate) struct PreflightTrace {
     pub bigint_states: Vec<BigIntState>,
     pub table_split_cycle: u32,
     pub rand_z: ExtVal,
-    /// Pinned copy of cycles|txns|bigint_bytes for the CUDA witgen upload (see cuda_stage).
-    #[cfg(feature = "cuda")]
+    /// Pinned copy of cycles|txns|bigint_bytes for the CUDA/HIP witgen upload (see cuda_stage).
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     #[debug(skip)]
     pub staged: Option<std::sync::Arc<super::cuda_stage::StagedTrace>>,
     /// The injector left out the five per-cycle columns (CYCLE_COLS): witgen writes them.
@@ -90,7 +90,7 @@ pub(crate) struct PreflightTrace {
 }
 
 // Return the big vectors for reuse by a later segment's preflight (see cuda_stage).
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 impl Drop for PreflightTrace {
     fn drop(&mut self) {
         super::cuda_stage::recycle_trace(self);
@@ -164,9 +164,9 @@ impl<'a> Preflight<'a> {
         }
         // Reserve the trace up front and back it with huge pages (see `advise_huge`). SimpleLoop
         // makes ~4.2 memory transactions per cycle; a segment that makes more grows `txns`.
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
         let trace = super::cuda_stage::recycled_trace(total_cycles, rand_z);
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(any(feature = "cuda", feature = "rocm")))]
         let trace = {
             let trace = PreflightTrace {
                 cycles: Vec::with_capacity(total_cycles),

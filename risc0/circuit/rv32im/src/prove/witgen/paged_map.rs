@@ -181,7 +181,7 @@ impl WordTxnMap {
     }
 
     /// Drop the pooled maps (see `cuda_stage::release`). Never blocks.
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "cuda", feature = "rocm")), allow(dead_code))]
     pub fn trim_pool() {
         if let Ok(mut pool) = WORD_TXN_POOL.try_lock() {
             pool.clear();
