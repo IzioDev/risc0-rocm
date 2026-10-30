@@ -23,6 +23,24 @@
 //   its reduction: every product stays in mred's domain.
 // - Partial rounds keep the cells below 1.87p (at most 1.8693p over all DH_i, x in [0, 2p)):
 //   cells < 2p hold for any number of rounds, by induction.
+//
+// ROCm (RDNA) path: the 32-bit multiplies (v_mad_u64_u32, v_mad_i64_i32, v_mul_lo/hi_u32) issue at
+// a quarter of the add rate, so each product costs 2 of them instead of 3, with a signed REDC:
+// sredc(t) = (t - m*p) / 2^32 with m = (int32)(t * p^-1 mod 2^32), p^-1 = 2^31 + 2^27 + 1, m
+// from two shift-adds (v_lshl_add_u32) and t - m*p from one v_mad_i64_i32 (m, -p, t). Since
+// t - m*p == 0 mod 2^32 the high word is the exact quotient, == t * 2^-32 (mod p), whenever
+// |t - m*p| < 2^63; |sredc(t)| <= (|t| + 2^31 p) / 2^32. Values are int32 in (-p, p) inside the
+// S-box and the partial rounds and canonical u32 in the linear layers:
+// - |a|, |b| <= p gives |a*b| <= p^2 and |sredc(a*b)| <= p^2/2^32 + p/2 < 0.96875p + 1 < p:
+//   every S-box step (input x + RC - p in [-p, p)) stays in (-p, p), as does x^7, which
+//   canon() = min_u32(r, r + p) maps to [0, p).
+// - For even t, lo(t) * (2^27 + 1) is already t * p^-1 mod 2^32 (lo * 2^31 == 0), so products by
+//   a constant use one shift-add for m: each constant is replaced by its even representative in
+//   (-p, p) (DH_i or DH_i - p), and the partial rounds' addend a == S * 2^32 is made even as
+//   2 * sredc(st * (2^95 mod p)) (|a| < 1.48p < 2^32), with st = sredc(S) (|st| < p/2 + 12).
+// - Partial-round cells: e'_i = sredc(E_i * e_i + a) with |E_i| < p, |e_i| < p, |a| < 2^32:
+//   |e'_i| < 0.96875p + 2 < p, so |cells| < p holds for any number of rounds, by induction (the
+//   S-box cell is canonicalized before adding its round constant). |S| < 24p < 2^36.
 
 #pragma once
 
@@ -33,6 +51,57 @@
 namespace pv {
 
 constexpr uint32_t P = 0x78000001u, M0 = 0x77ffffffu; // M0 = -p^-1 mod 2^32
+
+#ifdef __HIPCC__
+// Signed-REDC helpers for the ROCm path (see the header comment for the bounds).
+
+// An opaque copy: keeps LLVM from folding the shift-adds of sredc() into a v_mul_lo_u32.
+__device__ __forceinline__ uint32_t opq(uint32_t x) {
+  asm("" : "+v"(x));
+  return x;
+}
+
+// (t - m*p) / 2^32 with m = (int32)(t * p^-1 mod 2^32): two v_lshl_add_u32 + one v_mad_i64_i32.
+__device__ __forceinline__ int32_t sredc(int64_t t) {
+  uint32_t lo = uint32_t(t);
+  int32_t m = int32_t(opq(lo + (lo << 27)) + (lo << 31));
+  return int32_t(uint64_t(t + int64_t(m) * -int64_t(P)) >> 32);
+}
+
+// sredc() for even t: m = lo * (2^27 + 1), one v_lshl_add_u32.
+__device__ __forceinline__ int32_t sredc_even(int64_t t) {
+  uint32_t lo = uint32_t(t);
+  int32_t m = int32_t(lo + (lo << 27));
+  return int32_t(uint64_t(t + int64_t(m) * -int64_t(P)) >> 32);
+}
+
+__device__ __forceinline__ int32_t smul(int32_t a, int32_t b) {
+  return sredc(int64_t(a) * b);
+}
+
+// (-p, p) -> [0, p).
+__device__ __forceinline__ uint32_t canon(int32_t r) {
+  uint32_t u = uint32_t(r);
+  return __builtin_elementwise_min(u, u + P);
+}
+
+// y in [-p, p) -> y^7 in (-p, p).
+__device__ __forceinline__ int32_t ssbox(int32_t y) {
+  int32_t y2 = smul(y, y);
+  int32_t y3 = smul(y2, y);
+  int32_t y4 = smul(y2, y2);
+  return smul(y3, y4);
+}
+
+// PV_DH (Montgomery-form internal diagonal) as even representatives in (-p, p).
+constexpr int32_t PV_DHE[24] = {
+    -968772778,  271838616,   -774936828,  1384248088,  1011796206, 426221916,
+    985139354,   1760666932,  -1713368876, 224647294,   -656957998, -764689148,
+    1866859900,  1132319062,  1622455428,  -871607094,  1242914314, -234514942,
+    1178086656,  -1482974038, -1528792916, 316128532,   1581421748, 456216014};
+// 2^95 mod p (0x4579bdfe), even: sredc_even(st * PV_C95) == S * 2^31 for st == S * 2^-32.
+constexpr int32_t PV_C95 = 0x4579bdfe;
+#endif
 
 __device__ __forceinline__ uint32_t red1(uint32_t r) { // [0, 2p) -> [0, p)
   return r >= P ? r - P : r;
@@ -101,12 +170,68 @@ __device__ __forceinline__ void m_ext(uint32_t* x) {
 }
 
 __device__ __forceinline__ void full_round(uint32_t* x, int r) {
+#ifdef __HIPCC__
+  // The round constants first: one batch of scalar loads rather than one address per constant.
+  uint32_t rc[24];
+#pragma unroll
+  for (int i = 0; i < 24; i++)
+    rc[i] = PV_RCF[r * 24 + i];
+#pragma unroll
+  for (int i = 0; i < 24; i++)
+    x[i] = canon(ssbox(int32_t(x[i] + (rc[i] - P))));
+#else
 #pragma unroll
   for (int i = 0; i < 24; i++)
     x[i] = sbox(addm(x[i], PV_RCF[r * 24 + i]));
+#endif
   m_ext(x);
 }
 
+#ifdef __HIPCC__
+// sum_i e_i exactly for 24 values with |e_i| < 2^31: the low word wraps (v_add3_u32); the rest
+// comes from the top bytes, sum = 2^24 * tb + d with tb = sum (e_i >> 24) and d = sum (e_i mod
+// 2^24) in [0, 24 * 2^24), so d = lo - 2^24 * tb (mod 2^32) and the high word is
+// (tb + d / 2^24) >> 8. One v_perm_b32 packs two sign-extended top bytes into 16-bit lanes and
+// one v_pk_add_u16 adds them (|lane| <= 12 * 128): about 1.5 ops per term instead of 3 for a
+// sign-extended 64-bit sum.
+__device__ __forceinline__ int64_t ssum24(const int32_t* e) {
+  typedef unsigned short u16x2 __attribute__((ext_vector_type(2)));
+  uint32_t lo = 0;
+  u16x2 hp = {0, 0};
+#pragma unroll
+  for (int i = 0; i < 24; i += 2) {
+    lo += uint32_t(e[i]) + uint32_t(e[i + 1]);
+    // {e[i] >> 24, e[i + 1] >> 24} as int16 lanes: bytes 3, sign(3), 7, sign(7) of {e[i+1], e[i]}.
+    hp += __builtin_bit_cast(u16x2, __builtin_amdgcn_perm(uint32_t(e[i + 1]), uint32_t(e[i]), 0x0b070903u));
+  }
+  int32_t tb = int32_t(int16_t(hp.x)) + int32_t(int16_t(hp.y));
+  uint32_t d = lo - (uint32_t(tb) << 24);
+  int32_t hi = (tb + int32_t(d >> 24)) >> 8;
+  return int64_t((uint64_t(uint32_t(hi)) << 32) | lo);
+}
+
+// The 21 partial rounds with int32 cells in (-p, p): e'_i = sum_j e_j + DH_i * e_i * 2^-32,
+// computed as sredc_even(E_i * e_i + a) with E_i == DH_i and a == S * 2^32 (mod p), both even.
+__device__ __forceinline__ void partial_rounds(uint32_t* x) {
+  int32_t e[24];
+#pragma unroll
+  for (int i = 0; i < 24; i++)
+    e[i] = int32_t(x[i]);
+#pragma unroll 1
+  for (int r = 0; r < 21; r++) {
+    e[0] = ssbox(int32_t(canon(e[0]) + (PV_RCP[r] - P)));
+    int64_t sum = ssum24(e);
+    int32_t st = sredc(sum);                                    // == S * 2^-32, |st| < p/2 + 12
+    int64_t a = int64_t(sredc_even(int64_t(st) * PV_C95)) * 2; // == S * 2^32, even, |a| < 1.48p
+#pragma unroll
+    for (int i = 0; i < 24; i++)
+      e[i] = sredc_even(int64_t(PV_DHE[i]) * e[i] + a);
+  }
+#pragma unroll
+  for (int i = 0; i < 24; i++)
+    x[i] = canon(e[i]);
+}
+#else
 // The 21 partial rounds, with the cells kept in [0, 1.87p) between rounds (no per-cell
 // reduction): e'_i = sum_j e_j + DH_i * e_i * 2^-32, computed as mred(DH_i * e_i + w) with
 // w = mred(mred(S) * R^3) == S * 2^32 mod p, S = sum_j e_j.
@@ -114,20 +239,12 @@ __device__ __forceinline__ void partial_rounds(uint32_t* x) {
 #pragma unroll 1
   for (int r = 0; r < 21; r++) {
     x[0] = sbox(addm(red1(x[0]), PV_RCP[r]));
-#ifdef __HIPCC__
-    uint64_t sum = x[0];
-#pragma unroll
-    for (int i = 1; i < 24; i++)
-      sum += x[i];
-    uint32_t st = mred(sum); // < p + 22
-#else
     uint32_t lo, hi;
     asm("add.cc.u32 %0, %2, %3; addc.u32 %1, 0, 0;" : "=r"(lo), "=r"(hi) : "r"(x[0]), "r"(x[1]));
 #pragma unroll
     for (int i = 2; i < 24; i++)
       asm("add.cc.u32 %0, %0, %2; addc.u32 %1, %1, 0;" : "+r"(lo), "+r"(hi) : "r"(x[i]));
     uint32_t st = mred(((uint64_t)hi << 32) | lo); // < p + 22
-#endif
     uint32_t w = mred((uint64_t)st * 0x12f37bfbu); // == S * 2^32 mod p, < 1.074p
 #pragma unroll
     for (int i = 0; i < 24; i++)
@@ -137,9 +254,19 @@ __device__ __forceinline__ void partial_rounds(uint32_t* x) {
   for (int i = 0; i < 24; i++)
     x[i] = red1(x[i]);
 }
+#endif
 
 __device__ __forceinline__ void permute(uint32_t* x) {
   m_ext(x);
+#ifdef __HIPCC__
+  // One loop over the 8 full rounds, so their body is emitted once (half the code size).
+#pragma unroll 1
+  for (int r = 0; r < 8; r++) {
+    if (r == 4)
+      partial_rounds(x);
+    full_round(x, r);
+  }
+#else
 #pragma unroll 1
   for (int r = 0; r < 4; r++)
     full_round(x, r);
@@ -147,6 +274,7 @@ __device__ __forceinline__ void permute(uint32_t* x) {
 #pragma unroll 1
   for (int r = 4; r < 8; r++)
     full_round(x, r);
+#endif
 }
 
 // out[i] = hash of the two digests in[2i], in[2i + 1] (n outputs).
