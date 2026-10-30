@@ -34,8 +34,9 @@ fn host_free(ptr: usize) {
     let _ = risc0_sys::ffi_wrap(|| unsafe { risc0_circuit_recursion_cuda_host_free(p) });
 }
 
-/// HAL release hook (`risc0_zkp::hal::cuda::register_release_hook`): unless `device_only`,
-/// unpin the pooled and retired buffers (re-pinned on demand). Never blocks on the pool's lock.
+/// HAL release hook (`risc0_zkp::hal::cuda::register_release_hook`, or `hal::hip`'s): unless
+/// `device_only`, unpin the pooled and retired buffers (re-pinned on demand). Never blocks on the
+/// pool's lock.
 pub(crate) fn release(device_only: bool) {
     if device_only {
         return;

@@ -18,7 +18,7 @@
 
 mod hal;
 mod p2fast;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 mod pinned;
 mod preflight;
 mod program;
@@ -139,10 +139,10 @@ pub fn set_host_chains_check(on: bool) -> usize {
 }
 
 /// The recursion host-side preparation optimizations: host chains split across the preflight,
-/// page-locked staging of the witgen inputs (CUDA) and the fast host Poseidon2 permutation of the
-/// preflight (p2fast, bit-identical). On unless `RISC0_CUDA_REC_PREP=0`. Despite the name the
-/// switch is read on every build, not only with CUDA: p2fast serves the CPU and other GPU
-/// backends' recursion preflight too, and the switch turns it off there as well.
+/// page-locked staging of the witgen inputs (CUDA, ROCm) and the fast host Poseidon2
+/// permutation of the preflight (p2fast, bit-identical). On unless `RISC0_CUDA_REC_PREP=0`.
+/// Despite the name the switch is read on every build, not only with CUDA: p2fast serves the CPU
+/// and other GPU backends' recursion preflight too, and the switch turns it off there as well.
 pub(crate) fn host_prep_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var("RISC0_CUDA_REC_PREP").as_deref() != Ok("0"));
@@ -246,9 +246,9 @@ impl Prover {
         // Execute the host chains of the trace prefix on a background thread while the
         // preflight continues (from the point where a streaming preflight has consumed its whole
         // prefix, else at 3/5 of the rows); the rest after.
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
         let split = host_prep_enabled();
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(any(feature = "cuda", feature = "rocm")))]
         let split = false;
         let streaming = preflight_is_streaming(&preflight);
         let split_row = self.program.code_rows() * 3 / 5;
@@ -307,7 +307,6 @@ impl Prover {
                 );
             }
         }
-        // ROCm never splits (`split` is false there), so it takes the else branch.
         #[cfg(any(feature = "cuda", feature = "rocm"))]
         if let Some(h) = early.take() {
             let t0 = std::time::Instant::now();
@@ -356,7 +355,7 @@ impl Prover {
         }
         // Stage the trace and host chains in page-locked memory here, off the GPU thread, so
         // their H2D copies are truly asynchronous.
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
         if host_prep_enabled() {
             let t0 = std::time::Instant::now();
             let staged = {

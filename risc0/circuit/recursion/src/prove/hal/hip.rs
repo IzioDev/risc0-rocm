@@ -54,6 +54,7 @@ struct HipCircuitHal<CH: HipHash> {
 
 impl<CH: HipHash> HipCircuitHal<CH> {
     pub fn new(_hal: Arc<HipHal<CH>>) -> Self {
+        risc0_zkp::hal::hip::register_release_hook(super::super::pinned::release);
         Self { _hal }
     }
 }
@@ -102,13 +103,21 @@ impl<CH: HipHash> CircuitWitnessGenerator<HipHal<CH>> for HipCircuitHal<CH> {
             data: data.as_ptr() as *const BabyBearElem,
             global: global.as_ptr() as *const BabyBearElem,
         };
+        // The page-locked copies, if the preflight staged them (see `pinned`).
+        let p = hc.pinned.unwrap_or([
+            hc.heads.as_ptr() as usize,
+            hc.cycles.as_ptr() as usize,
+            hc.rows.as_ptr() as usize,
+            hc.wom_idx.as_ptr() as usize,
+            hc.wom_rows.as_ptr() as usize,
+        ]);
         let raw = RawHostChains {
-            heads: hc.heads.as_ptr(),
+            heads: p[0] as *const u32,
             num_heads: hc.heads.len() as u32,
-            cycles: hc.cycles.as_ptr(),
-            rows: hc.rows.as_ptr(),
-            wom_idx: hc.wom_idx.as_ptr(),
-            wom_rows: hc.wom_rows.as_ptr(),
+            cycles: p[1] as *const u32,
+            rows: p[2] as *const u32,
+            wom_idx: p[3] as *const u32,
+            wom_rows: p[4] as *const u32,
             num_rows: hc.cycles.len() as u32,
             data_cols: (hc.rows.len() / hc.cycles.len().max(1)) as u32,
         };

@@ -51,15 +51,16 @@ namespace cuda { namespace std { using ::std::array; } }
 #include <cstdlib>
 #include <map>
 
-// Async recursion witgen (CUDA only, and off by default on Windows: see recAsync; kill switch
-// RISC0_CUDA_REC_WITGEN=0 restores the synchronous path):the witgen uploads and the accum's initial ones go on the context's stream
+// Async recursion witgen (off by default on Windows: see recAsync; kill switch
+// RISC0_CUDA_REC_WITGEN=0 restores the synchronous path): the witgen uploads and the accum's initial ones go on the context's stream
 // (cudaMemcpyAsync/cudaMemsetAsync, a fill kernel) instead of the legacy stream, thrust's temporary storage comes from a per-thread cache and runs on that
 // stream (no cudaMalloc/cudaFree per proof: cudaFree synchronizes the device and both take a
 // driver ioctl that costs ~1 ms when the host is busy), the cached buffers grow with 25%
 // headroom, and the warmup pre-grows the stack reservation and loads the split eval_check module.
-#ifndef __HIPCC__
+// On HIP as well, where in addition (see RecStream and HostAccumContext::calcPrefixProducts) the
+// context's stream is kept per thread and the accum's prefix products run on it, so that the
+// witgen and the accum each wait on the host only at their start and end.
 #define REC_ASYNC_AVAILABLE 1
-#endif
 static bool recAsync() {
 #ifdef REC_ASYNC_AVAILABLE
   static const bool on = [] {
@@ -123,6 +124,64 @@ struct RecThrustAlloc {
 static thread_local RecThrustAlloc g_recThrustAlloc;
 extern "C" const char* rec_eval_check_split_warmup(size_t* localBytes);  // eval_check_split.cu
 size_t risc0_recursion_accum_inl_warmup();                                  // accum_inl.cu
+#endif
+
+#ifdef __HIPCC__
+// The witgen and accum contexts' stream. A context used to create its own (CudaStream), but on
+// ROCm hipStreamCreate + hipStreamDestroy take ~0.3 ms (RX 7900 XTX / RX 9070 XT, ROCm 7.2), twice
+// per recursion proof, between the GPU work of the proof. With the async path each thread keeps
+// one stream per device instead (the same kind: hipStreamCreate's, blocking). Each witgen or accum
+// call synchronizes it before returning, so the next call on the thread finds it idle, as it
+// would a new stream. The kill switch keeps a stream per context.
+class RecStream {
+  cudaStream_t stream = nullptr;
+  bool owned = false;
+
+  struct PerThread {
+    cudaStream_t streams[16] = {};
+    ~PerThread() {
+#ifndef _WIN32
+      // As the thread's buffer caches below (on Windows a thread_local destructor runs under the
+      // loader lock, where the runtime must not be called: the stream is left to process exit).
+      for (cudaStream_t s : streams)
+        if (s)
+          cudaStreamDestroy(s);
+#endif
+    }
+  };
+
+public:
+  RecStream() {
+    if (!recAsync()) {
+      cudaStreamCreate(&stream);
+      owned = true;
+      return;
+    }
+    static thread_local PerThread perThread;
+    int device = 0;
+    CUDA_OK(cudaGetDevice(&device));
+    if (device < 0 || device >= 16)
+      throw std::runtime_error("recursion stream: device index out of range");
+    if (!perThread.streams[device])
+      CUDA_OK(cudaStreamCreate(&perThread.streams[device]));
+    stream = perThread.streams[device];
+  }
+  ~RecStream() {
+    if (owned) {
+      cudaStreamDestroy(stream);
+    } else if (std::uncaught_exceptions()) {
+      // An error left the call early: let nothing it queued outlive it (its copies read the
+      // caller's host buffers), as a new stream's destruction would have.
+      cudaStreamSynchronize(stream);
+    }
+  }
+  RecStream(const RecStream&) = delete;
+  RecStream& operator=(const RecStream&) = delete;
+
+  inline operator cudaStream_t() const { return stream; }
+};
+#else
+using RecStream = CudaStream;
 #endif
 
 constexpr size_t kStepModeParallel = 0;
@@ -254,7 +313,6 @@ __global__ void fwdStepVerifyWom(ExecContext* ctx) {
   }
 }
 
-#ifndef __HIPCC__
 void risc0_recursion_launch_accum_inl(int verify, unsigned grid, unsigned block, cudaStream_t stream,
                                       AccumContext* ctx);
 // accum_inl.cu: the accum steps force-inlined into the kernels, and eval_check split into
@@ -268,7 +326,6 @@ static bool accumInl() {
   }();
   return on;
 }
-#endif
 
 __global__ void parStepComputeAccum(AccumContext* ctx) {
   uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x;
@@ -410,11 +467,13 @@ static thread_local CachedExecBuffers g_execCache;
 
 struct HostExecContext {
   ExecContext* ctx;
-  CudaStream stream;
+  RecStream stream;
   LaunchConfig cfg;
+  // ctx->trace->numCycles, kept on the host: ctx is managed memory (see verifyWom).
+  uint32_t numCycles;
 
   HostExecContext(ExecBuffers* buffers, PreflightTrace* trace, size_t totalCycles)
-      : cfg(getSimpleConfig(trace->numCycles)) {
+      : cfg(getSimpleConfig(trace->numCycles)), numCycles(trace->numCycles) {
     g_execCache.ensure(trace->numCycles, trace->numWoms, trace->numIops);
 
     ctx = g_execCache.ctx;
@@ -516,37 +575,48 @@ struct HostExecContext {
       revStepExec<<<cfg.grid, cfg.block, 0, stream>>>(ctx);
     } break;
     }
+#ifdef __HIPCC__
+    // verifyWom's work follows on the same stream (thrust without a host sync, see there).
+    if (!recAsync())
+#endif
     CUDA_OK(cudaStreamSynchronize(stream));
   }
 
   void verifyWom(uint32_t mode) {
     nvtx3::scoped_range range("verifyWom");
-    uint32_t numCycles = ctx->trace->numCycles;
+    // The values of ctx->trace->numCycles, ctx->womRows and ctx->womIndex, read from their host
+    // copies: ctx is managed memory, and on HIP the async path no longer waits for the exec kernel
+    // (doStepExec) before this point.
+    WomArgumentRow* womRows = g_execCache.womRows;
+    uint32_t* womIndex = g_execCache.womIndex;
 
 #ifdef REC_ASYNC_AVAILABLE
     if (recAsync()) {
       // Same thrust algorithms (the sort compares every field, so its output is unique), on the
       // context stream with cached temporary storage; par_nosync: no host wait in between.
+#ifdef __HIPCC__
+      auto policy = thrust::hip::par_nosync(g_recThrustAlloc).on(stream);
+#else
       auto policy = thrust::cuda::par_nosync(g_recThrustAlloc).on(stream);
+#endif
       {
         nvtx3::scoped_range range("sortWom");
-        thrust::sort(policy, ctx->womRows, ctx->womRows + numCycles * kMaxWomRowsPerCycle);
+        thrust::sort(policy, womRows, womRows + numCycles * kMaxWomRowsPerCycle);
       }
       {
         nvtx3::scoped_range range("scan");
-        thrust::exclusive_scan(policy, ctx->womIndex, ctx->womIndex + numCycles, ctx->womIndex);
+        thrust::exclusive_scan(policy, womIndex, womIndex + numCycles, womIndex);
       }
     } else
 #endif
     {
       {
         nvtx3::scoped_range range("sortWom");
-        thrust::sort(thrust::device, ctx->womRows, ctx->womRows + numCycles * kMaxWomRowsPerCycle);
+        thrust::sort(thrust::device, womRows, womRows + numCycles * kMaxWomRowsPerCycle);
       }
       {
         nvtx3::scoped_range range("scan");
-        thrust::exclusive_scan(
-            thrust::device, ctx->womIndex, ctx->womIndex + numCycles, ctx->womIndex);
+        thrust::exclusive_scan(thrust::device, womIndex, womIndex + numCycles, womIndex);
       }
     }
 
@@ -572,10 +642,11 @@ struct AccumBuffersState {
   int device = -1;
 };
 
-#ifdef SPPARK_NO_COOPERATIVE_LAUNCH
+#if defined(SPPARK_NO_COOPERATIVE_LAUNCH) || defined(__HIPCC__)
 // In-place inclusive prefix products of an FpExt array without a grid-wide sync (no cooperative
-// launch on this platform): each block scans a chunk and writes its total, one thread scans the
-// totals, then each chunk past the first is multiplied by the product of the chunks before it.
+// launch on this platform, or on HIP, none wanted: see calcPrefixProducts): each block scans a
+// chunk and writes its total, one thread scans the totals, then each chunk past the first is
+// multiplied by the product of the chunks before it.
 // FpExt multiplication is associative, so the products are those of the sequential scan.
 constexpr uint32_t kScanThreads = 256;
 constexpr uint32_t kScanPerThread = 8;
@@ -677,11 +748,14 @@ __global__ void fillOneExt(FpExt* p, uint32_t n) {
 
 struct HostAccumContext {
   AccumContext* ctx;
-  CudaStream stream;
+  RecStream stream;
   LaunchConfig cfg;
+  // ctx->workCycles, kept on the host: ctx is managed memory, which the host must not touch while
+  // the steps may run (see syncSteps).
+  uint32_t workCycles;
 
   HostAccumContext(AccumBuffers* buffers, size_t workCycles, size_t totalCycles)
-      : cfg(getSimpleConfig(workCycles)) {
+      : cfg(getSimpleConfig(workCycles)), workCycles(workCycles) {
     g_accumCache.ensure(workCycles);
 
     ctx = g_accumCache.ctx;
@@ -715,54 +789,82 @@ struct HostAccumContext {
     // Buffers owned by g_accumCache, not freed here
   }
 
+  // Whether the host waits for the stream after each step (and for the device before
+  // verifyAccum, for sppark's stream). Not with the async path on HIP: there every step, the
+  // prefix products included (see calcPrefixProducts), runs on the context's stream, which orders
+  // them, after the cudaDeviceSynchronize at the accum's start (risc0_circuit_recursion_cuda_accum)
+  // ordered it after the work of every other stream; verifyAccum still waits at the end.
+  static bool syncSteps() {
+#ifdef __HIPCC__
+    return !recAsync();
+#else
+    return true;
+#endif
+  }
+
   void computeAccum() {
     nvtx3::scoped_range range("computeAccum");
-#ifndef __HIPCC__
     if (accumInl()) {
       risc0_recursion_launch_accum_inl(0, cfg.grid.x, cfg.block.x, stream, ctx);
     } else
-#endif
     parStepComputeAccum<<<cfg.grid, cfg.block, 0, stream>>>(ctx);
-    CUDA_OK(cudaStreamSynchronize(stream));
+    if (syncSteps()) {
+      CUDA_OK(cudaStreamSynchronize(stream));
+    } else {
+      CUDA_OK(cudaGetLastError());
+    }
   }
 
   void calcPrefixProducts() {
     nvtx3::scoped_range range("calcPrefixProducts");
+#if defined(SPPARK_NO_COOPERATIVE_LAUNCH) || defined(__HIPCC__)
 #ifdef SPPARK_NO_COOPERATIVE_LAUNCH
     // sppark's prefix_op needs a cooperative launch, which this platform has not (see sppark's
     // util/cuda2hip.hpp): a three-kernel scan instead (see prefixProductsChunks).
-    uint32_t n = (uint32_t)ctx->workCycles;
-    uint32_t nblocks = (n + kScanChunk - 1) / kScanChunk;
-    static thread_local FpExt* totals = nullptr;
-    static thread_local uint32_t totalsCap = 0;
-    if (nblocks > totalsCap) {
-      if (totals)
-        CUDA_OK(cudaFree(totals));
-      CUDA_OK(cudaMalloc(&totals, nblocks * sizeof(FpExt)));
-      totalsCap = nblocks;
-    }
-    prefixProductsChunks<<<nblocks, kScanThreads, 0, stream>>>(ctx->accum, n, totals);
-    if (nblocks > 1) {
-      prefixProductsTotals<<<1, 1, 0, stream>>>(totals, nblocks);
-      uint32_t rest = n - kScanChunk;
-      prefixProductsFixup<<<(rest + 255) / 256, 256, 0, stream>>>(ctx->accum, n, totals);
-    }
-    CUDA_OK(cudaGetLastError());
-    CUDA_OK(cudaStreamSynchronize(stream));
+    const bool ownScan = true;
 #else
+    // On ROCm sppark's prefix_op is a cooperative launch on sppark's own stream, between host
+    // waits for the context's stream and for sppark's (~0.7 ms of idle GPU per proof on an
+    // RX 9070 XT). With the async path, the same products by the three-kernel scan, on the
+    // context's stream.
+    const bool ownScan = recAsync();
+#endif
+    if (ownScan) {
+      // The host copies of ctx->workCycles and ctx->accum (managed memory, see syncSteps).
+      uint32_t n = workCycles;
+      FpExt* io = g_accumCache.accum;
+      uint32_t nblocks = (n + kScanChunk - 1) / kScanChunk;
+      static thread_local FpExt* totals = nullptr;
+      static thread_local uint32_t totalsCap = 0;
+      if (nblocks > totalsCap) {
+        if (totals)
+          CUDA_OK(cudaFree(totals));
+        CUDA_OK(cudaMalloc(&totals, nblocks * sizeof(FpExt)));
+        totalsCap = nblocks;
+      }
+      prefixProductsChunks<<<nblocks, kScanThreads, 0, stream>>>(io, n, totals);
+      if (nblocks > 1) {
+        prefixProductsTotals<<<1, 1, 0, stream>>>(totals, nblocks);
+        uint32_t rest = n - kScanChunk;
+        prefixProductsFixup<<<(rest + 255) / 256, 256, 0, stream>>>(io, n, totals);
+      }
+      CUDA_OK(cudaGetLastError());
+      if (syncSteps())
+        CUDA_OK(cudaStreamSynchronize(stream));
+      return;
+    }
+#endif
     sppark::calcPrefixProducts(ctx->accum, ctx->workCycles);
     CUDA_OK(cudaStreamSynchronize(stream));
-#endif
   }
 
   void verifyAccum() {
     nvtx3::scoped_range range("verifyAccum");
-    CUDA_OK(cudaDeviceSynchronize());
-#ifndef __HIPCC__
+    if (syncSteps())
+      CUDA_OK(cudaDeviceSynchronize());
     if (accumInl()) {
       risc0_recursion_launch_accum_inl(1, cfg.grid.x, cfg.block.x, stream, ctx);
     } else
-#endif
     parStepVerifyAccum<<<cfg.grid, cfg.block, 0, stream>>>(ctx);
     CUDA_OK(cudaStreamSynchronize(stream));
   }
@@ -834,9 +936,15 @@ const char* risc0_circuit_recursion_cuda_warmup() {
       need = more > need ? more : need;
       if (const char* e = rec_eval_check_split_warmup(&more)) return e;
       need = more > need ? more : need;
+#ifndef __HIPCC__
       size_t cur = 0;
       CUDA_OK(cudaDeviceGetLimit(&cur, cudaLimitStackSize));
       if (need > cur) CUDA_OK(cudaDeviceSetLimit(cudaLimitStackSize, need));
+#else
+      // Nothing to pre-grow: ROCm sizes a dispatch's scratch from its kernel's private segment
+      // (hipLimitStackSize only bounds the dynamic stack), so the loads above are the warmup.
+      (void)need;
+#endif
     }
 #endif
   } catch (const std::exception& err) {
