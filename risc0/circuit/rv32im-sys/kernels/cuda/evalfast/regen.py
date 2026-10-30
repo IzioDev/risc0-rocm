@@ -50,6 +50,8 @@ the bit-exactness battery on the new kernel before updating the pins.
 The ROCm kernel, eval_check_ef_hip.cu, is the chain's output after
 HIP_LAST (remat_lu.py) in to_hip.py's HIP forms: mksm2.py's shared-memory
 words cap the occupancy on RDNA, and mksub.py's splits only add calls there.
+wmma_hip.py then moves the poly_mix chains onto the matrix units for gfx12
+(RDNA4) devices only; other targets keep the scalar statements.
 
 The results are committed, so the GPU builds need no Python. Re-run this after
 changing the generated circuit (kernels/cxx/rust_poly_fp_*.cpp) or any of the
@@ -65,12 +67,16 @@ import tempfile
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import to_hip  # noqa: E402
+import wmma_hip  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SYS = os.path.normpath(os.path.join(HERE, '..', '..', '..'))  # rv32im-sys
 OUT = os.path.join(SYS, 'kernels', 'cuda', 'eval_check_ef.cu')
 OUT_HIP = os.path.join(SYS, 'kernels', 'cuda', 'eval_check_ef_hip.cu')
 HIP_LAST = 'remat_lu.py'
+# wmma_hip.py (after to_hip.py): the poly_mix chains on the gfx12 matrix units.
+WMMA_EXPECT = ('wmma_hip: 136 of 282 chains, 4672 of 4948 Fp links on the matrix units (wmin 6, 1 x 24 '
+               'slots, group 48), 0 chains without a free region')
 NS = 'namespace risc0::circuit::rv32im_v2 {'
 
 # mksub.py cut points: function, body lines, cut line, live values passed to the tail (+ input
@@ -132,11 +138,14 @@ HIP_POST_HEADER = '''//
 // multiply-adds, accfirst_cuda, the mksplit2 phase split, remat_lu), without
 // mksm2.py's shared-memory slab words, which cap the occupancy on RDNA, or
 // mksub.py's splits, in to_hip.py's HIP forms, with ef_fpext.h's lazy FpExt
-// multiply. At po2 20 with 64-wide waves and EF_MINB 4 (build.rs): 214 ms on an
-// RX 7900 XTX (gfx1100) and 255 ms on an RX 9070 XT (gfx1201), against 326 and
-// 454 ms for the previous ROCm kernel (the generator's output before its CUDA
-// post-passes). The rematerialisation relies on data, accum and mix being
-// read-only for the whole kernel.
+// multiply. On gfx12 (RDNA4) the poly_mix chains run on the matrix units
+// (wmma_hip.py: int8 WMMAs over LDS-staged constraint values, bit-exact; other
+// targets compile the scalar chains). At po2 20 with 64-wide waves and EF_MINB 4
+// (build.rs): 214 ms on an RX 7900 XTX (gfx1100) and 235 ms on an RX 9070 XT
+// (gfx1201; 257 ms with the scalar chains), against 326 and 454 ms for the
+// previous ROCm kernel (the generator's output before its CUDA post-passes). The
+// rematerialisation relies on data, accum and mix being read-only for the whole
+// kernel.
 '''
 HEADER_END = '// kernel happens to tolerate them.\n'
 
@@ -208,7 +217,11 @@ def main():
         with open(gen, newline='') as f:
             new = f.read()
     outputs = []
-    for path, text, post in ((OUT, new, POST_HEADER), (OUT_HIP, to_hip.convert(hip), HIP_POST_HEADER)):
+    wstats = []
+    hip = wmma_hip.convert(to_hip.convert(hip), stats=wstats)
+    if wstats != [WMMA_EXPECT]:
+        sys.exit('regen: EXPECT failed: wmma_hip.py printed\n  %s\nnot\n  %s' % (wstats, WMMA_EXPECT))
+    for path, text, post in ((OUT, new, POST_HEADER), (OUT_HIP, hip, HIP_POST_HEADER)):
         assert text.count(HEADER_END) == 1
         text = text.replace(HEADER_END, HEADER_END + post)
         bad = [i + 1 for i, l in enumerate(text.split('\n')) if l != l.rstrip()]

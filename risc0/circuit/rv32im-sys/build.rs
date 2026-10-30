@@ -551,8 +551,9 @@ fn build_rocm_kernels() {
 
     // Step 1: Compile eval_check standalone with hipcc: the evalfast kernel
     // (eval_check_ef_hip.cu, see its header) unless RISC0_HIP_EVAL_CHECK=combined selects the original
-    // eval_check_combined.cu. A po2 20 eval_check takes ~255 ms on an RX 9070 XT (gfx1201) against
-    // the original's 845 ms, and ~214 ms on an RX 7900 XTX (gfx1100).
+    // eval_check_combined.cu. A po2 20 eval_check takes ~235 ms on an RX 9070 XT (gfx1201; its poly_mix
+    // chains on the matrix units, ~257 ms without) against the original's 845 ms, and ~214 ms on an
+    // RX 7900 XTX (gfx1100).
     // For the original, -mllvm -amdgpu-early-inline-all=false prevents OOM on this large kernel
     // (21 functions, 2154 column reads).
     //
