@@ -791,6 +791,21 @@ static uint32_t witgenSortWin() {
   }();
   return win;
 }
+
+// stepAccum's sort window (log2 rows; cycles are grouped by major within 2^win rows, see majorKeys):
+// RISC0_HIP_ACCUM_SORT (4..24), else 9. A smaller window keeps each wave's cycles close together (row
+// locality of the trace accesses) at the cost of more major divergence; 9 is the fastest on both an
+// RX 7900 XTX and an RX 9070 XT (prove_busy po2 20, stepAccumA 3.82 -> 3.20 and 5.02 -> 3.46 ms/seg
+// vs CUDA's 14; 8 and 10 are slower on both). The gain is larger on gfx12, whose L0 misses go
+// straight to L2 (no L1 level).
+static uint32_t accumSortWin() {
+  static const uint32_t win = [] {
+    const char* e = getenv("RISC0_HIP_ACCUM_SORT");
+    int w = e ? atoi(e) : 9;
+    return uint32_t(w < 4 ? 4 : w > 24 ? 24 : w);
+  }();
+  return win;
+}
 #endif
 
 // finalizeAccum fused with eltwise_zeroize_fp(accum) (INVALID -> 0), one pass over all rows.
@@ -1236,8 +1251,8 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
           }
           s_cap[dev] = lastCycle;
         }
-        // Sort window (rows, log2) as on CUDA: cycles are grouped by major within 2^14 rows.
-        const uint32_t win = 14;
+        // Sort window (rows, log2): cycles are grouped by major within 2^win rows (accumSortWin).
+        const uint32_t win = accumSortWin();
         majorKeys<<<cfg.grid, cfg.block, 0, stream>>>(
             get_cache().a_cycles, s_keys[dev][0], s_perm[dev][0], lastCycle, win);
         uint32_t maxWin = lastCycle ? ((lastCycle - 1) >> win) : 0;
