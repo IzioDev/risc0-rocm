@@ -101,7 +101,7 @@ __device__ __forceinline__ static FpExt ef_wfin(const EfW& w, const ef_v4i* d, u
     const uint32_t d0 = d[t][0], d1 = d[t][1], d2 = d[t][2], d3 = d[t][3];
     const uint32_t x = d0 + (d1 << 8), y = d2 + (d3 << 8);
     const uint32_t lo = x + (y << 16), hi = (y >> 16) + (lo < x ? 1u : 0u);
-    const uint32_t m = lo * Fp::M, tt = hi - rk_mulhi(m, Fp::P);
+    const uint32_t m = Fp::mulM(lo), tt = hi - rk_mulhi(m, Fp::P);
     w.st[s0 * EF_WSTR + w.rdo + 16u * t] = rk_umin(tt, tt + Fp::P);
   }
   uint32_t r[4];

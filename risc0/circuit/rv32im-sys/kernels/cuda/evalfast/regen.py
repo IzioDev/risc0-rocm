@@ -51,7 +51,10 @@ The ROCm kernel, eval_check_ef_hip.cu, is the chain's output after
 HIP_LAST (remat_lu.py) in to_hip.py's HIP forms: mksm2.py's shared-memory
 words cap the occupancy on RDNA, and mksub.py's splits only add calls there.
 wmma_hip.py then moves the poly_mix chains onto the matrix units for gfx12
-(RDNA4) devices only; other targets keep the scalar statements.
+(RDNA4) devices only; other targets keep the scalar statements. hoist_hip.py
+issues the trace loads one window of statements ahead of their uses, and
+args_hip.py narrows the chain-function calls (32-bit cycle/steps, the kernel
+pointers read from a device table instead of passed in VGPRs).
 
 The results are committed, so the GPU builds need no Python. Re-run this after
 changing the generated circuit (kernels/cxx/rust_poly_fp_*.cpp) or any of the
@@ -66,6 +69,8 @@ import tempfile
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import args_hip  # noqa: E402
+import hoist_hip  # noqa: E402
 import to_hip  # noqa: E402
 import wmma_hip  # noqa: E402
 
@@ -77,6 +82,10 @@ HIP_LAST = 'remat_lu.py'
 # wmma_hip.py (after to_hip.py): the poly_mix chains on the gfx12 matrix units.
 WMMA_EXPECT = ('wmma_hip: 136 of 282 chains, 4672 of 4948 Fp links on the matrix units (wmin 6, 1 x 24 '
                'slots, group 48), 0 chains without a free region')
+# hoist_hip.py (after wmma_hip.py): the trace loads issued one window of statements ahead of their uses.
+HOIST_EXPECT = 'hoist_hip: 22 functions, 3844 trace loads issued one window ahead (window 8)'
+# args_hip.py (last): 32-bit cycle/steps; the kernel pointers from ef_ptrs instead of call arguments.
+ARGS_EXPECT = 'args_hip: 32-bit cycle/steps, 101 signatures and 20 calls without 95 pointer arguments'
 NS = 'namespace risc0::circuit::rv32im_v2 {'
 
 # mksub.py cut points: function, body lines, cut line, live values passed to the tail (+ input
@@ -140,12 +149,14 @@ HIP_POST_HEADER = '''//
 // mksub.py's splits, in to_hip.py's HIP forms, with ef_fpext.h's lazy FpExt
 // multiply. On gfx12 (RDNA4) the poly_mix chains run on the matrix units
 // (wmma_hip.py: int8 WMMAs over LDS-staged constraint values, bit-exact; other
-// targets compile the scalar chains). At po2 20 with 64-wide waves and EF_MINB 4
-// (build.rs): 214 ms on an RX 7900 XTX (gfx1100) and 235 ms on an RX 9070 XT
-// (gfx1201; 257 ms with the scalar chains), against 326 and 454 ms for the
-// previous ROCm kernel (the generator's output before its CUDA post-passes). The
-// rematerialisation relies on data, accum and mix being read-only for the whole
-// kernel.
+// targets compile the scalar chains), then the trace loads issued one window of
+// statements ahead (hoist_hip.py) and narrower chain-function calls (args_hip.py).
+// At po2 20 with 64-wide waves and EF_MINB 4 (build.rs): 161 ms on an RX 7900 XTX
+// (gfx1100) and 169 ms on an RX 9070 XT (gfx1201; 200 ms with the scalar chains),
+// against 217 and 236 ms before the uniform addressing, hoist_hip, args_hip and
+// the shift-add / v_min reductions, and 326 and 454 ms for the first ROCm kernel
+// (the generator's output before its CUDA post-passes). The rematerialisation
+// relies on data, accum and mix being read-only for the whole kernel.
 '''
 HEADER_END = '// kernel happens to tolerate them.\n'
 
@@ -221,6 +232,14 @@ def main():
     hip = wmma_hip.convert(to_hip.convert(hip), stats=wstats)
     if wstats != [WMMA_EXPECT]:
         sys.exit('regen: EXPECT failed: wmma_hip.py printed\n  %s\nnot\n  %s' % (wstats, WMMA_EXPECT))
+    hstats = []
+    hip = hoist_hip.convert(hip, stats=hstats)
+    if hstats != [HOIST_EXPECT]:
+        sys.exit('regen: EXPECT failed: hoist_hip.py printed\n  %s\nnot\n  %s' % (hstats, HOIST_EXPECT))
+    astats = []
+    hip = args_hip.convert(hip, stats=astats)
+    if astats != [ARGS_EXPECT]:
+        sys.exit('regen: EXPECT failed: args_hip.py printed\n  %s\nnot\n  %s' % (astats, ARGS_EXPECT))
     for path, text, post in ((OUT, new, POST_HEADER), (OUT_HIP, hip, HIP_POST_HEADER)):
         assert text.count(HEADER_END) == 1
         text = text.replace(HEADER_END, HEADER_END + post)

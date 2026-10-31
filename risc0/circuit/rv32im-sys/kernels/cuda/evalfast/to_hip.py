@@ -24,6 +24,22 @@
 #    through the generic Fp* parameters they compile to FLAT instructions,
 #    which count against both vmcnt and lgkmcnt and were each waited on with
 #    s_waitcnt vmcnt(0) lgkmcnt(0) (-3% on gfx1100, -1.7% on gfx1201);
+#  - uniform addressing: the chain functions get steps and the column / slab
+#    pointers as (per-lane) VGPR arguments, so every trace load computed a
+#    64-bit VGPR address (index shift + 64-bit add, the base pointers held in
+#    VGPRs and spilled). steps and the pointers are the same in every lane:
+#    read with readfirstlane, a load is one global_load with an SGPR column
+#    base (pointer + c * steps words, scalar ALU) and a 32-bit row offset
+#    shared by the column loads of one row (EF_LDC), and the slab accesses use
+#    an SGPR address; loads from the constant address space (the trace is
+#    read-only for the whole kernel, as remat.py already assumes), which the
+#    register allocator may re-issue instead of spilling; the few uniform
+#    out/mix array reads through Fp* parameters as scalar loads (EF_LDU).
+#    Fewer VGPRs let the scheduler issue the loads well ahead of their uses:
+#    -16% on gfx1100, -18% on gfx1201 (ef harness, po2 20);
+#  - the lazy reductions' Montgomery factor lo * Fp::M through Fp::mulM
+#    (ef_fp.h: two shift-adds on ROCm, where a v_mul_lo_u32 issues at a
+#    quarter of the add rate);
 #  - the device-to-device symbol copies through hipGetSymbolAddress (the
 #    standalone TU is not relocatable, where hipMemcpyToSymbol is unreliable);
 #  - the eval_check stream always synchronized, as eval_check_combined.cu does;
@@ -54,11 +70,12 @@ def convert(s):
         '#if defined(__HIP_DEVICE_COMPILE__)\n'
         '// The slab is the kernel\'s private array (scratch_* rather than FLAT accesses).\n'
         'typedef __attribute__((address_space(5))) uint32_t ef_pu32;\n'
+        '// Its address is the same in every lane: an SGPR address (ef_uptr).\n'
         '__device__ __forceinline__ uint32_t ef_ldl(const void* p, uint32_t w) {\n'
-        '  return ((const ef_pu32*)(p))[(size_t)w * RK_STRIDE];\n'
+        '  return ((const ef_pu32*)(ef_uptr(p)))[(size_t)w * RK_STRIDE];\n'
         '}\n'
         '__device__ __forceinline__ void ef_stl(void* p, uint32_t w, uint32_t v) {\n'
-        '  ((ef_pu32*)(p))[(size_t)w * RK_STRIDE] = v;\n'
+        '  ((ef_pu32*)(ef_uptr(p)))[(size_t)w * RK_STRIDE] = v;\n'
         '}\n'
         '#else\n'
         '__device__ __forceinline__ uint32_t ef_ldl(const void* p, uint32_t w) {\n'
@@ -75,9 +92,41 @@ def convert(s):
         '// Trace columns: global loads (the generic Fp* parameters would make them FLAT).\n'
         'typedef const __attribute__((address_space(1))) uint32_t ef_gu32;\n'
         '#define EF_LD(p, i) (::risc0::Fp::fromRaw(((ef_gu32*)(reinterpret_cast<const uint32_t*>(p)))[(i)]))\n'
+        '// Uniform addressing (to_hip.py): steps and the trace / slab pointers are the same in every lane.\n'
+        '#define EF_UNI32(x) ((uint32_t)__builtin_amdgcn_readfirstlane((int)(x)))\n'
+        '__device__ __forceinline__ static void* ef_uptr(const void* p) {\n'
+        '  const uint64_t v = reinterpret_cast<uint64_t>(p);\n'
+        '  return reinterpret_cast<void*>((uint64_t(EF_UNI32(v >> 32)) << 32) | EF_UNI32(v));\n'
+        '}\n'
+        '// p + w words, the uniform base of an EF_LDC column (pointer arithmetic: an SGPR base and a\n'
+        '// 32-bit VGPR offset make a global_load saddr; integer arithmetic made 64-bit VGPR addresses).\n'
+        '__device__ __forceinline__ static const char* ef_ubase(const void* p, uint32_t w) {\n'
+        '  return reinterpret_cast<const char*>(ef_uptr(p)) + uint64_t(w) * 4u;\n'
+        '}\n'
+        'typedef const __attribute__((address_space(4))) uint32_t ef_cu32;\n'
+        '// Column c of p, row (cycle - k) mod steps (EF_LDCR: the raw word, see hoist_hip.py).\n'
+        '#define EF_LDCR(p, c, k) (*(ef_cu32*)(reinterpret_cast<uint64_t>(ef_ubase((p), (c) * rk_s) + (((rk_c - (k)) & rk_m) << 2))))\n'
+        '#define EF_LDC(p, c, k) (::risc0::Fp::fromRaw(EF_LDCR(p, c, k)))\n'
+        '#define EF_LDU(p, i) (::risc0::Fp::fromRaw(((ef_cu32*)(reinterpret_cast<uint64_t>(ef_ubase((p), 0u))))[(i)]))\n'
         '#else\n'
         '#define EF_LD(p, i) (::risc0::Fp::fromRaw(__ldg(reinterpret_cast<const uint32_t*>(p) + (i))))\n'
+        '#define EF_UNI32(x) (x)\n'
+        '#define EF_LDC(p, c, k) EF_LD(p, (uint32_t)((c) * rk_s + ((rk_c - (k)) & rk_m)))\n'
+        '#define EF_LDCR(p, c, k) (EF_LDC(p, c, k).asRaw())\n'
+        '#define EF_LDU(p, i) ((p)[(i)])\n'
         '#endif\n')
+    sub('const uint32_t rk_s = (uint32_t)steps, rk_m = rk_s - 1u, rk_c = (uint32_t)cycle;',
+        'const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = (uint32_t)cycle;', 22)
+
+    def resub(pat, new, count):
+        nonlocal s
+        s, n = re.subn(pat, new, s)
+        if n != count:
+            sys.exit('to_hip: expected %d of %r, found %d' % (count, pat, n))
+    resub(r'EF_LD\((\w+|args\[\d\]), \(uint32_t\)\((\d+)u \* rk_s \+ \(\(rk_c - (\d+)u\) & rk_m\)\)\)',
+          r'EF_LDC(\1, \2u, \3u)', 5973)
+    resub(r'\b(arg\d+)\[(\d+)\]', r'EF_LDU(\1, \2)', 86)
+    resub(r'\b((?:s\.|w\.)?lo(?:\[j\])?) \* (::risc0::)?Fp::M\b', r'\2Fp::mulM(\1)', 4)
     sub('#include <cuda_runtime.h>\n', '#if !defined(__HIPCC__)\n#include <cuda_runtime.h>\n#endif\n')
     pat = re.compile(r'CUDA_OK\(cudaMemcpyToSymbolAsync\((\w+), ([^,]+), ([^,]+), 0, '
                      r'cudaMemcpyDeviceToDevice, stream\)\);')
