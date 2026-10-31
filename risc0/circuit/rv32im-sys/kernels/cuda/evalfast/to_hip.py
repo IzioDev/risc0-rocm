@@ -37,6 +37,19 @@
 #    out/mix array reads through Fp* parameters as scalar loads (EF_LDU).
 #    Fewer VGPRs let the scheduler issue the loads well ahead of their uses:
 #    -16% on gfx1100, -18% on gfx1201 (ef harness, po2 20);
+#  - the trace loads (EF_LDCR) as raw buffer loads: one buffer resource (an
+#    SGPR quad) per group of EF_BG = 32 columns, based at the group's first
+#    column, the column within the group as the SGPR offset (c % 32) * steps * 4
+#    and the row as the VGPR offset, instead of a 64-bit SGPR base computed for
+#    every column. The buffer offset is 32 bits: 32 columns of steps <= 2^25
+#    rows (po2 <= 23) stay below 4 GB, where one resource for all 211 data
+#    columns overflowed at po2 21. On gfx11 the loads carry SLC (L2 streaming;
+#    GLC was weaker, and DLC, which keeps the trace out of the Infinity Cache
+#    that serves the later chain functions' re-reads, cost +10%). On the
+#    inlined kernel (inline_hip.py, ef harness po2 20): RX 7900 XTX 155.7 ->
+#    142.7 ms (145.0 without SLC), RX 9070 XT 141.2 -> 137.3 ms (not
+#    measurably faster with the chain functions called). Other targets keep
+#    the global loads (the resource's last word is the gfx11 / gfx12 one);
 #  - the lazy reductions' Montgomery factor lo * Fp::M through Fp::mulM
 #    (ef_fp.h: two shift-adds on ROCm, where a v_mul_lo_u32 issues at a
 #    quarter of the add rate);
@@ -105,7 +118,23 @@ def convert(s):
         '}\n'
         'typedef const __attribute__((address_space(4))) uint32_t ef_cu32;\n'
         '// Column c of p, row (cycle - k) mod steps (EF_LDCR: the raw word, see hoist_hip.py).\n'
+        '#if defined(__GFX11__) || defined(__GFX12__)\n'
+        '// The trace columns through buffer resources, one per EF_BG columns (to_hip.py): SGPR offset\n'
+        '// (c % EF_BG) * steps * 4 below 4 GB for steps <= 2^25; gfx11 with SLC.\n'
+        '#define EF_BG 32u\n'
+        '#if defined(__GFX11__)\n'
+        '#define EF_BAUX 2\n'
+        '#else\n'
+        '#define EF_BAUX 0\n'
+        '#endif\n'
+        '__device__ __forceinline__ static __amdgpu_buffer_rsrc_t ef_rsrcg(const void* p, uint32_t g, uint32_t s) {\n'
+        '  return __builtin_amdgcn_make_buffer_rsrc(const_cast<char*>(reinterpret_cast<const char*>(ef_uptr(p)) + uint64_t(g) * (EF_BG * 4u) * s),\n'
+        '                                           (short)0, (int)0xffffffff, 0x31004000);\n'
+        '}\n'
+        '#define EF_LDCR(p, c, k) ((uint32_t)__builtin_amdgcn_raw_buffer_load_b32(ef_rsrcg((p), (c) / EF_BG, rk_s), ((rk_c - (k)) & rk_m) << 2, ((c) % EF_BG) * rk_s * 4u, EF_BAUX))\n'
+        '#else\n'
         '#define EF_LDCR(p, c, k) (*(ef_cu32*)(reinterpret_cast<uint64_t>(ef_ubase((p), (c) * rk_s) + (((rk_c - (k)) & rk_m) << 2))))\n'
+        '#endif\n'
         '#define EF_LDC(p, c, k) (::risc0::Fp::fromRaw(EF_LDCR(p, c, k)))\n'
         '#define EF_LDU(p, i) (::risc0::Fp::fromRaw(((ef_cu32*)(reinterpret_cast<uint64_t>(ef_ubase((p), 0u))))[(i)]))\n'
         '#else\n'

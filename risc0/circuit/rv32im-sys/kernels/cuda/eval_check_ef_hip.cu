@@ -17,13 +17,18 @@
 // multiply. On gfx12 (RDNA4) the poly_mix chains run on the matrix units
 // (wmma_hip.py: int8 WMMAs over LDS-staged constraint values, bit-exact; other
 // targets compile the scalar chains), then the trace loads issued one window of
-// statements ahead (hoist_hip.py) and narrower chain-function calls (args_hip.py).
-// At po2 20 with 64-wide waves and EF_MINB 4 (build.rs): 161 ms on an RX 7900 XTX
-// (gfx1100) and 169 ms on an RX 9070 XT (gfx1201; 200 ms with the scalar chains),
-// against 217 and 236 ms before the uniform addressing, hoist_hip, args_hip and
-// the shift-add / v_min reductions, and 326 and 454 ms for the first ROCm kernel
-// (the generator's output before its CUDA post-passes). The rematerialisation
-// relies on data, accum and mix being read-only for the whole kernel.
+// statements ahead (hoist_hip.py), narrower chain-function calls (args_hip.py),
+// every chain function inlined into the kernel (inline_hip.py), with the trace
+// loads through per-32-column buffer resources (to_hip.py) and, on gfx11, the
+// hottest slab words in LDS (smem_hip.py). At po2 20 with 64-wide waves and EF_MINB
+// 4 (build.rs): ~139 ms on an RX 7900 XTX (gfx1100) and ~137 ms on an RX 9070 XT
+// (gfx1201), against ~156 and 141 ms inlined with global loads and the scratch
+// slab, 160 and 169 ms with the chain functions called (callee-saved register
+// saves around every call), 217 and 236 ms
+// before the uniform addressing, hoist_hip, args_hip and the shift-add / v_min
+// reductions, and 326 and 454 ms for the first ROCm kernel (the generator's output
+// before its CUDA post-passes). The rematerialisation relies on data, accum and
+// mix being read-only for the whole kernel.
 #define EF_EXT_LAZY 1
 #define RISC0_INTEL_EVAL_LOHI 1
 #if !defined(__HIPCC__)
@@ -77,7 +82,23 @@ __device__ __forceinline__ static const char* ef_ubase(const void* p, uint32_t w
 }
 typedef const __attribute__((address_space(4))) uint32_t ef_cu32;
 // Column c of p, row (cycle - k) mod steps (EF_LDCR: the raw word, see hoist_hip.py).
+#if defined(__GFX11__) || defined(__GFX12__)
+// The trace columns through buffer resources, one per EF_BG columns (to_hip.py): SGPR offset
+// (c % EF_BG) * steps * 4 below 4 GB for steps <= 2^25; gfx11 with SLC.
+#define EF_BG 32u
+#if defined(__GFX11__)
+#define EF_BAUX 2
+#else
+#define EF_BAUX 0
+#endif
+__device__ __forceinline__ static __amdgpu_buffer_rsrc_t ef_rsrcg(const void* p, uint32_t g, uint32_t s) {
+  return __builtin_amdgcn_make_buffer_rsrc(const_cast<char*>(reinterpret_cast<const char*>(ef_uptr(p)) + uint64_t(g) * (EF_BG * 4u) * s),
+                                           (short)0, (int)0xffffffff, 0x31004000);
+}
+#define EF_LDCR(p, c, k) ((uint32_t)__builtin_amdgcn_raw_buffer_load_b32(ef_rsrcg((p), (c) / EF_BG, rk_s), ((rk_c - (k)) & rk_m) << 2, ((c) % EF_BG) * rk_s * 4u, EF_BAUX))
+#else
 #define EF_LDCR(p, c, k) (*(ef_cu32*)(reinterpret_cast<uint64_t>(ef_ubase((p), (c) * rk_s) + (((rk_c - (k)) & rk_m) << 2))))
+#endif
 #define EF_LDC(p, c, k) (::risc0::Fp::fromRaw(EF_LDCR(p, c, k)))
 #define EF_LDU(p, i) (::risc0::Fp::fromRaw(((ef_cu32*)(reinterpret_cast<uint64_t>(ef_ubase((p), 0u))))[(i)]))
 #else
@@ -101,6 +122,15 @@ __device__ uint64_t ef_ptrs[4];
 #define EF_GPTR(i) (reinterpret_cast<::risc0::Fp*>(ef_ptrs[(i)]))
 #endif
 #define EF_PM(i) (::risc0::FpExt(::risc0::Fp::fromRaw(ef_pm_raw[4 * (i) + 0]), ::risc0::Fp::fromRaw(ef_pm_raw[4 * (i) + 1]), ::risc0::Fp::fromRaw(ef_pm_raw[4 * (i) + 2]), ::risc0::Fp::fromRaw(ef_pm_raw[4 * (i) + 3])))
+// inline_hip.py: the chain functions are inlined into ef_eval_split (EF_CHAIN), each with its own
+// opaque row index (EF_OPQ: an empty asm statement, unique per function) so that loads of the same
+// trace word in different functions are not merged.
+#define EF_CHAIN __attribute__((always_inline))
+#if defined(__HIP_DEVICE_COMPILE__)
+#define EF_OPQ(x, n) asm("; ef_row " #n : "+v"(x))
+#else
+#define EF_OPQ(x, n)
+#endif
 namespace risc0::circuit::rv32im_v2 {
 namespace {
 constexpr size_t kInvRate = 4;
@@ -426,6 +456,28 @@ __device__ __forceinline__ void ef_stl(void* p, uint32_t w, uint32_t v) {
 #endif
 #define RK_LD4(p, w0, w1, w2, w3) (static_cast<const ::risc0::FpExt>(::risc0::FpExt(RK_LD1(p, w0), RK_LD1(p, w1), RK_LD1(p, w2), RK_LD1(p, w3))))
 #define RK_ST4(p, w0, w1, w2, w3, v) do { ::risc0::FpExt _rk_v = (v); RK_ST1(p, w0, _rk_v.elems[0]); RK_ST1(p, w1, _rk_v.elems[1]); RK_ST1(p, w2, _rk_v.elems[2]); RK_ST1(p, w3, _rk_v.elems[3]); } while (0)
+// smem_hip.py: on gfx11 the hottest slab words of each phase in LDS (ef_sm), the rest in the
+// scratch slab; other targets use the slab for every word.
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__)
+#define EF_NHOT 32u
+__shared__ uint32_t ef_sm[EF_NHOT][EF_THREADS];
+#define EF_SMW(k) ef_sm[k][threadIdx.x]
+__device__ __forceinline__ constexpr int ef_hotM(uint32_t w) { switch (w) { case 5u: return 0; case 7u: return 1; case 8u: return 2; case 18u: return 3; case 1u: return 4; case 14u: return 5; case 10u: return 6; case 15u: return 7; case 9u: return 8; case 20u: return 9; case 16u: return 10; case 0u: return 11; case 11u: return 12; case 12u: return 13; case 17u: return 14; case 22u: return 15; case 21u: return 16; case 13u: return 17; case 19u: return 18; case 4u: return 19; case 23u: return 20; case 29u: return 21; case 3u: return 22; case 6u: return 23; case 24u: return 24; case 25u: return 25; case 27u: return 26; case 28u: return 27; case 26u: return 28; case 2u: return 29; case 33u: return 30; case 34u: return 31; default: return -1; } }
+#define RK_LD1M(p, w) (static_cast<const ::risc0::Fp>(::risc0::Fp::fromRaw(ef_hotM(w) >= 0 ? EF_SMW(ef_hotM(w) < 0 ? 0 : ef_hotM(w)) : ef_ldl((p), (w)))))
+#define RK_ST1M(p, w, v) do { if (ef_hotM(w) >= 0) EF_SMW(ef_hotM(w) < 0 ? 0 : ef_hotM(w)) = ::risc0::Fp(v).asRaw(); else ef_stl((p), (w), ::risc0::Fp(v).asRaw()); } while (0)
+__device__ __forceinline__ constexpr int ef_hotL(uint32_t w) { switch (w) { case 4u: return 0; case 5u: return 1; case 6u: return 2; case 7u: return 3; case 8u: return 4; case 9u: return 5; case 10u: return 6; case 11u: return 7; case 20u: return 8; case 21u: return 9; case 22u: return 10; case 23u: return 11; case 40u: return 12; case 41u: return 13; case 42u: return 14; case 43u: return 15; case 60u: return 16; case 61u: return 17; case 62u: return 18; case 63u: return 19; case 80u: return 20; case 81u: return 21; case 82u: return 22; case 83u: return 23; case 84u: return 24; case 85u: return 25; case 86u: return 26; case 87u: return 27; case 92u: return 28; case 93u: return 29; case 94u: return 30; case 95u: return 31; default: return -1; } }
+#define RK_LD1L(p, w) (static_cast<const ::risc0::Fp>(::risc0::Fp::fromRaw(ef_hotL(w) >= 0 ? EF_SMW(ef_hotL(w) < 0 ? 0 : ef_hotL(w)) : ef_ldl((p), (w)))))
+#define RK_ST1L(p, w, v) do { if (ef_hotL(w) >= 0) EF_SMW(ef_hotL(w) < 0 ? 0 : ef_hotL(w)) = ::risc0::Fp(v).asRaw(); else ef_stl((p), (w), ::risc0::Fp(v).asRaw()); } while (0)
+#else
+#define RK_LD1M RK_LD1
+#define RK_ST1M RK_ST1
+#define RK_LD1L RK_LD1
+#define RK_ST1L RK_ST1
+#endif
+#define RK_LD4M(p, w0, w1, w2, w3) (static_cast<const ::risc0::FpExt>(::risc0::FpExt(RK_LD1M(p, w0), RK_LD1M(p, w1), RK_LD1M(p, w2), RK_LD1M(p, w3))))
+#define RK_ST4M(p, w0, w1, w2, w3, v) do { ::risc0::FpExt _rk_v = (v); RK_ST1M(p, w0, _rk_v.elems[0]); RK_ST1M(p, w1, _rk_v.elems[1]); RK_ST1M(p, w2, _rk_v.elems[2]); RK_ST1M(p, w3, _rk_v.elems[3]); } while (0)
+#define RK_LD4L(p, w0, w1, w2, w3) (static_cast<const ::risc0::FpExt>(::risc0::FpExt(RK_LD1L(p, w0), RK_LD1L(p, w1), RK_LD1L(p, w2), RK_LD1L(p, w3))))
+#define RK_ST4L(p, w0, w1, w2, w3, v) do { ::risc0::FpExt _rk_v = (v); RK_ST1L(p, w0, _rk_v.elems[0]); RK_ST1L(p, w1, _rk_v.elems[1]); RK_ST1L(p, w2, _rk_v.elems[2]); RK_ST1L(p, w3, _rk_v.elems[3]); } while (0)
 __device__ FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3);
 __device__ FpExt rv32im_v2_18(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3);
 __device__ FpExt rv32im_v2_17(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3);
@@ -448,7 +500,7 @@ __device__ FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg0, Fp arg
 __device__ FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3);
 __device__ FpExt poly_fp(uint32_t cycle, uint32_t steps, Fp** args);
 
-__device__ EF_NOINLINE FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3) {
+__device__ EF_CHAIN FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3) {
   FpExt* arg7 = reinterpret_cast<FpExt*>(arg0);
   Fp* arg8 = EF_GPTR(0);
   Fp* arg9 = EF_GPTR(1);
@@ -461,7 +513,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* ar
   FpExt arg4(arg4_e0, arg4_e1, arg4_e2, arg4_e3);
   FpExt arg5(arg5_e0, arg5_e1, arg5_e2, arg5_e3);
   FpExt arg6(arg6_e0, arg6_e1, arg6_e2, arg6_e3);
-  size_t mask = steps - 1; const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = (uint32_t)cycle;
+  size_t mask = steps - 1; uint32_t rk_c_o = (uint32_t)cycle; EF_OPQ(rk_c_o, 1); const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = rk_c_o;
   const uint32_t efl_arg8_136_0 = EF_LDCR(arg8, 136u, 0u);
   const uint32_t efl_arg8_137_0 = EF_LDCR(arg8, 137u, 0u);
   const uint32_t efl_arg8_138_0 = EF_LDCR(arg8, 138u, 0u);
@@ -505,7 +557,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg8_152_0 = EF_LDCR(arg8, 152u, 0u);
   const uint32_t efl_arg8_153_0 = EF_LDCR(arg8, 153u, 0u);
   const uint32_t efl_arg8_154_0 = EF_LDCR(arg8, 154u, 0u);
-  auto x180 = RK_LD1(arg0, 17u);
+  auto x180 = RK_LD1M(arg0, 17u);
   EF_W((const int efq_0_12 = ef_wq(efw, 19u); ef_wst(efw, 12u, x180);), RkAcc x181 = rk_link_nf_k(x179, x180, 19u);)
   auto x182 = (::risc0::Fp::fromRaw(efl_arg8_148_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg8_148_0)));
   EF_W((ef_wst(efw, 13u, x182);), RkAcc x183 = rk_link_k(x181, x182, 20u);)
@@ -554,7 +606,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg8_169_0 = EF_LDCR(arg8, 169u, 0u);
   auto x212 = (::risc0::Fp::fromRaw(efl_arg8_163_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg8_163_0)));
   EF_W((const int efq_0_28 = ef_wq(efw, 35u); ef_wst(efw, 4u, x212);), RkAcc x213 = rk_link_nf_k(x211, x212, 35u);)
-  auto x214 = RK_LD1(arg0, 19u);
+  auto x214 = RK_LD1M(arg0, 19u);
   EF_W((ef_wst(efw, 5u, x214);), RkAcc x215 = rk_link_k(x213, x214, 36u);)
   auto x216 = (::risc0::Fp::fromRaw(efl_arg8_164_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg8_164_0)));
   EF_W((ef_wst(efw, 6u, x216);), RkAcc x217 = rk_link_nf_k(x215, x216, 37u);)
@@ -603,7 +655,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((const int efq_0_44 = ef_wq(efw, 51u); ef_wst(efw, 20u, x244);), RkAcc x245 = rk_link_nf_k(x243, x244, 51u);)
   auto x246 = (::risc0::Fp::fromRaw(efl_arg8_179_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg8_179_0)));
   EF_W((ef_wst(efw, 21u, x246);), RkAcc x247 = rk_link_k(x245, x246, 52u);)
-  auto x248 = RK_LD1(arg0, 20u);
+  auto x248 = RK_LD1M(arg0, 20u);
   EF_W((ef_wst(efw, 22u, x248);), RkAcc x249 = rk_link_nf_k(x247, x248, 53u);)
   auto x250 = (::risc0::Fp::fromRaw(efl_arg8_180_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg8_180_0)));
   EF_W((ef_wst(efw, 23u, x250); ef_wblk(efw, efd_0, 16u, efq_0_40); ef_wblk(efw, efd_0, 20u, efq_0_44); efb_0 = ef_wfin(efw, efd_0, 0u, efb_0);), RkAcc x251 = rk_link_k(x249, x250, 54u);)
@@ -652,7 +704,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 13u, x278);), RkAcc x279 = rk_link_k(x277, x278, 68u);)
   auto x280 = (::risc0::Fp::fromRaw(efl_arg8_195_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg8_195_0)));
   EF_W((ef_wst(efw, 14u, x280);), RkAcc x281 = rk_link_nf_k(x279, x280, 69u);)
-  auto x282 = RK_LD1(arg0, 22u);
+  auto x282 = RK_LD1M(arg0, 22u);
   EF_W((ef_wst(efw, 15u, x282); ef_wblk(efw, efd_0, 8u, efq_0_56);), RkAcc x283 = rk_link_k(x281, x282, 70u);)
   const uint32_t efl_arg8_37_0 = EF_LDCR(arg8, 37u, 0u);
   const uint32_t efl_arg8_25_0 = EF_LDCR(arg8, 25u, 0u);
@@ -690,7 +742,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg8_30_0 = EF_LDCR(arg8, 30u, 0u);
   auto x295 = x294 - x40;
   EF_W((ef_v4i efd_1[4] = {}; const int efq_1_0 = ef_wq(efw, 1u); ef_wst(efw, 0u, x291);), RkAcc x296 = rk_link_nf_k(arg3, x291, 1u);)
-  auto x297 = RK_LD1(arg0, 15u);
+  auto x297 = RK_LD1M(arg0, 15u);
   EF_W((ef_wst(efw, 1u, x297);), RkAcc x298 = rk_link_k(x296, x297, 2u);)
   constexpr Fp x27(1);
   auto x299 = x31 - x27;
@@ -917,9 +969,9 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* ar
   // lincombF: fused into a lazy Fp linear combination
   auto x437 = ef_lsub(x27, x61);
   // lincombF: fused into a lazy Fp linear combination
-  auto x439 = RK_LD1(arg0, 16u);
+  auto x439 = RK_LD1M(arg0, 16u);
   auto x440 = x37 + x439;
-  RK_ST1(arg0, 15u, x440);
+  RK_ST1M(arg0, 15u, x440);
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
@@ -1022,7 +1074,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* ar
   auto x505 = x39 + x504;
   const uint32_t efl_arg8_40_0 = EF_LDCR(arg8, 40u, 0u);
   const uint32_t efl_arg8_42_0 = EF_LDCR(arg8, 42u, 0u);
-  RK_ST1(arg0, 16u, x505);
+  RK_ST1M(arg0, 16u, x505);
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
@@ -1071,10 +1123,10 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* ar
   auto x536 = x132 * x29;
   auto x133 = ::risc0::Fp::fromRaw(efl_arg8_46_0);
   auto x537 = x536 + x133;
-  auto x538 = RK_LD1(arg0, 6u);
+  auto x538 = RK_LD1M(arg0, 6u);
   auto x539 = x538 - x537;
   EF_W((const int efq_5_8 = ef_wq(efw, 296u); ef_wst(efw, 8u, x539);), RkAcc x540 = rk_link_nf_k(x535, x539, 296u);)
-  auto x541 = RK_LD1(arg0, 8u);
+  auto x541 = RK_LD1M(arg0, 8u);
   const uint32_t efl_arg8_49_0 = EF_LDCR(arg8, 49u, 0u);
   const uint32_t efl_arg8_51_0 = EF_LDCR(arg8, 51u, 0u);
   auto x542 = x541 + x132;
@@ -1102,15 +1154,15 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* ar
   auto x138 = ::risc0::Fp::fromRaw(efl_arg8_52_0);
   auto x556 = x555 * x138;
   auto x557 = x556 - x552;
-  RK_ST1(arg0, 6u, x557);
+  RK_ST1M(arg0, 6u, x557);
   EF_W((ef_wst(efw, 13u, x557);), RkAcc x558 = rk_link_k(x554, x557, 301u);)
   auto x559 = x137 * x555;
   const uint32_t efl_arg8_53_0 = EF_LDCR(arg8, 53u, 0u);
-  RK_ST1(arg0, 8u, x559);
+  RK_ST1M(arg0, 8u, x559);
   EF_W((ef_wst(efw, 14u, x559);), RkAcc x560 = rk_link_nf_k(x558, x559, 302u);)
   auto x561 = x137 * x138;
   EF_W((ef_wst(efw, 15u, x561); ef_wblk(efw, efd_5, 8u, efq_5_8);), RkAcc x562 = rk_link_k(x560, x561, 303u);)
-  auto x563 = RK_LD1(arg0, 1u);
+  auto x563 = RK_LD1M(arg0, 1u);
   const uint32_t efl_arg8_55_0 = EF_LDCR(arg8, 55u, 0u);
   const uint32_t efl_arg8_59_0 = EF_LDCR(arg8, 59u, 0u);
   const uint32_t efl_arg8_0_0 = EF_LDCR(arg8, 0u, 0u);
@@ -1119,7 +1171,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* ar
   // lincombF: fused into a lazy Fp linear combination
   auto x566 = ef_lsub(x27, x564);
   // lincombF: fused into a lazy Fp linear combination
-  auto x568 = RK_LD1(arg0, 4u);
+  auto x568 = RK_LD1M(arg0, 4u);
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   auto x139 = ::risc0::Fp::fromRaw(efl_arg8_53_0);
@@ -1140,7 +1192,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg8_64_0 = EF_LDCR(arg8, 64u, 0u);
   const uint32_t efl_arg8_61_0 = EF_LDCR(arg8, 61u, 0u);
   auto x578 = x142 - x577;
-  RK_ST1(arg0, 1u, x578);
+  RK_ST1M(arg0, 1u, x578);
   EF_W((ef_wst(efw, 19u, x578); ef_wblk(efw, efd_5, 12u, efq_5_12);), RkAcc x579 = rk_link_k(x576, x578, 307u);)
   auto x143 = ::risc0::Fp::fromRaw(efl_arg8_54_0);
   auto x581 = x143 - x139;
@@ -1213,7 +1265,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 7u, x208); ef_wblk(efw, efd_6, 0u, efq_6_24);), RkAcc x636 = rk_link_k(x635, x208, 32u);)
   EF_W((const int efq_6_32 = ef_wq(efw, 33u); ef_wst(efw, 8u, x210);), RkAcc x637 = rk_link_nf_k(x636, x210, 33u);)
   EF_W((ef_wst(efw, 9u, x212);), RkAcc x638 = rk_link_k(x637, x212, 34u);)
-  auto x639 = RK_LD1(arg0, 18u);
+  auto x639 = RK_LD1M(arg0, 18u);
   auto x640 = x439 - x639;
   EF_W((ef_wst(efw, 10u, x640);), RkAcc x641 = rk_link_nf_k(x638, x640, 35u);)
   EF_W((ef_wst(efw, 11u, x216); ef_wblk(efw, efd_6, 4u, efq_6_28);), RkAcc x642 = rk_link_k(x641, x216, 36u);)
@@ -1249,7 +1301,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 17u, x276);), RkAcc x672 = rk_link_k(x671, x276, 66u);)
   EF_W((ef_wst(efw, 18u, x278);), RkAcc x673 = rk_link_nf_k(x672, x278, 67u);)
   EF_W((ef_wst(efw, 19u, x280); ef_wblk(efw, efd_6, 12u, efq_6_60);), RkAcc x674 = rk_link_k(x673, x280, 68u);)
-  auto x675 = RK_LD1(arg0, 21u);
+  auto x675 = RK_LD1M(arg0, 21u);
   auto x676 = x504 - x675;
   EF_W((const int efq_6_68 = ef_wq(efw, 69u); ef_wst(efw, 20u, x676);), RkAcc x677 = rk_link_nf_k(x674, x676, 69u);)
   EF_W((ef_wst(efw, 21u, x31);), RkAcc x678 = rk_link_k(x677, x31, 70u);)
@@ -1371,7 +1423,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* ar
   // lincombF: fused into a lazy Fp linear combination
   auto x957 = ((Fp(1u) - ::risc0::Fp::fromRaw(efl_arg8_18_0)) * ::risc0::Fp::fromRaw(efl_arg8_14_4));
   auto x958 = x957 + x603;
-  RK_ST1(arg0, 17u, x958);
+  RK_ST1M(arg0, 17u, x958);
   // lincombF: fused into a lazy Fp linear combination
   auto x960 = x27 - x67;
   const uint32_t efl_arg8_15_4 = EF_LDCR(arg8, 15u, 4u);
@@ -1389,13 +1441,13 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* ar
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx973 = rkw1_ff0(x71, x958, false); rkw1_ff(_wx973, x971, x961, false); auto x973 = rkw1_fin(_wx973);
   // lincombF: fused into a lazy Fp linear combination
-  auto x975 = RK_LD1(arg0, 5u);
+  auto x975 = RK_LD1M(arg0, 5u);
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   auto x979 = ((Fp(1u) - ::risc0::Fp::fromRaw(efl_arg8_18_0)) * ::risc0::Fp::fromRaw(efl_arg8_15_4));
   auto x980 = x979 + x504;
-  RK_ST1(arg0, 5u, x980);
+  RK_ST1M(arg0, 5u, x980);
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx983 = rkw1_ff0(x67, x980, false); rkw1_ff(_wx983, x960, x979, false); auto x983 = rkw1_fin(_wx983);
@@ -1408,7 +1460,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* ar
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx991 = rkw1_ff0(x71, x980, false); rkw1_ff(_wx991, x971, x979, false); auto x991 = rkw1_fin(_wx991);
   // lincombF: fused into a lazy Fp linear combination
-  auto x993 = RK_LD1(arg0, 7u);
+  auto x993 = RK_LD1M(arg0, 7u);
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
@@ -1434,7 +1486,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 13u, x557);), RkAcc x1016 = rk_link_k(x1015, x557, 324u);)
   EF_W((ef_wst(efw, 14u, x559);), RkAcc x1017 = rk_link_nf_k(x1016, x559, 325u);)
   EF_W((ef_wst(efw, 15u, x561); ef_wblk(efw, efd_15, 8u, efq_15_8);), RkAcc x1018 = rk_link_k(x1017, x561, 326u);)
-  auto x1019 = RK_LD1(arg0, 0u);
+  auto x1019 = RK_LD1M(arg0, 0u);
   auto x1020 = x552 * x1019;
   // lincombF: fused into a lazy Fp linear combination
   auto x1022 = ef_lsub(x27, x1020);
@@ -1470,7 +1522,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* ar
   auto x1047 = x957 * x56;
   const uint32_t efl_arg8_76_0 = EF_LDCR(arg8, 76u, 0u);
   const uint32_t efl_arg8_77_0 = EF_LDCR(arg8, 77u, 0u);
-  RK_ST1(arg0, 0u, x1047);
+  RK_ST1M(arg0, 0u, x1047);
   // lincombF: fused into a lazy Fp linear combination
   auto x1049 = (::risc0::Fp::fromRaw(efl_arg8_78_0) * Fp(32768u));
   // lincombF: fused into a lazy Fp linear combination
@@ -1482,7 +1534,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* ar
   // lincombF: fused into a lazy Fp linear combination
   auto x1056 = (::risc0::Fp::fromRaw(efl_arg8_74_0) * Fp(2u));
   RkW1 _wx1057 = rkw1_ff0(x290, x12, false); rkw1_v(_wx1057, x1049, false); rkw1_ff(_wx1057, x152, x13, false); rkw1_v(_wx1057, x598, false); rkw1_v(_wx1057, x1054, false); rkw1_v(_wx1057, x1056, false); auto x1057 = rkw1_fin(_wx1057);
-  RK_ST1(arg0, 7u, x1057);
+  RK_ST1M(arg0, 7u, x1057);
   constexpr Fp x6(65520);
   auto x153 = ::risc0::Fp::fromRaw(efl_arg8_69_0);
   auto x1058 = x153 * x6;
@@ -1490,7 +1542,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* ar
   auto x1060 = x1058 + x1059;
   auto x154 = ::risc0::Fp::fromRaw(efl_arg8_77_0);
   auto x1061 = x1060 + x154;
-  RK_ST1(arg0, 18u, x1061);
+  RK_ST1M(arg0, 18u, x1061);
   constexpr Fp x5(5);
   auto x1062 = x290 - x5;
   auto x2000397 = x1062 - x604;
@@ -1587,24 +1639,24 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 7u, x2000060); ef_wblk(efw, efd_19, 0u, efq_19_24);), RkAcc x2000061 = rk_link_k(x2000059, x2000060, 489u);)
   auto x2000062 = ef_lmul(x56, x35);
   EF_W((const int efq_19_32 = ef_wq4(efw, 490u, 490u, 490u, 490u, 1u); ef_wst(efw, 8u, x2000062); ef_wblk(efw, efd_19, 4u, efq_19_28); ef_wblk(efw, efd_19, 8u, efq_19_32); FpExt x1146 = ef_wfin(efw, efd_19, 0u, x1103);), FpExt x1146 = rk_fin(rk_link_k(x2000061, x2000062, 490u));)
-  auto x1147 = RK_LD1(arg0, 14u);
+  auto x1147 = RK_LD1M(arg0, 14u);
   // lincombF: fused into a lazy Fp linear combination
   auto x1149 = x957 + x1147;
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx1152 = rkw1_ff0(x1147, x53, false); rkw1_v(_wx1152, x1041, false); rkw1_v(_wx1152, x1042, false); rkw1_ff(_wx1152, x1149, x54, false); auto x1152 = rkw1_fin(_wx1152);
-  RK_ST1(arg0, 14u, x1152);
+  RK_ST1M(arg0, 14u, x1152);
   auto x155 = ::risc0::Fp::fromRaw(efl_arg8_100_0);
   auto x1153 = x155 * x53;
   auto x1154 = x979 + x155;
   auto x1155 = x1154 * x54;
-  RK_ST1(arg0, 19u, x1155);
+  RK_ST1M(arg0, 19u, x1155);
   auto x1156 = x1046 + x1153;
-  RK_ST1(arg0, 20u, x1156);
+  RK_ST1M(arg0, 20u, x1156);
   auto x1157 = rv32im_v2_18(cycle, steps, arg0, x1146.elems[0], x1146.elems[1], x1146.elems[2], x1146.elems[3], x1037.elems[0], x1037.elems[1], x1037.elems[2], x1037.elems[3], arg4.elems[0], arg4.elems[1], arg4.elems[2], arg4.elems[3]);
   return x1157;
 }
-__device__ EF_NOINLINE FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3, Fp arg8_e0, Fp arg8_e1, Fp arg8_e2, Fp arg8_e3) {
+__device__ EF_CHAIN FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3, Fp arg8_e0, Fp arg8_e1, Fp arg8_e2, Fp arg8_e3) {
   FpExt* arg7 = reinterpret_cast<FpExt*>(arg0);
   Fp* arg9 = EF_GPTR(0);
   Fp* arg10 = EF_GPTR(1);
@@ -1618,7 +1670,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* ar
   FpExt arg5(arg5_e0, arg5_e1, arg5_e2, arg5_e3);
   FpExt arg6(arg6_e0, arg6_e1, arg6_e2, arg6_e3);
   FpExt arg8(arg8_e0, arg8_e1, arg8_e2, arg8_e3);
-  size_t mask = steps - 1; const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = (uint32_t)cycle;
+  size_t mask = steps - 1; uint32_t rk_c_o = (uint32_t)cycle; EF_OPQ(rk_c_o, 2); const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = rk_c_o;
   auto x155 = EF_LDU(arg12, 33);
   auto x156 = EF_LDU(arg12, 34);
   auto x157 = EF_LDU(arg12, 35);
@@ -1837,7 +1889,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* ar
   auto x344 = x33 - x62;
   auto x345 = x62 * x344;
   EF_W((ef_v4i efd_27[4] = {}; const int efq_27_0 = ef_wq(efw, 131u); ef_wst(efw, 0u, x345);), RkAcc x346 = rk_link_nf_k(x323, x345, 131u);)
-  auto x347 = RK_LD1(arg0, 6u);
+  auto x347 = RK_LD1M(arg0, 6u);
   const uint32_t efl_arg9_115_0 = EF_LDCR(arg9, 115u, 0u);
   auto x63 = ::risc0::Fp::fromRaw(efl_arg9_114_0);
   auto x348 = x347 * x63;
@@ -1853,7 +1905,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* ar
   auto x356 = ef_lsub(x33, x344);
   constexpr Fp x23(64);
   // lincombF: fused into a lazy Fp linear combination
-  auto x358 = RK_LD1(arg0, 4u);
+  auto x358 = RK_LD1M(arg0, 4u);
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   auto x64 = ::risc0::Fp::fromRaw(efl_arg9_115_0);
@@ -1946,7 +1998,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 18u, x401); ef_wblk(efw, efd_27, 12u, efq_27_12); ef_wblk(efw, efd_27, 16u, efq_27_16); FpExt x402 = ef_wfin(efw, efd_27, 0u, x323);), FpExt x402 = rk_fin(rk_link_k(x398, x401, 150u));)
   auto x76 = ::risc0::Fp::fromRaw(efl_arg9_6_0);
   RkW _cx403 = rk_cl0(arg4, x76 * x402, 417u); FpExt x403 = rkw_fin(_cx403);
-  auto x404 = RK_LD1(arg0, 7u);
+  auto x404 = RK_LD1M(arg0, 7u);
   auto x405 = x404 + x347;
   auto x406 = (::risc0::Fp::fromRaw(efl_arg9_97_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_97_0)));
   EF_W((ef_v4i efd_28[4] = {}; FpExt efb_28 = arg5; const int efq_28_0 = ef_wq4(efw, 40u, 491u, 492u, 493u, 4u); ef_wst(efw, 0u, x406);), RkAcc x407 = rk_link_nf_k(arg5, x406, 40u);)
@@ -1956,22 +2008,22 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg9_82_0 = EF_LDCR(arg9, 82u, 0u);
   const uint32_t efl_arg9_79_0 = EF_LDCR(arg9, 79u, 0u);
   const uint32_t efl_arg9_83_0 = EF_LDCR(arg9, 83u, 0u);
-  auto x408 = RK_LD1(arg0, 1u);
-  auto x409 = RK_LD1(arg0, 5u);
+  auto x408 = RK_LD1M(arg0, 1u);
+  auto x409 = RK_LD1M(arg0, 5u);
   auto x410 = ef_lsub(x408, x409);
-  auto x412 = RK_LD1(arg0, 8u);
+  auto x412 = RK_LD1M(arg0, 8u);
   auto x77 = ::risc0::Fp::fromRaw(efl_arg9_98_0);
   auto x413 = x412 - x77;
   auto x78 = ::risc0::Fp::fromRaw(efl_arg9_75_0);
   auto x415 = x78 - x22;
   auto x417 = (::risc0::Fp::fromRaw(efl_arg9_80_0) - Fp(1u));
-  auto x419 = RK_LD1(arg0, 9u);
+  auto x419 = RK_LD1M(arg0, 9u);
   auto x79 = ::risc0::Fp::fromRaw(efl_arg9_76_0);
   auto x422 = x79 - x77;
   auto x424 = (::risc0::Fp::fromRaw(efl_arg9_78_0) - ::risc0::Fp::fromRaw(efl_arg9_82_0));
   auto x426 = (::risc0::Fp::fromRaw(efl_arg9_79_0) - ::risc0::Fp::fromRaw(efl_arg9_83_0));
   auto x428 = x45 - x33;
-  auto x430 = RK_LD1(arg0, 10u);
+  auto x430 = RK_LD1M(arg0, 10u);
   auto x431 = x42 - x430;
   auto x83 = ::risc0::Fp::fromRaw(efl_arg9_97_0);
   auto x2000063 = x83 * x410;
@@ -2135,7 +2187,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* ar
   // lincombF: fused into a lazy Fp linear combination
   auto x101 = ::risc0::Fp::fromRaw(efl_arg9_110_0);
   // lincombF: fused into a lazy Fp linear combination
-  auto x518 = RK_LD1(arg0, 2u);
+  auto x518 = RK_LD1M(arg0, 2u);
   auto x519 = x518 - x35;
   auto x520 = (::risc0::Fp::fromRaw(efl_arg9_112_0) - Fp(1u));
   EF_W((const int efq_28_44 = ef_wq(efw, 87u); ef_wst(efw, 20u, x520);), RkAcc x521 = rk_link_nf_k(x515, x520, 87u);)
@@ -2321,22 +2373,22 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* ar
   auto x665 = x664 - x33;
   auto x666 = ((Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_18_0)) * ::risc0::Fp::fromRaw(efl_arg9_14_4));
   auto x667 = x666 + x393;
-  RK_ST1(arg0, 1u, x667);
+  RK_ST1M(arg0, 1u, x667);
   auto x668 = (((Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_18_0)) * ::risc0::Fp::fromRaw(efl_arg9_17_4)) + ::risc0::Fp::fromRaw(efl_arg9_18_0));
   const uint32_t efl_arg9_189_0 = EF_LDCR(arg9, 189u, 0u);
   const uint32_t efl_arg9_191_0 = EF_LDCR(arg9, 191u, 0u);
   auto x669 = x668 - x33;
-  RK_ST1(arg0, 2u, x669);
+  RK_ST1M(arg0, 2u, x669);
   auto x670 = x664 - x27;
-  RK_ST1(arg0, 4u, x670);
+  RK_ST1M(arg0, 4u, x670);
   auto x671 = x664 - x26;
-  RK_ST1(arg0, 5u, x671);
+  RK_ST1M(arg0, 5u, x671);
   constexpr Fp x17(6);
   auto x672 = x664 - x17;
-  RK_ST1(arg0, 6u, x672);
+  RK_ST1M(arg0, 6u, x672);
   constexpr Fp x16(7);
   auto x673 = x664 - x16;
-  RK_ST1(arg0, 7u, x673);
+  RK_ST1M(arg0, 7u, x673);
   auto x121 = ::risc0::Fp::fromRaw(efl_arg9_189_0);
   auto x674 = x121 - x454;
   RkAcc x675 = rk_link_nf_k(arg2, x674, 0u);
@@ -2370,7 +2422,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg9_43_0 = EF_LDCR(arg9, 43u, 0u);
   const uint32_t efl_arg9_44_0 = EF_LDCR(arg9, 44u, 0u);
   auto x697 = x47 - x454;
-  RK_ST1(arg0, 8u, x697);
+  RK_ST1M(arg0, 8u, x697);
   EF_W((const int efq_35_4 = ef_wq4(efw, 4u, 6u, 7u, 8u, 4u); ef_wst(efw, 4u, x697);), RkAcc x698 = rk_link_nf_k(x696, x697, 4u);)
   auto x700 = x44 - x682;
   EF_W((ef_wst(efw, 5u, x700);), RkAcc x701 = rk_link_k(x698, x700, 6u);)
@@ -2391,7 +2443,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg9_46_0 = EF_LDCR(arg9, 46u, 0u);
   const uint32_t efl_arg9_47_0 = EF_LDCR(arg9, 47u, 0u);
   auto x710 = x126 - x454;
-  RK_ST1(arg0, 9u, x710);
+  RK_ST1M(arg0, 9u, x710);
   EF_W((ef_wst(efw, 10u, x710);), RkAcc x711 = rk_link_nf_k(x709, x710, 11u);)
   auto x127 = ::risc0::Fp::fromRaw(efl_arg9_39_0);
   auto x713 = x127 - x683;
@@ -2416,7 +2468,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 15u, x721); ef_wblk(efw, efd_35, 8u, efq_35_8);), RkAcc x722 = rk_link_k(x720, x721, 17u);)
   auto x134 = ::risc0::Fp::fromRaw(efl_arg9_53_0);
   auto x723 = x134 - x454;
-  RK_ST1(arg0, 10u, x723);
+  RK_ST1M(arg0, 10u, x723);
   EF_W((const int efq_35_16 = ef_wq4(efw, 18u, 20u, 21u, 22u, 4u); ef_wst(efw, 16u, x723);), RkAcc x724 = rk_link_nf_k(x722, x723, 18u);)
   const uint32_t efl_arg9_55_0 = EF_LDCR(arg9, 55u, 0u);
   const uint32_t efl_arg9_61_0 = EF_LDCR(arg9, 61u, 0u);
@@ -2444,7 +2496,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg9_64_0 = EF_LDCR(arg9, 64u, 0u);
   const uint32_t efl_arg9_65_0 = EF_LDCR(arg9, 65u, 0u);
   auto x736 = x140 - x454;
-  RK_ST1(arg0, 11u, x736);
+  RK_ST1M(arg0, 11u, x736);
   EF_W((ef_wst(efw, 22u, x736);), RkAcc x737 = rk_link_nf_k(x735, x736, 25u);)
   auto x141 = ::risc0::Fp::fromRaw(efl_arg9_57_0);
   auto x739 = x141 - x685;
@@ -2471,7 +2523,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 3u, x747); ef_wblk(efw, efd_35, 20u, efq_35_20);), RkAcc x748 = rk_link_k(x746, x747, 31u);)
   auto x146 = ::risc0::Fp::fromRaw(efl_arg9_71_0);
   auto x749 = x146 - x454;
-  RK_ST1(arg0, 12u, x749);
+  RK_ST1M(arg0, 12u, x749);
   EF_W((const int efq_35_28 = ef_wq4(efw, 32u, 34u, 35u, 36u, 4u); ef_wst(efw, 4u, x749);), RkAcc x750 = rk_link_nf_k(x748, x749, 32u);)
   auto x147 = ::risc0::Fp::fromRaw(efl_arg9_66_0);
   auto x752 = x147 - x686;
@@ -2491,7 +2543,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 9u, x760);), RkAcc x761 = rk_link_k(x759, x760, 38u);)
   auto x151 = ::risc0::Fp::fromRaw(efl_arg9_80_0);
   auto x762 = x151 - x454;
-  RK_ST1(arg0, 13u, x762);
+  RK_ST1M(arg0, 13u, x762);
   EF_W((ef_wst(efw, 10u, x762);), RkAcc x763 = rk_link_nf_k(x761, x762, 39u);)
   auto x765 = x78 - x687;
   EF_W((ef_wst(efw, 11u, x765); ef_wblk(efw, efd_35, 4u, efq_35_28);), RkAcc x766 = rk_link_k(x763, x765, 41u);)
@@ -2506,7 +2558,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* ar
   auto x772 = (::risc0::Fp::fromRaw(efl_arg9_88_0) - Fp(1u));
   EF_W((ef_wst(efw, 15u, x772); ef_wblk(efw, efd_35, 8u, efq_35_32);), RkAcc x773 = rk_link_k(x771, x772, 45u);)
   auto x774 = x81 - x454;
-  RK_ST1(arg0, 14u, x774);
+  RK_ST1M(arg0, 14u, x774);
   EF_W((const int efq_35_40 = ef_wq4(efw, 46u, 48u, 49u, 50u, 4u); ef_wst(efw, 16u, x774);), RkAcc x775 = rk_link_nf_k(x773, x774, 46u);)
   auto x777 = x80 - x688;
   EF_W((ef_wst(efw, 17u, x777);), RkAcc x778 = rk_link_k(x775, x777, 48u);)
@@ -2708,7 +2760,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* ar
   RkAcc x904 = rk_link_k(x902, x903, 1u);
   auto x208 = ::risc0::Fp::fromRaw(efl_arg9_182_0);
   auto x905 = x667 * x208;
-  RK_ST1(arg0, 15u, x905);
+  RK_ST1M(arg0, 15u, x905);
   auto x906 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_181_0));
   auto x907 = x905 - x906;
   RkAcc x908 = rk_link_nf_k(x904, x907, 2u);
@@ -2726,12 +2778,12 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 1u, x702);), RkAcc x919 = rk_link_k(x918, x702, 5u);)
   EF_W((ef_wst(efw, 2u, x704);), RkAcc x920 = rk_link_nf_k(x919, x704, 6u);)
   auto x921 = x285 - x50;
-  RK_ST1(arg0, 16u, x921);
+  RK_ST1M(arg0, 16u, x921);
   auto x922 = (::risc0::Fp::fromRaw(efl_arg9_101_0) - Fp(1u));
   EF_W((ef_wst(efw, 3u, x922);), RkAcc x923 = rk_link_k(x920, x922, 7u);)
   const uint32_t efl_arg9_40_0 = EF_LDCR(arg9, 40u, 0u);
   auto x924 = x99 - x921;
-  RK_ST1(arg0, 17u, x924);
+  RK_ST1M(arg0, 17u, x924);
   EF_W((const int efq_39_4 = ef_wq(efw, 8u); ef_wst(efw, 4u, x924);), RkAcc x925 = rk_link_nf_k(x923, x924, 8u);)
   EF_W((ef_wst(efw, 5u, x706);), RkAcc x926 = rk_link_k(x925, x706, 9u);)
   EF_W((ef_wst(efw, 6u, x708);), RkAcc x927 = rk_link_nf_k(x926, x708, 10u);)
@@ -2772,7 +2824,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 6u, x64); ef_wblk(efw, efd_39, 0u, efq_39_24); ef_wblk(efw, efd_39, 4u, efq_39_28); FpExt x957 = ef_wfin(efw, efd_39, 0u, x915);), FpExt x957 = rk_fin(rk_link_k(x956, x64, 35u));)
   RkW _cx958 = rk_cl0(x912, x209 * x957, 5u); FpExt x958 = rkw_fin(_cx958);
   auto x959 = x47 - x367;
-  RK_ST1(arg0, 18u, x959);
+  RK_ST1M(arg0, 18u, x959);
   EF_W((ef_v4i efd_40[4] = {}; FpExt efb_40 = x914; const int efq_40_0 = ef_wq4(efw, 2u, 4u, 5u, 6u, 4u); ef_wst(efw, 0u, x959);), RkAcc x960 = rk_link_nf_k(x914, x959, 2u);)
   constexpr Fp x11(1073725592);
   auto x962 = x44 - x11;
@@ -2786,7 +2838,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 6u, x706);), RkAcc x970 = rk_link_nf_k(x969, x706, 9u);)
   EF_W((ef_wst(efw, 7u, x708); ef_wblk(efw, efd_40, 0u, efq_40_0);), RkAcc x971 = rk_link_k(x970, x708, 10u);)
   auto x972 = x126 - x367;
-  RK_ST1(arg0, 19u, x972);
+  RK_ST1M(arg0, 19u, x972);
   EF_W((const int efq_40_8 = ef_wq4(efw, 11u, 13u, 14u, 15u, 4u); ef_wst(efw, 8u, x972);), RkAcc x973 = rk_link_nf_k(x971, x972, 11u);)
   constexpr Fp x10(1073725593);
   auto x975 = x127 - x10;
@@ -2801,7 +2853,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 14u, x719);), RkAcc x983 = rk_link_nf_k(x982, x719, 18u);)
   EF_W((ef_wst(efw, 15u, x721); ef_wblk(efw, efd_40, 8u, efq_40_8);), RkAcc x984 = rk_link_k(x983, x721, 19u);)
   auto x985 = x134 - x367;
-  RK_ST1(arg0, 20u, x985);
+  RK_ST1M(arg0, 20u, x985);
   EF_W((const int efq_40_16 = ef_wq4(efw, 20u, 22u, 23u, 24u, 4u); ef_wst(efw, 16u, x985);), RkAcc x986 = rk_link_nf_k(x984, x985, 20u);)
   constexpr Fp x9(1073725594);
   auto x988 = x135 - x9;
@@ -2809,11 +2861,11 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* ar
   auto x990 = (::risc0::Fp::fromRaw(efl_arg9_53_0) - Fp(1u));
   auto x219 = ::risc0::Fp::fromRaw(efl_arg9_49_0);
   auto x991 = x990 - x219;
-  RK_ST1(arg0, 21u, x991);
+  RK_ST1M(arg0, 21u, x991);
   auto x992 = x36 - x33;
   EF_W((ef_wst(efw, 18u, x992);), RkAcc x993 = rk_link_nf_k(x989, x992, 23u);)
   auto x994 = x100 - x991;
-  RK_ST1(arg0, 22u, x994);
+  RK_ST1M(arg0, 22u, x994);
   EF_W((ef_wst(efw, 19u, x994); ef_wblk(efw, efd_40, 12u, efq_40_12);), RkAcc x995 = rk_link_k(x993, x994, 24u);)
   auto x996 = x137 - x220;
   EF_W((const int efq_40_20 = ef_wq(efw, 25u); ef_wst(efw, 20u, x996);), RkAcc x997 = rk_link_nf_k(x995, x996, 25u);)
@@ -2823,7 +2875,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 22u, x732);), RkAcc x1000 = rk_link_nf_k(x999, x732, 27u);)
   EF_W((ef_wst(efw, 23u, x734); ef_wblk(efw, efd_40, 16u, efq_40_16);), RkAcc x1001 = rk_link_k(x1000, x734, 28u);)
   auto x1002 = x140 - x367;
-  RK_ST1(arg0, 23u, x1002);
+  RK_ST1M(arg0, 23u, x1002);
   EF_W((const int efq_40_24 = ef_wq4(efw, 29u, 31u, 32u, 33u, 4u); ef_wst(efw, 0u, x1002);), RkAcc x1003 = rk_link_nf_k(x1001, x1002, 29u);)
   constexpr Fp x8(1073725595);
   auto x1005 = x141 - x8;
@@ -2831,10 +2883,10 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* ar
   auto x1007 = (::risc0::Fp::fromRaw(efl_arg9_62_0) - Fp(1u));
   auto x222 = ::risc0::Fp::fromRaw(efl_arg9_58_0);
   auto x1008 = x1007 - x222;
-  RK_ST1(arg0, 24u, x1008);
+  RK_ST1M(arg0, 24u, x1008);
   EF_W((ef_wst(efw, 2u, x243);), RkAcc x1009 = rk_link_nf_k(x1006, x243, 32u);)
   auto x1010 = x35 - x1008;
-  RK_ST1(arg0, 25u, x1010);
+  RK_ST1M(arg0, 25u, x1010);
   EF_W((ef_wst(efw, 3u, x1010); ef_wblk(efw, efd_40, 20u, efq_40_20);), RkAcc x1011 = rk_link_k(x1009, x1010, 33u);)
   const uint32_t efl_arg9_67_0 = EF_LDCR(arg9, 67u, 0u);
   auto x1012 = x143 - x223;
@@ -2844,7 +2896,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 6u, x745);), RkAcc x1016 = rk_link_nf_k(x1015, x745, 36u);)
   EF_W((ef_wst(efw, 7u, x747); ef_wblk(efw, efd_40, 0u, efq_40_24);), RkAcc x1017 = rk_link_k(x1016, x747, 37u);)
   auto x1018 = x146 - x367;
-  RK_ST1(arg0, 26u, x1018);
+  RK_ST1M(arg0, 26u, x1018);
   EF_W((const int efq_40_32 = ef_wq4(efw, 38u, 40u, 41u, 42u, 4u); ef_wst(efw, 8u, x1018);), RkAcc x1019 = rk_link_nf_k(x1017, x1018, 38u);)
   constexpr Fp x7(1073725596);
   auto x1021 = x147 - x7;
@@ -2855,7 +2907,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* ar
   auto x1025 = (::risc0::Fp::fromRaw(efl_arg9_109_0) - Fp(1u));
   EF_W((ef_wst(efw, 10u, x1025);), RkAcc x1026 = rk_link_nf_k(x1022, x1025, 41u);)
   auto x1027 = x101 - x1024;
-  RK_ST1(arg0, 27u, x1027);
+  RK_ST1M(arg0, 27u, x1027);
   EF_W((ef_wst(efw, 11u, x1027); ef_wblk(efw, efd_40, 4u, efq_40_28);), RkAcc x1028 = rk_link_k(x1026, x1027, 42u);)
   auto x1029 = x163 - x226;
   EF_W((const int efq_40_36 = ef_wq(efw, 43u); ef_wst(efw, 12u, x1029);), RkAcc x1030 = rk_link_nf_k(x1028, x1029, 43u);)
@@ -2872,7 +2924,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* ar
   auto x1041 = (::risc0::Fp::fromRaw(efl_arg9_111_0) - Fp(1u));
   EF_W((ef_wst(efw, 18u, x1041);), RkAcc x1042 = rk_link_nf_k(x1039, x1041, 50u);)
   auto x1043 = x46 - x1040;
-  RK_ST1(arg0, 28u, x1043);
+  RK_ST1M(arg0, 28u, x1043);
   EF_W((ef_wst(efw, 19u, x1043); ef_wblk(efw, efd_40, 12u, efq_40_36);), RkAcc x1044 = rk_link_k(x1042, x1043, 51u);)
   auto x1045 = x153 - x228;
   EF_W((const int efq_40_44 = ef_wq(efw, 52u); ef_wst(efw, 20u, x1045);), RkAcc x1046 = rk_link_nf_k(x1044, x1045, 52u);)
@@ -2905,7 +2957,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 10u, x1072);), RkAcc x1073 = rk_link_nf_k(x1071, x1072, 68u);)
   auto x1074 = ((::risc0::Fp::fromRaw(efl_arg9_98_0) - Fp(1u)) - ::risc0::Fp::fromRaw(efl_arg9_94_0));
   auto x1075 = x67 - x1074;
-  RK_ST1(arg0, 29u, x1075);
+  RK_ST1M(arg0, 29u, x1075);
   EF_W((ef_wst(efw, 11u, x1075); ef_wblk(efw, efd_40, 4u, efq_40_52);), RkAcc x1076 = rk_link_k(x1073, x1075, 69u);)
   auto x1077 = x84 - x232;
   EF_W((const int efq_40_60 = ef_wq4(efw, 70u, 71u, 70u, 70u, 2u); ef_wst(efw, 12u, x1077);), RkAcc x1078 = rk_link_nf_k(x1076, x1077, 70u);)
@@ -3049,7 +3101,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* ar
   auto x1209 = rv32im_v2_14(cycle, steps, x1208.elems[0], x1208.elems[1], x1208.elems[2], x1208.elems[3], x1114.elems[0], x1114.elems[1], x1114.elems[2], x1114.elems[3], x1160.elems[0], x1160.elems[1], x1160.elems[2], x1160.elems[3], arg0, arg2.elems[0], arg2.elems[1], arg2.elems[2], arg2.elems[3], x663.elems[0], x663.elems[1], x663.elems[2], x663.elems[3], x915.elems[0], x915.elems[1], x915.elems[2], x915.elems[3], arg6.elems[0], arg6.elems[1], arg6.elems[2], arg6.elems[3], arg8.elems[0], arg8.elems[1], arg8.elems[2], arg8.elems[3]);
   return x1209;
 }
-__device__ EF_NOINLINE FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3, Fp arg7_e0, Fp arg7_e1, Fp arg7_e2, Fp arg7_e3, Fp arg8_e0, Fp arg8_e1, Fp arg8_e2, Fp arg8_e3, Fp arg9_e0, Fp arg9_e1, Fp arg9_e2, Fp arg9_e3) {
+__device__ EF_CHAIN FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3, Fp arg7_e0, Fp arg7_e1, Fp arg7_e2, Fp arg7_e3, Fp arg8_e0, Fp arg8_e1, Fp arg8_e2, Fp arg8_e3, Fp arg9_e0, Fp arg9_e1, Fp arg9_e2, Fp arg9_e3) {
   FpExt* arg2 = reinterpret_cast<FpExt*>(arg0);
   Fp* arg10 = EF_GPTR(0);
   Fp* arg11 = EF_GPTR(1);
@@ -3063,37 +3115,37 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* ar
   FpExt arg7(arg7_e0, arg7_e1, arg7_e2, arg7_e3);
   FpExt arg8(arg8_e0, arg8_e1, arg8_e2, arg8_e3);
   FpExt arg9(arg9_e0, arg9_e1, arg9_e2, arg9_e3);
-  size_t mask = steps - 1; const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = (uint32_t)cycle;
+  size_t mask = steps - 1; uint32_t rk_c_o = (uint32_t)cycle; EF_OPQ(rk_c_o, 3); const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = rk_c_o;
   const uint32_t efl_arg10_58_0 = EF_LDCR(arg10, 58u, 0u);
   const uint32_t efl_arg10_59_0 = EF_LDCR(arg10, 59u, 0u);
   const uint32_t efl_arg10_60_0 = EF_LDCR(arg10, 60u, 0u);
   const uint32_t efl_arg10_61_0 = EF_LDCR(arg10, 61u, 0u);
-  auto x161 = RK_LD1(arg0, 33u);
+  auto x161 = RK_LD1M(arg0, 33u);
   auto x21 = ::risc0::Fp::fromRaw(efl_arg10_58_0);
   auto x162 = x161 - x21;
   EF_W((ef_v4i efd_44[4] = {}; RkAcc efs_44 = rk_acc(arg1); const int efq_44_0 = ef_wq(efw, 217u); ef_wst(efw, 0u, x162);), RkAcc x163 = rk_link_nf_k(arg1, x162, 217u);)
-  auto x164 = RK_LD1(arg0, 34u);
+  auto x164 = RK_LD1M(arg0, 34u);
   auto x22 = ::risc0::Fp::fromRaw(efl_arg10_59_0);
   auto x165 = x164 - x22;
   EF_W((ef_wst(efw, 1u, x165);), RkAcc x166 = rk_link_k(x163, x165, 218u);)
   const uint32_t efl_arg10_62_0 = EF_LDCR(arg10, 62u, 0u);
   const uint32_t efl_arg10_63_0 = EF_LDCR(arg10, 63u, 0u);
-  auto x167 = RK_LD1(arg0, 35u);
+  auto x167 = RK_LD1M(arg0, 35u);
   auto x23 = ::risc0::Fp::fromRaw(efl_arg10_60_0);
   auto x168 = x167 - x23;
   EF_W((ef_wst(efw, 2u, x168);), RkAcc x169 = rk_link_nf_k(x166, x168, 219u);)
-  auto x170 = RK_LD1(arg0, 36u);
+  auto x170 = RK_LD1M(arg0, 36u);
   auto x24 = ::risc0::Fp::fromRaw(efl_arg10_61_0);
   auto x171 = x170 - x24;
   EF_W((ef_wst(efw, 3u, x171);), RkAcc x172 = rk_link_k(x169, x171, 220u);)
   const uint32_t efl_arg10_201_0 = EF_LDCR(arg10, 201u, 0u);
   const uint32_t efl_arg10_156_0 = EF_LDCR(arg10, 156u, 0u);
   const uint32_t efl_arg10_157_0 = EF_LDCR(arg10, 157u, 0u);
-  auto x173 = RK_LD1(arg0, 37u);
+  auto x173 = RK_LD1M(arg0, 37u);
   auto x25 = ::risc0::Fp::fromRaw(efl_arg10_62_0);
   auto x174 = x173 - x25;
   EF_W((const int efq_44_4 = ef_wq4(efw, 221u, 222u, 221u, 221u, 2u); ef_wst(efw, 4u, x174);), RkAcc x175 = rk_link_nf_k(x172, x174, 221u);)
-  auto x176 = RK_LD1(arg0, 38u);
+  auto x176 = RK_LD1M(arg0, 38u);
   auto x26 = ::risc0::Fp::fromRaw(efl_arg10_63_0);
   auto x177 = x176 - x26;
   EF_W((ef_wst(efw, 5u, x177); ef_wblk(efw, efd_44, 0u, efq_44_0); ef_wblk(efw, efd_44, 4u, efq_44_4);), RkAcc x178 = rk_link_k(x175, x177, 222u);)
@@ -3101,7 +3153,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg10_160_0 = EF_LDCR(arg10, 160u, 0u);
   const uint32_t efl_arg10_161_0 = EF_LDCR(arg10, 161u, 0u);
   const uint32_t efl_arg10_162_0 = EF_LDCR(arg10, 162u, 0u);
-  auto x179 = RK_LD4(arg2, 29u, 30u, 31u, 32u);
+  auto x179 = RK_LD4M(arg2, 29u, 30u, 31u, 32u);
   EF_W((efs_44 = rk_link_k(efs_44, x179, 223u); FpExt x180 = ef_wfin(efw, efd_44, 0u, rk_fin(efs_44));), FpExt x180 = rk_fin(rk_link_k(x178, x179, 223u));)
   auto x27 = ::risc0::Fp::fromRaw(efl_arg10_201_0);
   RkW _cx181 = rk_cl0(arg3, x27 * x180, 349u); FpExt x181 = rkw_fin(_cx181);
@@ -3289,7 +3341,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 3u, x275); ef_wblk(efw, efd_47, 20u, efq_47_20);), RkAcc x276 = rk_link_k(x274, x275, 34u);)
   auto x277 = (Fp(0u) - ::risc0::Fp::fromRaw(efl_arg10_63_0));
   EF_W((const int efq_47_28 = ef_wq4(efw, 35u, 35u, 35u, 35u, 1u); ef_wst(efw, 4u, x277); ef_wblk(efw, efd_47, 0u, efq_47_24); ef_wblk(efw, efd_47, 4u, efq_47_28);), RkAcc x278 = rk_link_nf_k(x276, x277, 35u);)
-  auto x279 = RK_LD4(arg2, 5u, 7u, 8u, 9u);
+  auto x279 = RK_LD4M(arg2, 5u, 7u, 8u, 9u);
   EF_W((efs_47 = rk_link_k(efs_47, x279, 36u); FpExt x280 = ef_wfin(efw, efd_47, 0u, rk_fin(efs_47));), FpExt x280 = rk_fin(rk_link_k(x278, x279, 36u));)
   const uint32_t efl_arg10_86_0 = EF_LDCR(arg10, 86u, 0u);
   const uint32_t efl_arg10_91_0 = EF_LDCR(arg10, 91u, 0u);
@@ -3448,7 +3500,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 6u, x356);), RkAcc x357 = rk_link_nf_k(x355, x356, 10u);)
   auto x358 = (::risc0::Fp::fromRaw(efl_arg10_82_0) - Fp(1u));
   EF_W((ef_wst(efw, 7u, x358); ef_wblk(efw, efd_49, 0u, efq_49_0);), RkAcc x359 = rk_link_k(x357, x358, 11u);)
-  auto x360 = RK_LD1(arg0, 10u);
+  auto x360 = RK_LD1M(arg0, 10u);
   EF_W((const int efq_49_8 = ef_wq4(efw, 12u, 14u, 15u, 16u, 4u); ef_wst(efw, 8u, x360);), RkAcc x361 = rk_link_nf_k(x359, x360, 12u);)
   const uint32_t efl_arg10_41_4 = EF_LDCR(arg10, 41u, 4u);
   auto x91 = ::risc0::Fp::fromRaw(efl_arg10_78_0);
@@ -3461,7 +3513,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* ar
   auto x369 = (::risc0::Fp::fromRaw(efl_arg10_142_0) - Fp(1u));
   const uint32_t efl_arg10_87_0 = EF_LDCR(arg10, 87u, 0u);
   EF_W((const int efq_49_12 = ef_wq(efw, 17u); ef_wst(efw, 12u, x369);), RkAcc x370 = rk_link_nf_k(x368, x369, 17u);)
-  auto x371 = RK_LD1(arg0, 11u);
+  auto x371 = RK_LD1M(arg0, 11u);
   EF_W((ef_wst(efw, 13u, x371);), RkAcc x372 = rk_link_k(x370, x371, 18u);)
   auto x373 = ((::risc0::Fp::fromRaw(efl_arg10_85_0) * Fp(65536u)) + ::risc0::Fp::fromRaw(efl_arg10_84_0));
   auto x92 = ::risc0::Fp::fromRaw(efl_arg10_41_4);
@@ -3475,7 +3527,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 15u, x376); ef_wblk(efw, efd_49, 8u, efq_49_8);), RkAcc x377 = rk_link_k(x375, x376, 20u);)
   auto x378 = (::risc0::Fp::fromRaw(efl_arg10_91_0) - Fp(1u));
   EF_W((const int efq_49_16 = ef_wq4(efw, 21u, 22u, 24u, 25u, 4u); ef_wst(efw, 16u, x378);), RkAcc x379 = rk_link_nf_k(x377, x378, 21u);)
-  auto x380 = RK_LD1(arg0, 12u);
+  auto x380 = RK_LD1M(arg0, 12u);
   EF_W((ef_wst(efw, 17u, x380);), RkAcc x381 = rk_link_k(x379, x380, 22u);)
   auto x93 = ::risc0::Fp::fromRaw(efl_arg10_87_0);
   auto x383 = x93 - x335;
@@ -3487,7 +3539,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((const int efq_49_20 = ef_wq(efw, 26u); ef_wst(efw, 20u, x387);), RkAcc x388 = rk_link_nf_k(x386, x387, 26u);)
   auto x389 = (::risc0::Fp::fromRaw(efl_arg10_144_0) - Fp(1u));
   EF_W((ef_wst(efw, 21u, x389);), RkAcc x390 = rk_link_k(x388, x389, 27u);)
-  auto x391 = RK_LD1(arg0, 13u);
+  auto x391 = RK_LD1M(arg0, 13u);
   EF_W((ef_wst(efw, 22u, x391);), RkAcc x392 = rk_link_nf_k(x390, x391, 28u);)
   const uint32_t efl_arg10_96_0 = EF_LDCR(arg10, 96u, 0u);
   const uint32_t efl_arg10_98_0 = EF_LDCR(arg10, 98u, 0u);
@@ -3503,7 +3555,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* ar
   auto x398 = (::risc0::Fp::fromRaw(efl_arg10_100_0) - Fp(1u));
   EF_W((ef_wst(efw, 1u, x398);), RkAcc x399 = rk_link_k(x397, x398, 31u);)
   const uint32_t efl_arg10_43_4 = EF_LDCR(arg10, 43u, 4u);
-  auto x400 = RK_LD1(arg0, 14u);
+  auto x400 = RK_LD1M(arg0, 14u);
   EF_W((ef_wst(efw, 2u, x400);), RkAcc x401 = rk_link_nf_k(x399, x400, 32u);)
   auto x95 = ::risc0::Fp::fromRaw(efl_arg10_96_0);
   auto x403 = x95 - x336;
@@ -3515,7 +3567,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 5u, x407);), RkAcc x408 = rk_link_k(x406, x407, 36u);)
   auto x409 = (::risc0::Fp::fromRaw(efl_arg10_146_0) - Fp(1u));
   EF_W((ef_wst(efw, 6u, x409);), RkAcc x410 = rk_link_nf_k(x408, x409, 37u);)
-  auto x411 = RK_LD1(arg0, 15u);
+  auto x411 = RK_LD1M(arg0, 15u);
   EF_W((ef_wst(efw, 7u, x411); ef_wblk(efw, efd_49, 0u, efq_49_24);), RkAcc x412 = rk_link_k(x410, x411, 38u);)
   auto x413 = ((::risc0::Fp::fromRaw(efl_arg10_103_0) * Fp(65536u)) + ::risc0::Fp::fromRaw(efl_arg10_102_0));
   auto x96 = ::risc0::Fp::fromRaw(efl_arg10_43_4);
@@ -3529,7 +3581,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 9u, x416);), RkAcc x417 = rk_link_k(x415, x416, 40u);)
   auto x418 = (::risc0::Fp::fromRaw(efl_arg10_109_0) - Fp(1u));
   EF_W((ef_wst(efw, 10u, x418);), RkAcc x419 = rk_link_nf_k(x417, x418, 41u);)
-  auto x420 = RK_LD1(arg0, 16u);
+  auto x420 = RK_LD1M(arg0, 16u);
   EF_W((ef_wst(efw, 11u, x420); ef_wblk(efw, efd_49, 4u, efq_49_28);), RkAcc x421 = rk_link_k(x419, x420, 42u);)
   auto x97 = ::risc0::Fp::fromRaw(efl_arg10_105_0);
   const uint32_t efl_arg10_44_4 = EF_LDCR(arg10, 44u, 4u);
@@ -3544,7 +3596,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg10_114_0 = EF_LDCR(arg10, 114u, 0u);
   const uint32_t efl_arg10_116_0 = EF_LDCR(arg10, 116u, 0u);
   const uint32_t efl_arg10_120_0 = EF_LDCR(arg10, 120u, 0u);
-  auto x431 = RK_LD1(arg0, 17u);
+  auto x431 = RK_LD1M(arg0, 17u);
   EF_W((const int efq_49_40 = ef_wq(efw, 48u); ef_wst(efw, 16u, x431);), RkAcc x432 = rk_link_nf_k(x430, x431, 48u);)
   auto x433 = ((::risc0::Fp::fromRaw(efl_arg10_112_0) * Fp(65536u)) + ::risc0::Fp::fromRaw(efl_arg10_111_0));
   auto x98 = ::risc0::Fp::fromRaw(efl_arg10_44_4);
@@ -3556,7 +3608,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg10_121_0 = EF_LDCR(arg10, 121u, 0u);
   auto x438 = (::risc0::Fp::fromRaw(efl_arg10_118_0) - Fp(1u));
   EF_W((ef_wst(efw, 19u, x438); ef_wblk(efw, efd_49, 12u, efq_49_36);), RkAcc x439 = rk_link_k(x437, x438, 51u);)
-  auto x440 = RK_LD1(arg0, 18u);
+  auto x440 = RK_LD1M(arg0, 18u);
   EF_W((const int efq_49_44 = ef_wq4(efw, 52u, 54u, 55u, 56u, 4u); ef_wst(efw, 20u, x440);), RkAcc x441 = rk_link_nf_k(x439, x440, 52u);)
   auto x99 = ::risc0::Fp::fromRaw(efl_arg10_114_0);
   auto x443 = x99 - x338;
@@ -3568,7 +3620,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 23u, x447); ef_wblk(efw, efd_49, 16u, efq_49_40); ef_wblk(efw, efd_49, 20u, efq_49_44); efb_49 = ef_wfin(efw, efd_49, 0u, efb_49);), RkAcc x448 = rk_link_k(x446, x447, 56u);)
   auto x449 = (::risc0::Fp::fromRaw(efl_arg10_150_0) - Fp(1u));
   EF_W((efd_49[0] = efd_49[1] = efd_49[2] = efd_49[3] = ef_v4i{}; const int efq_49_48 = ef_wq(efw, 57u); ef_wst(efw, 0u, x449);), RkAcc x450 = rk_link_nf_k(x448, x449, 57u);)
-  auto x451 = RK_LD1(arg0, 20u);
+  auto x451 = RK_LD1M(arg0, 20u);
   EF_W((ef_wst(efw, 1u, x451);), RkAcc x452 = rk_link_k(x450, x451, 58u);)
   auto x453 = ((::risc0::Fp::fromRaw(efl_arg10_121_0) * Fp(65536u)) + ::risc0::Fp::fromRaw(efl_arg10_120_0));
   const uint32_t efl_arg10_123_0 = EF_LDCR(arg10, 123u, 0u);
@@ -3583,7 +3635,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 3u, x456);), RkAcc x457 = rk_link_k(x455, x456, 60u);)
   auto x458 = (::risc0::Fp::fromRaw(efl_arg10_127_0) - Fp(1u));
   EF_W((const int efq_49_52 = ef_wq4(efw, 61u, 62u, 64u, 65u, 4u); ef_wst(efw, 4u, x458);), RkAcc x459 = rk_link_nf_k(x457, x458, 61u);)
-  auto x460 = RK_LD1(arg0, 21u);
+  auto x460 = RK_LD1M(arg0, 21u);
   const uint32_t efl_arg10_153_0 = EF_LDCR(arg10, 153u, 0u);
   const uint32_t efl_arg10_128_0 = EF_LDCR(arg10, 128u, 0u);
   const uint32_t efl_arg10_124_0 = EF_LDCR(arg10, 124u, 0u);
@@ -3613,7 +3665,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((const int efq_49_60 = ef_wq4(efw, 70u, 71u, 72u, 74u, 4u); ef_wst(efw, 12u, x476);), RkAcc x477 = rk_link_nf_k(x475, x476, 70u);)
   auto x478 = (::risc0::Fp::fromRaw(efl_arg10_136_0) - Fp(1u));
   EF_W((ef_wst(efw, 13u, x478);), RkAcc x479 = rk_link_k(x477, x478, 71u);)
-  auto x480 = RK_LD1(arg0, 22u);
+  auto x480 = RK_LD1M(arg0, 22u);
   EF_W((ef_wst(efw, 14u, x480);), RkAcc x481 = rk_link_nf_k(x479, x480, 72u);)
   auto x103 = ::risc0::Fp::fromRaw(efl_arg10_132_0);
   auto x483 = x103 - x340;
@@ -3627,7 +3679,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 17u, x487);), RkAcc x488 = rk_link_k(x486, x487, 76u);)
   auto x489 = (::risc0::Fp::fromRaw(efl_arg10_154_0) - Fp(1u));
   EF_W((ef_wst(efw, 18u, x489);), RkAcc x490 = rk_link_nf_k(x488, x489, 77u);)
-  auto x491 = RK_LD1(arg0, 23u);
+  auto x491 = RK_LD1M(arg0, 23u);
   const uint32_t efl_arg10_197_0 = EF_LDCR(arg10, 197u, 0u);
   EF_W((ef_wst(efw, 19u, x491); ef_wblk(efw, efd_49, 12u, efq_49_60);), RkAcc x492 = rk_link_k(x490, x491, 78u);)
   auto x493 = ((::risc0::Fp::fromRaw(efl_arg10_139_0) * Fp(65536u)) + ::risc0::Fp::fromRaw(efl_arg10_138_0));
@@ -3810,7 +3862,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* ar
   auto x629 = ((::risc0::Fp::fromRaw(efl_arg10_0_0) * Fp(2u)) + Fp(1u));
   auto x119 = ::risc0::Fp::fromRaw(efl_arg10_74_0);
   auto x630 = x119 - x629;
-  RK_ST1(arg0, 10u, x630);
+  RK_ST1M(arg0, 10u, x630);
   EF_W((ef_wst(efw, 2u, x630);), RkAcc x631 = rk_link_nf_k(x628, x630, 11u);)
   EF_W((ef_wst(efw, 3u, x343);), RkAcc x633 = rk_link_k(x631, x343, 13u);)
   EF_W((const int efq_54_4 = ef_wq4(efw, 14u, 15u, 18u, 19u, 4u); ef_wst(efw, 4u, x349);), RkAcc x634 = rk_link_nf_k(x633, x349, 14u);)
@@ -3847,7 +3899,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 1u, x358);), RkAcc x662 = rk_link_k(x661, x358, 28u);)
   auto x123 = ::risc0::Fp::fromRaw(efl_arg10_83_0);
   auto x663 = x123 - x629;
-  RK_ST1(arg0, 12u, x663);
+  RK_ST1M(arg0, 12u, x663);
   EF_W((ef_wst(efw, 2u, x663);), RkAcc x664 = rk_link_nf_k(x662, x663, 29u);)
   EF_W((ef_wst(efw, 3u, x363);), RkAcc x666 = rk_link_k(x664, x363, 31u);)
   EF_W((const int efq_57_4 = ef_wq4(efw, 32u, 33u, 36u, 37u, 4u); ef_wst(efw, 4u, x369);), RkAcc x667 = rk_link_nf_k(x666, x369, 32u);)
@@ -3886,7 +3938,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 1u, x378);), RkAcc x695 = rk_link_k(x694, x378, 46u);)
   auto x128 = ::risc0::Fp::fromRaw(efl_arg10_92_0);
   auto x696 = x128 - x629;
-  RK_ST1(arg0, 14u, x696);
+  RK_ST1M(arg0, 14u, x696);
   const uint32_t efl_arg10_199_0 = EF_LDCR(arg10, 199u, 0u);
   EF_W((ef_wst(efw, 2u, x696);), RkAcc x697 = rk_link_nf_k(x695, x696, 47u);)
   EF_W((ef_wst(efw, 3u, x383);), RkAcc x699 = rk_link_k(x697, x383, 49u);)
@@ -3925,7 +3977,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 1u, x398);), RkAcc x728 = rk_link_k(x727, x398, 64u);)
   auto x133 = ::risc0::Fp::fromRaw(efl_arg10_101_0);
   auto x729 = x133 - x629;
-  RK_ST1(arg0, 16u, x729);
+  RK_ST1M(arg0, 16u, x729);
   EF_W((ef_wst(efw, 2u, x729);), RkAcc x730 = rk_link_nf_k(x728, x729, 65u);)
   EF_W((ef_wst(efw, 3u, x403);), RkAcc x732 = rk_link_k(x730, x403, 67u);)
   EF_W((const int efq_63_4 = ef_wq4(efw, 68u, 69u, 72u, 73u, 4u); ef_wst(efw, 4u, x409);), RkAcc x733 = rk_link_nf_k(x732, x409, 68u);)
@@ -3964,7 +4016,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 1u, x418);), RkAcc x761 = rk_link_k(x760, x418, 82u);)
   auto x138 = ::risc0::Fp::fromRaw(efl_arg10_110_0);
   auto x762 = x138 - x629;
-  RK_ST1(arg0, 18u, x762);
+  RK_ST1M(arg0, 18u, x762);
   EF_W((ef_wst(efw, 2u, x762);), RkAcc x763 = rk_link_nf_k(x761, x762, 83u);)
   EF_W((ef_wst(efw, 3u, x423);), RkAcc x765 = rk_link_k(x763, x423, 85u);)
   EF_W((const int efq_66_4 = ef_wq4(efw, 86u, 87u, 90u, 91u, 4u); ef_wst(efw, 4u, x429);), RkAcc x766 = rk_link_nf_k(x765, x429, 86u);)
@@ -4001,7 +4053,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 1u, x438);), RkAcc x794 = rk_link_k(x793, x438, 100u);)
   auto x142 = ::risc0::Fp::fromRaw(efl_arg10_119_0);
   auto x795 = x142 - x629;
-  RK_ST1(arg0, 21u, x795);
+  RK_ST1M(arg0, 21u, x795);
   EF_W((ef_wst(efw, 2u, x795);), RkAcc x796 = rk_link_nf_k(x794, x795, 101u);)
   EF_W((ef_wst(efw, 3u, x443);), RkAcc x798 = rk_link_k(x796, x443, 103u);)
   EF_W((const int efq_69_4 = ef_wq4(efw, 104u, 105u, 108u, 109u, 4u); ef_wst(efw, 4u, x449);), RkAcc x799 = rk_link_nf_k(x798, x449, 104u);)
@@ -4039,7 +4091,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 1u, x458);), RkAcc x827 = rk_link_k(x826, x458, 118u);)
   auto x147 = ::risc0::Fp::fromRaw(efl_arg10_128_0);
   auto x828 = x147 - x629;
-  RK_ST1(arg0, 22u, x828);
+  RK_ST1M(arg0, 22u, x828);
   EF_W((ef_wst(efw, 2u, x828);), RkAcc x829 = rk_link_nf_k(x827, x828, 119u);)
   const uint32_t efl_arg10_203_0 = EF_LDCR(arg10, 203u, 0u);
   EF_W((ef_wst(efw, 3u, x463);), RkAcc x831 = rk_link_k(x829, x463, 121u);)
@@ -4080,7 +4132,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg10_205_0 = EF_LDCR(arg10, 205u, 0u);
   auto x152 = ::risc0::Fp::fromRaw(efl_arg10_137_0);
   auto x861 = x152 - x629;
-  RK_ST1(arg0, 29u, x861);
+  RK_ST1M(arg0, 29u, x861);
   EF_W((ef_wst(efw, 2u, x861);), RkAcc x862 = rk_link_nf_k(x860, x861, 137u);)
   EF_W((ef_wst(efw, 3u, x483);), RkAcc x864 = rk_link_k(x862, x483, 139u);)
   EF_W((const int efq_75_4 = ef_wq4(efw, 140u, 141u, 144u, 145u, 4u); ef_wst(efw, 4u, x489);), RkAcc x865 = rk_link_nf_k(x864, x489, 140u);)
@@ -4339,7 +4391,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* ar
   auto x1204 = rv32im_v2_10(cycle, steps, arg0, x1203.elems[0], x1203.elems[1], x1203.elems[2], x1203.elems[3], x1173.elems[0], x1173.elems[1], x1173.elems[2], x1173.elems[3], x924.elems[0], x924.elems[1], x924.elems[2], x924.elems[3], x609.elems[0], x609.elems[1], x609.elems[2], x609.elems[3], x618.elems[0], x618.elems[1], x618.elems[2], x618.elems[3], x623.elems[0], x623.elems[1], x623.elems[2], x623.elems[3], x653.elems[0], x653.elems[1], x653.elems[2], x653.elems[3], x658.elems[0], x658.elems[1], x658.elems[2], x658.elems[3], x686.elems[0], x686.elems[1], x686.elems[2], x686.elems[3], x691.elems[0], x691.elems[1], x691.elems[2], x691.elems[3], x719.elems[0], x719.elems[1], x719.elems[2], x719.elems[3], x724.elems[0], x724.elems[1], x724.elems[2], x724.elems[3], x752.elems[0], x752.elems[1], x752.elems[2], x752.elems[3], x757.elems[0], x757.elems[1], x757.elems[2], x757.elems[3], x785.elems[0], x785.elems[1], x785.elems[2], x785.elems[3], x790.elems[0], x790.elems[1], x790.elems[2], x790.elems[3], x818.elems[0], x818.elems[1], x818.elems[2], x818.elems[3], x823.elems[0], x823.elems[1], x823.elems[2], x823.elems[3], x852.elems[0], x852.elems[1], x852.elems[2], x852.elems[3], x857.elems[0], x857.elems[1], x857.elems[2], x857.elems[3], arg9.elems[0], arg9.elems[1], arg9.elems[2], arg9.elems[3], arg7.elems[0], arg7.elems[1], arg7.elems[2], arg7.elems[3], x280.elems[0], x280.elems[1], x280.elems[2], x280.elems[3], x220.elems[0], x220.elems[1], x220.elems[2], x220.elems[3], arg5.elems[0], arg5.elems[1], arg5.elems[2], arg5.elems[3]);
   return x1204;
 }
-__device__ EF_NOINLINE FpExt rv32im_v2_7(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3, Fp arg7_e0, Fp arg7_e1, Fp arg7_e2, Fp arg7_e3, Fp arg8_e0, Fp arg8_e1, Fp arg8_e2, Fp arg8_e3) {
+__device__ EF_CHAIN FpExt rv32im_v2_7(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3, Fp arg7_e0, Fp arg7_e1, Fp arg7_e2, Fp arg7_e3, Fp arg8_e0, Fp arg8_e1, Fp arg8_e2, Fp arg8_e3) {
   FpExt* arg2 = reinterpret_cast<FpExt*>(arg0);
   Fp* arg9 = EF_GPTR(0);
   Fp* arg10 = EF_GPTR(1);
@@ -4352,92 +4404,92 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(uint32_t cycle, uint32_t steps, Fp* arg
   FpExt arg6(arg6_e0, arg6_e1, arg6_e2, arg6_e3);
   FpExt arg7(arg7_e0, arg7_e1, arg7_e2, arg7_e3);
   FpExt arg8(arg8_e0, arg8_e1, arg8_e2, arg8_e3);
-  size_t mask = steps - 1; const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = (uint32_t)cycle;
+  size_t mask = steps - 1; uint32_t rk_c_o = (uint32_t)cycle; EF_OPQ(rk_c_o, 4); const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = rk_c_o;
   const uint32_t efl_arg9_112_0 = EF_LDCR(arg9, 112u, 0u);
-  auto x247 = RK_LD1(arg0, 29u);
-  auto x248 = RK_LD1(arg0, 24u);
+  auto x247 = RK_LD1M(arg0, 29u);
+  auto x248 = RK_LD1M(arg0, 24u);
   auto x249 = x247 + x248;
-  auto x250 = RK_LD1(arg0, 25u);
+  auto x250 = RK_LD1M(arg0, 25u);
   auto x251 = x249 + x250;
-  auto x252 = RK_LD1(arg0, 26u);
+  auto x252 = RK_LD1M(arg0, 26u);
   auto x253 = x251 + x252;
-  auto x254 = RK_LD1(arg0, 27u);
+  auto x254 = RK_LD1M(arg0, 27u);
   auto x255 = x253 + x254;
-  auto x256 = RK_LD1(arg0, 28u);
+  auto x256 = RK_LD1M(arg0, 28u);
   auto x257 = x255 + x256;
   constexpr Fp x47(1083257840);
   auto x48 = ::risc0::Fp::fromRaw(efl_arg9_112_0);
   auto x258 = x48 * x47;
   auto x259 = x257 + x258;
-  auto x260 = RK_LD1(arg0, 5u);
+  auto x260 = RK_LD1M(arg0, 5u);
   constexpr Fp x46(375892129);
   auto x261 = x260 * x46;
   auto x262 = x257 + x261;
-  auto x263 = RK_LD1(arg0, 7u);
+  auto x263 = RK_LD1M(arg0, 7u);
   constexpr Fp x45(111593398);
   auto x264 = x263 * x45;
   auto x265 = x257 + x264;
-  auto x266 = RK_LD1(arg0, 8u);
+  auto x266 = RK_LD1M(arg0, 8u);
   constexpr Fp x44(1867716110);
   auto x267 = x266 * x44;
   auto x268 = x257 + x267;
-  auto x269 = RK_LD1(arg0, 9u);
+  auto x269 = RK_LD1M(arg0, 9u);
   constexpr Fp x43(658182609);
   auto x270 = x269 * x43;
   auto x271 = x257 + x270;
-  auto x272 = RK_LD1(arg0, 10u);
+  auto x272 = RK_LD1M(arg0, 10u);
   constexpr Fp x42(51866717);
   auto x273 = x272 * x42;
   auto x274 = x257 + x273;
-  auto x275 = RK_LD1(arg0, 11u);
+  auto x275 = RK_LD1M(arg0, 11u);
   constexpr Fp x41(1928969209);
   auto x276 = x275 * x41;
   auto x277 = x257 + x276;
-  auto x278 = RK_LD1(arg0, 12u);
+  auto x278 = RK_LD1M(arg0, 12u);
   constexpr Fp x40(1942928017);
   auto x279 = x278 * x40;
   auto x280 = x257 + x279;
-  auto x281 = RK_LD1(arg0, 13u);
+  auto x281 = RK_LD1M(arg0, 13u);
   constexpr Fp x39(1558116381);
   auto x282 = x281 * x39;
   auto x283 = x257 + x282;
-  auto x284 = RK_LD1(arg0, 14u);
+  auto x284 = RK_LD1M(arg0, 14u);
   constexpr Fp x38(20525701);
   auto x285 = x284 * x38;
   auto x286 = x257 + x285;
-  auto x287 = RK_LD1(arg0, 15u);
+  auto x287 = RK_LD1M(arg0, 15u);
   constexpr Fp x37(1188752902);
   auto x288 = x287 * x37;
   auto x289 = x257 + x288;
-  auto x290 = RK_LD1(arg0, 16u);
+  auto x290 = RK_LD1M(arg0, 16u);
   constexpr Fp x36(106789798);
   auto x291 = x290 * x36;
   auto x292 = x257 + x291;
-  auto x293 = RK_LD1(arg0, 17u);
+  auto x293 = RK_LD1M(arg0, 17u);
   constexpr Fp x35(1389833583);
   auto x294 = x293 * x35;
   auto x295 = x257 + x294;
-  auto x296 = RK_LD1(arg0, 18u);
+  auto x296 = RK_LD1M(arg0, 18u);
   constexpr Fp x34(98371040);
   auto x297 = x296 * x34;
   auto x298 = x257 + x297;
-  auto x299 = RK_LD1(arg0, 19u);
+  auto x299 = RK_LD1M(arg0, 19u);
   constexpr Fp x33(1001081699);
   auto x300 = x299 * x33;
   auto x301 = x257 + x300;
-  auto x302 = RK_LD1(arg0, 20u);
+  auto x302 = RK_LD1M(arg0, 20u);
   constexpr Fp x32(1792686146);
   auto x303 = x302 * x32;
   auto x304 = x257 + x303;
-  auto x305 = RK_LD1(arg0, 21u);
+  auto x305 = RK_LD1M(arg0, 21u);
   constexpr Fp x31(801504236);
   auto x306 = x305 * x31;
   auto x307 = x257 + x306;
-  auto x308 = RK_LD1(arg0, 22u);
+  auto x308 = RK_LD1M(arg0, 22u);
   constexpr Fp x30(1997365680);
   auto x309 = x308 * x30;
   auto x310 = x257 + x309;
-  auto x311 = RK_LD1(arg0, 23u);
+  auto x311 = RK_LD1M(arg0, 23u);
   constexpr Fp x29(1461037801);
   auto x312 = x311 * x29;
   auto x313 = x257 + x312;
@@ -4600,7 +4652,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(uint32_t cycle, uint32_t steps, Fp* arg
   auto x73 = ::risc0::Fp::fromRaw(efl_arg9_63_0);
   auto x392 = x323 - x73;
   EF_W((ef_wst(efw, 10u, x392); ef_wblk(efw, efd_88, 4u, efq_88_28); ef_wblk(efw, efd_88, 8u, efq_88_32);), RkAcc x393 = rk_link_nf_k(x391, x392, 76u);)
-  auto x394 = RK_LD4(arg2, 0u, 1u, 3u, 4u);
+  auto x394 = RK_LD4M(arg2, 0u, 1u, 3u, 4u);
   EF_W((efs_88 = rk_link_k(efs_88, x394, 77u); FpExt x395 = ef_wfin(efw, efd_88, 0u, rk_fin(efs_88));), FpExt x395 = rk_fin(rk_link_k(x393, x394, 77u));)
   const uint32_t efl_arg9_26_0 = EF_LDCR(arg9, 26u, 0u);
   const uint32_t efl_arg9_27_0 = EF_LDCR(arg9, 27u, 0u);
@@ -4658,7 +4710,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(uint32_t cycle, uint32_t steps, Fp* arg
   EF_W((ef_wst(efw, 1u, x416);), RkAcc x417 = rk_link_k(x415, x416, 1u);)
   auto x86 = ::risc0::Fp::fromRaw(efl_arg9_138_0);
   auto x418 = x86 - x407;
-  RK_ST1(arg0, 0u, x418);
+  RK_ST1M(arg0, 0u, x418);
   EF_W((ef_wst(efw, 2u, x418);), RkAcc x419 = rk_link_nf_k(x417, x418, 2u);)
   const uint32_t efl_arg9_134_0 = EF_LDCR(arg9, 134u, 0u);
   const uint32_t efl_arg9_177_0 = EF_LDCR(arg9, 177u, 0u);
@@ -4683,7 +4735,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(uint32_t cycle, uint32_t steps, Fp* arg
   const uint32_t efl_arg9_146_0 = EF_LDCR(arg9, 146u, 0u);
   const uint32_t efl_arg9_147_0 = EF_LDCR(arg9, 147u, 0u);
   auto x431 = x91 - x428;
-  RK_ST1(arg0, 1u, x431);
+  RK_ST1M(arg0, 1u, x431);
   EF_W((ef_wst(efw, 7u, x431); ef_wblk(efw, efd_90, 0u, efq_90_0);), RkAcc x432 = rk_link_k(x430, x431, 8u);)
   constexpr Fp x18(16384);
   // lincombF: fused into a lazy Fp linear combination
@@ -4947,7 +4999,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(uint32_t cycle, uint32_t steps, Fp* arg
   EF_W((ef_wst(efw, 18u, x453);), RkAcc x586 = rk_link_nf_k(x585, x453, 25u);)
   auto x587 = (::risc0::Fp::fromRaw(efl_arg9_30_4) + Fp(3u));
   auto x588 = x587 - x139;
-  RK_ST1(arg0, 3u, x588);
+  RK_ST1M(arg0, 3u, x588);
   EF_W((ef_wst(efw, 19u, x458); ef_wblk(efw, efd_93, 12u, efq_93_12);), RkAcc x589 = rk_link_k(x586, x458, 26u);)
   EF_W((const int efq_93_20 = ef_wq4(efw, 27u, 28u, 30u, 31u, 4u); ef_wst(efw, 20u, x460);), RkAcc x590 = rk_link_nf_k(x589, x460, 27u);)
   auto x591 = x105 - x410;
@@ -4962,7 +5014,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(uint32_t cycle, uint32_t steps, Fp* arg
   EF_W((ef_wst(efw, 2u, x600);), RkAcc x601 = rk_link_nf_k(x599, x600, 34u);)
   auto x602 = (::risc0::Fp::fromRaw(efl_arg9_30_4) + Fp(7u));
   auto x603 = x602 - x139;
-  RK_ST1(arg0, 4u, x603);
+  RK_ST1M(arg0, 4u, x603);
   EF_W((ef_wst(efw, 3u, x480); ef_wblk(efw, efd_93, 20u, efq_93_20);), RkAcc x604 = rk_link_k(x601, x480, 35u);)
   EF_W((const int efq_93_28 = ef_wq4(efw, 36u, 37u, 39u, 40u, 4u); ef_wst(efw, 4u, x482);), RkAcc x605 = rk_link_nf_k(x604, x482, 36u);)
   auto x606 = x114 - x410;
@@ -4984,7 +5036,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(uint32_t cycle, uint32_t steps, Fp* arg
   EF_W((ef_wst(efw, 15u, x332); ef_wblk(efw, efd_93, 8u, efq_93_32);), RkAcc x623 = rk_link_k(x622, x332, 48u);)
   auto x146 = ::risc0::Fp::fromRaw(efl_arg9_34_0);
   auto x624 = x618 - x146;
-  RK_ST1(arg0, 5u, x624);
+  RK_ST1M(arg0, 5u, x624);
   EF_W((const int efq_93_40 = ef_wq(efw, 49u); ef_wst(efw, 16u, x624);), RkAcc x625 = rk_link_nf_k(x623, x624, 49u);)
   RkW1 _wx626 = rkw1_ff0(x559, x141, false); rkw1_ff(_wx626, x540, x11, false); rkw1_v(_wx626, x137, true); auto x626 = rkw1_fin(_wx626);
   EF_W((ef_wst(efw, 17u, x626);), RkAcc x627 = rk_link_k(x625, x626, 50u);)
@@ -5013,7 +5065,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(uint32_t cycle, uint32_t steps, Fp* arg
   const uint32_t efl_arg9_64_0 = EF_LDCR(arg9, 64u, 0u);
   const uint32_t efl_arg9_65_0 = EF_LDCR(arg9, 65u, 0u);
   const uint32_t efl_arg9_66_0 = EF_LDCR(arg9, 66u, 0u);
-  RK_ST1(arg0, 7u, x641);
+  RK_ST1M(arg0, 7u, x641);
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
@@ -5043,7 +5095,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx669 = rkw1_ff0(x63, x6, false); rkw1_v(_wx669, x62, false); rkw1_ff(_wx669, x64, x23, false); rkw1_ff(_wx669, x65, x5, false); rkw1_ff(_wx669, x66, x4, false); rkw1_ff(_wx669, x67, x22, false); rkw1_ff(_wx669, x68, x3, false); rkw1_ff(_wx669, x69, x2, false); auto x669 = rkw1_fin(_wx669);
   const uint32_t efl_arg9_67_0 = EF_LDCR(arg9, 67u, 0u);
-  RK_ST1(arg0, 8u, x669);
+  RK_ST1M(arg0, 8u, x669);
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
@@ -5064,18 +5116,18 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   auto x684 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_36_0));
   auto x685 = x49 * x684;
-  RK_ST1(arg0, 9u, x685);
+  RK_ST1M(arg0, 9u, x685);
   EF_W((ef_wst(efw, 18u, x685);), RkAcc x686 = rk_link_nf_k(x627, x685, 51u);)
   auto x687 = ef_lsub(x15, x147);
   auto x688 = x147 * x687;
   EF_W((ef_wst(efw, 19u, x688); ef_wblk(efw, efd_93, 12u, efq_93_36);), RkAcc x689 = rk_link_k(x686, x688, 52u);)
   auto x690 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_38_0));
   auto x691 = x148 * x690;
-  RK_ST1(arg0, 10u, x691);
+  RK_ST1M(arg0, 10u, x691);
   EF_W((const int efq_93_44 = ef_wq(efw, 53u); ef_wst(efw, 20u, x691);), RkAcc x692 = rk_link_nf_k(x689, x691, 53u);)
   auto x693 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_39_0));
   auto x694 = x149 * x693;
-  RK_ST1(arg0, 11u, x694);
+  RK_ST1M(arg0, 11u, x694);
   EF_W((ef_wst(efw, 21u, x694);), RkAcc x695 = rk_link_k(x692, x694, 54u);)
   auto x696 = ef_lsub(x15, x50);
   auto x697 = x50 * x696;
@@ -5153,12 +5205,12 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(uint32_t cycle, uint32_t steps, Fp* arg
   const uint32_t efl_arg9_71_0 = EF_LDCR(arg9, 71u, 0u);
   const uint32_t efl_arg9_73_0 = EF_LDCR(arg9, 73u, 0u);
   const uint32_t efl_arg9_74_0 = EF_LDCR(arg9, 74u, 0u);
-  RK_ST1(arg0, 12u, x765);
+  RK_ST1M(arg0, 12u, x765);
   EF_W((ef_wst(efw, 2u, x765);), RkAcc x766 = rk_link_nf_k(x762, x765, 83u);)
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx769 = rkw1_ff0(x641, x1, true); rkw1_v(_wx769, x89, false); rkw1_v(_wx769, x54, true); rkw1_ff(_wx769, x55, x6, true); rkw1_ff(_wx769, x56, x23, true); rkw1_ff(_wx769, x57, x5, true); rkw1_ff(_wx769, x58, x4, true); rkw1_ff(_wx769, x59, x22, true); rkw1_ff(_wx769, x60, x3, true); rkw1_ff(_wx769, x61, x2, true); auto x769 = rkw1_fin(_wx769);
-  RK_ST1(arg0, 13u, x769);
+  RK_ST1M(arg0, 13u, x769);
   EF_W((ef_wst(efw, 3u, x769); ef_wblk(efw, efd_93, 20u, efq_93_68);), RkAcc x770 = rk_link_k(x766, x769, 84u);)
   const uint32_t efl_arg9_68_0 = EF_LDCR(arg9, 68u, 0u);
   const uint32_t efl_arg9_72_0 = EF_LDCR(arg9, 72u, 0u);
@@ -5190,7 +5242,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   auto x783 = (::risc0::Fp::fromRaw(efl_arg9_75_0) * Fp(128u));
   RkW1 _wx784 = rkw1_ff0(x154, x6, false); rkw1_v(_wx784, x159, false); rkw1_ff(_wx784, x155, x23, false); rkw1_ff(_wx784, x156, x5, false); rkw1_v(_wx784, x779, false); rkw1_ff(_wx784, x157, x22, false); rkw1_ff(_wx784, x158, x3, false); rkw1_v(_wx784, x783, false); auto x784 = rkw1_fin(_wx784);
-  RK_ST1(arg0, 14u, x784);
+  RK_ST1M(arg0, 14u, x784);
   const uint32_t efl_arg9_83_0 = EF_LDCR(arg9, 83u, 0u);
   const uint32_t efl_arg9_85_0 = EF_LDCR(arg9, 85u, 0u);
   auto x160 = ::risc0::Fp::fromRaw(efl_arg9_79_0);
@@ -5246,7 +5298,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx812 = rkw1_ff0(x165, x6, false); rkw1_v(_wx812, x172, false); rkw1_ff(_wx812, x166, x23, false); rkw1_ff(_wx812, x167, x5, false); rkw1_ff(_wx812, x168, x4, false); rkw1_ff(_wx812, x169, x22, false); rkw1_ff(_wx812, x170, x3, false); rkw1_ff(_wx812, x171, x2, false); auto x812 = rkw1_fin(_wx812);
-  RK_ST1(arg0, 15u, x812);
+  RK_ST1M(arg0, 15u, x812);
   const uint32_t efl_arg9_99_0 = EF_LDCR(arg9, 99u, 0u);
   const uint32_t efl_arg9_92_0 = EF_LDCR(arg9, 92u, 0u);
   const uint32_t efl_arg9_95_0 = EF_LDCR(arg9, 95u, 0u);
@@ -5345,12 +5397,12 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(uint32_t cycle, uint32_t steps, Fp* arg
   const uint32_t efl_arg9_102_0 = EF_LDCR(arg9, 102u, 0u);
   const uint32_t efl_arg9_103_0 = EF_LDCR(arg9, 103u, 0u);
   const uint32_t efl_arg9_104_0 = EF_LDCR(arg9, 104u, 0u);
-  RK_ST1(arg0, 16u, x895);
+  RK_ST1M(arg0, 16u, x895);
   EF_W((const int efq_93_108 = ef_wq(efw, 117u); ef_wst(efw, 12u, x895);), RkAcc x896 = rk_link_nf_k(x892, x895, 117u);)
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx899 = rkw1_ff0(x784, x1, true); rkw1_v(_wx899, x99, false); rkw1_v(_wx899, x164, true); rkw1_v(_wx899, x789, true); rkw1_v(_wx899, x791, true); rkw1_ff(_wx899, x160, x5, true); rkw1_ff(_wx899, x161, x4, true); rkw1_ff(_wx899, x162, x22, true); rkw1_ff(_wx899, x163, x3, true); rkw1_v(_wx899, x797, true); auto x899 = rkw1_fin(_wx899);
-  RK_ST1(arg0, 17u, x899);
+  RK_ST1M(arg0, 17u, x899);
   EF_W((ef_wst(efw, 13u, x899);), RkAcc x900 = rk_link_k(x896, x899, 118u);)
   auto x180 = ::risc0::Fp::fromRaw(efl_arg9_100_0);
   const uint32_t efl_arg9_105_0 = EF_LDCR(arg9, 105u, 0u);
@@ -5490,7 +5542,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx978 = rkw1_ff0(x181, x6, false); rkw1_v(_wx978, x180, false); rkw1_ff(_wx978, x182, x23, false); rkw1_v(_wx978, x973, false); rkw1_ff(_wx978, x184, x4, false); rkw1_ff(_wx978, x185, x22, false); rkw1_ff(_wx978, x186, x3, false); rkw1_ff(_wx978, x187, x2, false); auto x978 = rkw1_fin(_wx978);
-  RK_ST1(arg0, 18u, x978);
+  RK_ST1M(arg0, 18u, x978);
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
@@ -5519,7 +5571,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx1006 = rkw1_ff0(x196, x6, false); rkw1_v(_wx1006, x195, false); rkw1_ff(_wx1006, x197, x23, false); rkw1_ff(_wx1006, x198, x5, false); rkw1_ff(_wx1006, x199, x4, false); rkw1_ff(_wx1006, x200, x22, false); rkw1_ff(_wx1006, x201, x3, false); rkw1_ff(_wx1006, x202, x2, false); auto x1006 = rkw1_fin(_wx1006);
-  RK_ST1(arg0, 19u, x1006);
+  RK_ST1M(arg0, 19u, x1006);
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
@@ -5771,7 +5823,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(uint32_t cycle, uint32_t steps, Fp* arg
   auto x1194 = (::risc0::Fp::fromRaw(efl_arg9_41_4) * Fp(2u));
   auto x1195 = x1194 * x217;
   auto x1196 = x1193 - x1195;
-  RK_ST1(arg0, 20u, x1196);
+  RK_ST1M(arg0, 20u, x1196);
   auto x1197 = x240 + x219;
   auto x1198 = ef_lmul(x240, x6);
   auto x1199 = x1198 * x219;
@@ -5780,7 +5832,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(uint32_t cycle, uint32_t steps, Fp* arg
   auto x1202 = (::risc0::Fp::fromRaw(efl_arg9_43_4) * Fp(2u));
   auto x1203 = x1202 * x221;
   auto x1204 = x1201 - x1203;
-  RK_ST1(arg0, 21u, x1204);
+  RK_ST1M(arg0, 21u, x1204);
   auto x1205 = x242 + x223;
   auto x1206 = ef_lmul(x242, x6);
   auto x1207 = x1206 * x223;
@@ -5789,7 +5841,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(uint32_t cycle, uint32_t steps, Fp* arg
   auto x1210 = (::risc0::Fp::fromRaw(efl_arg9_45_4) * Fp(2u));
   auto x1211 = x1210 * x225;
   auto x1212 = x1209 - x1211;
-  RK_ST1(arg0, 22u, x1212);
+  RK_ST1M(arg0, 22u, x1212);
   auto x1213 = x244 + x227;
   auto x1214 = x244 * x6;
   auto x1215 = x1214 * x227;
@@ -5798,7 +5850,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(uint32_t cycle, uint32_t steps, Fp* arg
   auto x1218 = (::risc0::Fp::fromRaw(efl_arg9_47_4) * Fp(2u));
   auto x1219 = x1218 * x229;
   auto x1220 = x1217 - x1219;
-  RK_ST1(arg0, 23u, x1220);
+  RK_ST1M(arg0, 23u, x1220);
   auto x1221 = x246 + x231;
   auto x1222 = x246 * x6;
   auto x1223 = x1222 * x231;
@@ -5806,97 +5858,97 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(uint32_t cycle, uint32_t steps, Fp* arg
   auto x1225 = x236 + x1100;
   auto x1226 = x1182 * x1100;
   auto x1227 = x1225 - x1226;
-  RK_ST1(arg0, 24u, x1227);
+  RK_ST1M(arg0, 24u, x1227);
   auto x1228 = x237 + x1104;
   auto x1229 = x1186 * x1104;
   auto x1230 = x1228 - x1229;
-  RK_ST1(arg0, 25u, x1230);
+  RK_ST1M(arg0, 25u, x1230);
   auto x1231 = x238 + x1108;
   auto x1232 = x1190 * x1108;
   auto x1233 = x1231 - x1232;
-  RK_ST1(arg0, 26u, x1233);
+  RK_ST1M(arg0, 26u, x1233);
   auto x1234 = x239 + x1112;
   auto x1235 = x1194 * x1112;
   auto x1236 = x1234 - x1235;
-  RK_ST1(arg0, 27u, x1236);
+  RK_ST1M(arg0, 27u, x1236);
   auto x1237 = x240 + x1116;
   auto x1238 = x1198 * x1116;
   auto x1239 = x1237 - x1238;
-  RK_ST1(arg0, 28u, x1239);
+  RK_ST1M(arg0, 28u, x1239);
   auto x1240 = x241 + x1120;
   auto x1241 = x1202 * x1120;
   auto x1242 = x1240 - x1241;
-  RK_ST1(arg0, 29u, x1242);
+  RK_ST1M(arg0, 29u, x1242);
   auto x1243 = x242 + x1124;
   auto x1244 = x1206 * x1124;
   auto x1245 = x1243 - x1244;
-  RK_ST1(arg0, 30u, x1245);
+  RK_ST1M(arg0, 30u, x1245);
   auto x1246 = x243 + x1128;
   auto x1247 = x1210 * x1128;
   auto x1248 = x1246 - x1247;
-  RK_ST1(arg0, 31u, x1248);
+  RK_ST1M(arg0, 31u, x1248);
   auto x1249 = x244 + x1132;
   auto x1250 = x1214 * x1132;
   auto x1251 = x1249 - x1250;
-  RK_ST1(arg0, 32u, x1251);
+  RK_ST1M(arg0, 32u, x1251);
   auto x1252 = x245 + x1136;
   auto x1253 = x1218 * x1136;
   auto x1254 = x1252 - x1253;
-  RK_ST1(arg0, 33u, x1254);
+  RK_ST1M(arg0, 33u, x1254);
   auto x1255 = x246 + x1140;
   auto x1256 = x1222 * x1140;
   auto x1257 = x1255 - x1256;
-  RK_ST1(arg0, 34u, x1257);
+  RK_ST1M(arg0, 34u, x1257);
   auto x1258 = x215 + x1144;
   auto x1259 = x1098 * x1144;
   auto x1260 = x1258 - x1259;
-  RK_ST1(arg0, 35u, x1260);
+  RK_ST1M(arg0, 35u, x1260);
   auto x1261 = x217 + x1148;
   auto x1262 = x1102 * x1148;
   auto x1263 = x1261 - x1262;
-  RK_ST1(arg0, 36u, x1263);
+  RK_ST1M(arg0, 36u, x1263);
   auto x1264 = x219 + x1152;
   auto x1265 = x1106 * x1152;
   auto x1266 = x1264 - x1265;
-  RK_ST1(arg0, 37u, x1266);
+  RK_ST1M(arg0, 37u, x1266);
   auto x1267 = x221 + x1156;
   auto x1268 = x1110 * x1156;
   auto x1269 = x1267 - x1268;
-  RK_ST1(arg0, 38u, x1269);
+  RK_ST1M(arg0, 38u, x1269);
   auto x1270 = x223 + x1160;
   auto x1271 = x1114 * x1160;
   auto x1272 = x1270 - x1271;
-  RK_ST1(arg0, 39u, x1272);
+  RK_ST1M(arg0, 39u, x1272);
   auto x1273 = x225 + x1164;
   auto x1274 = x1118 * x1164;
   auto x1275 = x1273 - x1274;
-  RK_ST1(arg0, 40u, x1275);
+  RK_ST1M(arg0, 40u, x1275);
   auto x1276 = x227 + x1168;
   auto x1277 = x1122 * x1168;
   auto x1278 = x1276 - x1277;
-  RK_ST1(arg0, 41u, x1278);
+  RK_ST1M(arg0, 41u, x1278);
   auto x1279 = x229 + x1172;
   auto x1280 = x1126 * x1172;
   auto x1281 = x1279 - x1280;
-  RK_ST1(arg0, 42u, x1281);
+  RK_ST1M(arg0, 42u, x1281);
   auto x1282 = x231 + x1176;
   auto x1283 = x1130 * x1176;
   auto x1284 = x1282 - x1283;
-  RK_ST1(arg0, 43u, x1284);
+  RK_ST1M(arg0, 43u, x1284);
   auto x1285 = x216 + x1180;
   auto x1286 = x1134 * x1180;
   auto x1287 = x1285 - x1286;
-  RK_ST1(arg0, 44u, x1287);
+  RK_ST1M(arg0, 44u, x1287);
   auto x1288 = x218 + x1184;
   auto x1289 = x1138 * x1184;
   auto x1290 = x1288 - x1289;
-  RK_ST1(arg0, 45u, x1290);
+  RK_ST1M(arg0, 45u, x1290);
   auto x1291 = x220 + x1188;
-  RK_ST1(arg0, 46u, x1291);
+  RK_ST1M(arg0, 46u, x1291);
   auto x1292 = rv32im_v2_6(cycle, steps, arg0, x1096.elems[0], x1096.elems[1], x1096.elems[2], x1096.elems[3], x936.elems[0], x936.elems[1], x936.elems[2], x936.elems[3], x538.elems[0], x538.elems[1], x538.elems[2], x538.elems[3], x548.elems[0], x548.elems[1], x548.elems[2], x548.elems[3], arg7.elems[0], arg7.elems[1], arg7.elems[2], arg7.elems[3], x403.elems[0], x403.elems[1], x403.elems[2], x403.elems[3], arg6.elems[0], arg6.elems[1], arg6.elems[2], arg6.elems[3], arg8.elems[0], arg8.elems[1], arg8.elems[2], arg8.elems[3]);
   return x1292;
 }
-__device__ EF_NOINLINE FpExt rv32im_v2_3(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3) {
+__device__ EF_CHAIN FpExt rv32im_v2_3(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3) {
   FpExt* arg6 = reinterpret_cast<FpExt*>(arg0);
   Fp* arg7 = EF_GPTR(0);
   Fp* arg8 = EF_GPTR(1);
@@ -5907,7 +5959,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_3(uint32_t cycle, uint32_t steps, Fp* arg
   FpExt arg3(arg3_e0, arg3_e1, arg3_e2, arg3_e3);
   FpExt arg4(arg4_e0, arg4_e1, arg4_e2, arg4_e3);
   FpExt arg5(arg5_e0, arg5_e1, arg5_e2, arg5_e3);
-  size_t mask = steps - 1; const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = (uint32_t)cycle;
+  size_t mask = steps - 1; uint32_t rk_c_o = (uint32_t)cycle; EF_OPQ(rk_c_o, 5); const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = rk_c_o;
   const uint32_t efl_arg7_169_0 = EF_LDCR(arg7, 169u, 0u);
   const uint32_t efl_arg7_170_0 = EF_LDCR(arg7, 170u, 0u);
   const uint32_t efl_arg7_171_0 = EF_LDCR(arg7, 171u, 0u);
@@ -6257,7 +6309,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_3(uint32_t cycle, uint32_t steps, Fp* arg
   EF_W((const int efq_97_28 = ef_wq4(efw, 47u, 48u, 49u, 51u, 4u); ef_wst(efw, 4u, x456);), RkAcc x457 = rk_link_nf_k(x454, x456, 47u);)
   auto x458 = (::risc0::Fp::fromRaw(efl_arg7_92_0) - Fp(1u));
   EF_W((ef_wst(efw, 5u, x458);), RkAcc x459 = rk_link_k(x457, x458, 48u);)
-  auto x460 = RK_LD1(arg0, 6u);
+  auto x460 = RK_LD1M(arg0, 6u);
   EF_W((ef_wst(efw, 6u, x460);), RkAcc x461 = rk_link_nf_k(x459, x460, 49u);)
   auto x73 = ::risc0::Fp::fromRaw(efl_arg7_88_0);
   auto x463 = x73 - x455;
@@ -6511,7 +6563,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_3(uint32_t cycle, uint32_t steps, Fp* arg
   EF_W((ef_wst(efw, 6u, x717);), RkAcc x718 = rk_link_nf_k(x716, x717, 215u);)
   auto x719 = (::risc0::Fp::fromRaw(efl_arg7_30_4) - ::risc0::Fp::fromRaw(efl_arg7_30_0));
   EF_W((ef_wst(efw, 7u, x719); ef_wblk(efw, efd_100, 0u, efq_100_0);), RkAcc x720 = rk_link_k(x718, x719, 216u);)
-  auto x721 = RK_LD1(arg0, 32u);
+  auto x721 = RK_LD1M(arg0, 32u);
   EF_W((const int efq_100_8 = ef_wq(efw, 217u); ef_wst(efw, 8u, x721);), RkAcc x722 = rk_link_nf_k(x720, x721, 217u);)
   auto x126 = ::risc0::Fp::fromRaw(efl_arg7_32_0);
   auto x723 = x123 - x126;
@@ -6860,7 +6912,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_3(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   auto x968 = (::risc0::Fp::fromRaw(efl_arg7_28_0) * Fp(7u));
   RkW1 _wx969 = rkw1_ff0(x940, x200, false); rkw1_ff(_wx969, x943, x145, false); rkw1_ff(_wx969, x166, x8, false); rkw1_v(_wx969, x963, false); rkw1_ff(_wx969, x949, x168, false); rkw1_ff(_wx969, x169, x6, false); rkw1_ff(_wx969, x959, x170, false); rkw1_v(_wx969, x968, false); auto x969 = rkw1_fin(_wx969);
-  auto x971 = RK_LD1(arg0, 2u);
+  auto x971 = RK_LD1M(arg0, 2u);
   const uint32_t efl_arg7_10_0 = EF_LDCR(arg7, 10u, 0u);
   const uint32_t efl_arg7_11_0 = EF_LDCR(arg7, 11u, 0u);
   const uint32_t efl_arg7_12_0 = EF_LDCR(arg7, 12u, 0u);
@@ -7090,7 +7142,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_3(uint32_t cycle, uint32_t steps, Fp* arg
   constexpr FpExt x4(0,1,0,0);
   return x1102;
 }
-__device__ EF_NOINLINE FpExt rk_accblk(uint32_t cycle, uint32_t steps, Fp* arg0) {
+__device__ EF_CHAIN FpExt rk_accblk(uint32_t cycle, uint32_t steps, Fp* arg0) {
   FpExt* arg6 = reinterpret_cast<FpExt*>(arg0);
   Fp* arg7 = EF_GPTR(0);
   Fp* arg8 = EF_GPTR(1);
@@ -7099,7 +7151,7 @@ __device__ EF_NOINLINE FpExt rk_accblk(uint32_t cycle, uint32_t steps, Fp* arg0)
   const FpExt arg2 = FpExt(0);
   const FpExt x1102 = FpExt(0);
   size_t mask = steps - 1;
-  const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = (uint32_t)cycle;
+  uint32_t rk_c_o = (uint32_t)cycle; EF_OPQ(rk_c_o, 6); const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = rk_c_o;
   const uint32_t efl_arg7_13_0 = EF_LDCR(arg7, 13u, 0u);
   const uint32_t efl_arg7_36_0 = EF_LDCR(arg7, 36u, 0u);
   const uint32_t efl_arg7_45_0 = EF_LDCR(arg7, 45u, 0u);
@@ -7272,7 +7324,7 @@ __device__ EF_NOINLINE FpExt rk_accblk(uint32_t cycle, uint32_t steps, Fp* arg0)
   rkw_ee_acc(_wx1191, x1172, x1141, false);
   rkw_ee_acc(_wx1191, x1174, x1142, false);
   auto x1191 = rkw_fin(_wx1191);
-  RK_ST4(arg6, 16u, 17u, 18u, 19u, x1191);
+  RK_ST4L(arg6, 16u, 17u, 18u, 19u, x1191);
   const uint32_t efl_arg8_0_4 = EF_LDCR(arg8, 0u, 4u);
   const uint32_t efl_arg8_7_4 = EF_LDCR(arg8, 7u, 4u);
   const uint32_t efl_arg8_6_4 = EF_LDCR(arg8, 6u, 4u);
@@ -7315,16 +7367,16 @@ __device__ EF_NOINLINE FpExt rk_accblk(uint32_t cycle, uint32_t steps, Fp* arg0)
   auto x1209 = x254 + x1208;
   // remat_lu: store dropped
   auto x1210 = x1197 + x1191;
-  RK_ST4(arg6, 28u, 29u, 30u, 31u, x1210);
+  RK_ST4L(arg6, 28u, 29u, 30u, 31u, x1210);
   auto x1211 = x1210 * x1143;
   auto x1212 = x1108 - x1211;
   RkAcc x1213 = rk_link_nf_k(arg2, x1212, 0u);
   auto x1214 = x1116 - x1203;
-  RK_ST4(arg6, 32u, 33u, 34u, 35u, x1214);
+  RK_ST4L(arg6, 32u, 33u, 34u, 35u, x1214);
   RkAcc x1215 = rk_link_k(x1213, x1214, 1u);
   const uint32_t efl_arg8_22_0 = EF_LDCR(arg8, 22u, 0u);
   auto x1216 = x1124 - x1209;
-  RK_ST4(arg6, 36u, 37u, 38u, 39u, x1216);
+  RK_ST4L(arg6, 36u, 37u, 38u, 39u, x1216);
   FpExt x1217 = rk_fin(rk_link_k(x1215, x1216, 2u));
   RkW _cx1218 = _cx1127;
   rk_cl_acc(_cx1218, x225 * x1217, 439u);
@@ -7382,7 +7434,7 @@ __device__ EF_NOINLINE FpExt rk_accblk(uint32_t cycle, uint32_t steps, Fp* arg0)
 
 __device__ FpExt poly_fp(uint32_t cycle, uint32_t steps, Fp** args) {
   EF_WSETUP
-  size_t mask = steps - 1; const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = (uint32_t)cycle;
+  size_t mask = steps - 1; uint32_t rk_c_o = (uint32_t)cycle; EF_OPQ(rk_c_o, 7); const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = rk_c_o;
   const uint32_t efl_args1_18_0 = EF_LDCR(args[1], 18u, 0u);
   const uint32_t efl_args1_16_4 = EF_LDCR(args[1], 16u, 4u);
   const uint32_t efl_args1_0_0 = EF_LDCR(args[1], 0u, 0u);
@@ -7465,11 +7517,11 @@ __device__ FpExt poly_fp(uint32_t cycle, uint32_t steps, Fp** args) {
   auto x246 = x245 + x46;
   auto x247 = x246 + x47;
   auto x248 = x247 + x48;
-  RK_ST1(x33, 0u, x248);
+  RK_ST1M(x33, 0u, x248);
   auto x249 = x248 + x49;
   auto x250 = x249 + x50;
   auto x251 = x250 + x51;
-  RK_ST1(x33, 1u, x251);
+  RK_ST1M(x33, 1u, x251);
   auto x252 = x251 - x31;
   EF_W((const int efq_108_12 = ef_wq(efw, 12u); ef_wst(efw, 12u, x252);), RkAcc x253 = rk_link_nf_k(x244, x252, 12u);)
   constexpr Fp x25(2);
@@ -7611,9 +7663,9 @@ __device__ FpExt poly_fp(uint32_t cycle, uint32_t steps, Fp** args) {
   constexpr Fp x17(49151);
   auto x348 = x347 * x17;
   auto x349 = x346 + x348;
-  RK_ST1(x33, 2u, x349);
+  RK_ST1M(x33, 2u, x349);
   auto x350 = x349 - x217;
-  RK_ST1(x33, 3u, x350);
+  RK_ST1M(x33, 3u, x350);
   constexpr Fp x18(16384);
   auto x351 = x217 * x18;
   constexpr Fp x2(1073725440);
@@ -7621,7 +7673,7 @@ __device__ FpExt poly_fp(uint32_t cycle, uint32_t steps, Fp** args) {
   constexpr Fp x1(1073725472);
   auto x353 = x347 * x1;
   auto x354 = x352 + x353;
-  RK_ST1(x33, 4u, x354);
+  RK_ST1M(x33, 4u, x354);
   auto x355 = ef_ladd(x216, x27);
   auto x359 = x355 * x47;
   auto x360 = x355 * x48;
@@ -7632,12 +7684,12 @@ __device__ FpExt poly_fp(uint32_t cycle, uint32_t steps, Fp** args) {
   auto x2001914 = x2001913 + x47;
   auto x2001915 = x2001914 + x48;
   auto x2001916 = x2001915 * x355;
-  RK_ST1(x33, 5u, x2001916);
+  RK_ST1M(x33, 5u, x2001916);
   auto x2001917 = x49 + x50;
   auto x2001918 = x2001917 + x51;
   auto x2001919 = x2001918 * x355;
   auto x2001920 = x2001919 + x2001916;
-  RK_ST1(x33, 6u, x2001920);
+  RK_ST1M(x33, 6u, x2001920);
   auto x374 = x217 * x47;
   auto x375 = x217 * x48;
   auto x376 = x217 * x49;
@@ -7650,13 +7702,13 @@ __device__ FpExt poly_fp(uint32_t cycle, uint32_t steps, Fp** args) {
   auto x2001923 = x2001922 + x47;
   auto x2001924 = ef_ladd(x2001923, x48);
   auto x2001925 = x2001924 * x217;
-  RK_ST1(x33, 7u, x2001925);
+  RK_ST1M(x33, 7u, x2001925);
   auto x2001926 = x49 + x50;
   auto x2001927 = ef_ladd(x2001926, x51);
   auto x2001928 = x2001927 * x217;
   auto x2001929 = x2001928 + x2001925;
   const uint32_t efl_args1_85_0 = EF_LDCR(args[1], 85u, 0u);
-  RK_ST1(x33, 8u, x2001929);
+  RK_ST1M(x33, 8u, x2001929);
   auto x386 = x37 * x25;
   auto x65 = ::risc0::Fp::fromRaw(efl_args1_66_0);
   auto x387 = x65 - x386;
@@ -7783,7 +7835,7 @@ __device__ FpExt poly_fp(uint32_t cycle, uint32_t steps, Fp** args) {
   auto x463 = x26 - x88;
   auto x464 = x462 * x463;
   const uint32_t efl_args1_74_0 = EF_LDCR(args[1], 74u, 0u);
-  RK_ST1(x33, 9u, x464);
+  RK_ST1M(x33, 9u, x464);
   EF_W((ef_wst(efw, 1u, x464);), RkAcc x465 = rk_link_k(x458, x464, 26u);)
   auto x89 = ::risc0::Fp::fromRaw(efl_args1_73_0);
   auto x466 = ef_lsub(x31, x89);
@@ -7793,7 +7845,7 @@ __device__ FpExt poly_fp(uint32_t cycle, uint32_t steps, Fp** args) {
   auto x470 = x26 - x89;
   const uint32_t efl_args1_75_0 = EF_LDCR(args[1], 75u, 0u);
   auto x471 = x469 * x470;
-  RK_ST1(x33, 10u, x471);
+  RK_ST1M(x33, 10u, x471);
   EF_W((ef_wst(efw, 2u, x471);), RkAcc x472 = rk_link_nf_k(x465, x471, 27u);)
   auto x90 = ::risc0::Fp::fromRaw(efl_args1_74_0);
   auto x473 = ef_lsub(x31, x90);
@@ -7803,7 +7855,7 @@ __device__ FpExt poly_fp(uint32_t cycle, uint32_t steps, Fp** args) {
   const uint32_t efl_args1_76_0 = EF_LDCR(args[1], 76u, 0u);
   auto x477 = x26 - x90;
   auto x478 = x476 * x477;
-  RK_ST1(x33, 11u, x478);
+  RK_ST1M(x33, 11u, x478);
   EF_W((ef_wst(efw, 3u, x478); ef_wblk(efw, efd_109, 20u, efq_109_20);), RkAcc x479 = rk_link_k(x472, x478, 28u);)
   auto x91 = ::risc0::Fp::fromRaw(efl_args1_75_0);
   auto x480 = ef_lsub(x31, x91);
@@ -7817,7 +7869,7 @@ __device__ FpExt poly_fp(uint32_t cycle, uint32_t steps, Fp** args) {
   auto x486 = ef_lmul(x484, x485);
   auto x487 = x26 - x92;
   auto x488 = x486 * x487;
-  RK_ST1(x33, 12u, x488);
+  RK_ST1M(x33, 12u, x488);
   const uint32_t efl_args1_78_0 = EF_LDCR(args[1], 78u, 0u);
   const uint32_t efl_args1_79_0 = EF_LDCR(args[1], 79u, 0u);
   EF_W((ef_wst(efw, 5u, x488);), RkAcc x489 = rk_link_k(x482, x488, 30u);)
@@ -7864,7 +7916,7 @@ __device__ FpExt poly_fp(uint32_t cycle, uint32_t steps, Fp** args) {
   auto x520 = ef_lmul(x518, x519);
   auto x521 = x26 - x98;
   auto x522 = x520 * x521;
-  RK_ST1(x33, 13u, x522);
+  RK_ST1M(x33, 13u, x522);
   EF_W((ef_wst(efw, 11u, x522); ef_wblk(efw, efd_109, 4u, efq_109_28);), RkAcc x523 = rk_link_k(x516, x522, 36u);)
   auto x99 = ::risc0::Fp::fromRaw(efl_args1_83_0);
   auto x524 = ef_lsub(x31, x99);
@@ -7902,7 +7954,7 @@ __device__ FpExt poly_fp(uint32_t cycle, uint32_t steps, Fp** args) {
   constexpr Fp x10(4096);
   auto x548 = x96 * x10;
   auto x549 = x547 + x548;
-  RK_ST1(x33, 14u, x549);
+  RK_ST1M(x33, 14u, x549);
   constexpr Fp x11(1024);
   auto x550 = x97 * x11;
   auto x551 = x549 + x550;
@@ -7935,7 +7987,7 @@ __device__ FpExt poly_fp(uint32_t cycle, uint32_t steps, Fp** args) {
   constexpr Fp x13(64);
   auto x575 = x85 * x13;
   auto x576 = x575 + x574;
-  RK_ST1(x33, 15u, x576);
+  RK_ST1M(x33, 15u, x576);
   auto x577 = x95 * x27;
   auto x578 = x577 + x96;
   const uint32_t efl_args1_126_0 = EF_LDCR(args[1], 126u, 0u);
@@ -7945,7 +7997,7 @@ __device__ FpExt poly_fp(uint32_t cycle, uint32_t steps, Fp** args) {
   auto x580 = x576 * x8;
   auto x581 = x579 + x580;
   auto x582 = x581 + x566;
-  RK_ST1(x33, 16u, x582);
+  RK_ST1M(x33, 16u, x582);
   auto x583 = x85 * x16;
   auto x101 = ::risc0::Fp::fromRaw(efl_args1_125_0);
   const uint32_t efl_args1_108_0 = EF_LDCR(args[1], 108u, 0u);
@@ -8259,7 +8311,7 @@ __device__ FpExt poly_fp(uint32_t cycle, uint32_t steps, Fp** args) {
   auto x763 = x762 + x748;
   auto x764 = x763 + x749;
   auto x765 = x130 - x764;
-  RK_ST1(x33, 17u, x765);
+  RK_ST1M(x33, 17u, x765);
   EF_W((ef_wst(efw, 18u, x765);), RkAcc x766 = rk_link_nf_k(x734, x765, 19u);)
   const uint32_t efl_args1_150_0 = EF_LDCR(args[1], 150u, 0u);
   const uint32_t efl_args1_151_0 = EF_LDCR(args[1], 151u, 0u);
@@ -8371,11 +8423,11 @@ __device__ FpExt poly_fp(uint32_t cycle, uint32_t steps, Fp** args) {
   auto x842 = x841 + x827;
   auto x843 = x842 + x828;
   auto x844 = x843 + x829;
-  RK_ST1(x33, 18u, x844);
+  RK_ST1M(x33, 18u, x844);
   auto x845 = x132 - x844;
   const uint32_t efl_args1_166_0 = EF_LDCR(args[1], 166u, 0u);
   const uint32_t efl_args1_167_0 = EF_LDCR(args[1], 167u, 0u);
-  RK_ST1(x33, 19u, x845);
+  RK_ST1M(x33, 19u, x845);
   EF_W((ef_wst(efw, 11u, x845); ef_wblk(efw, efd_114, 4u, efq_114_28);), RkAcc x846 = rk_link_k(x814, x845, 36u);)
   auto x171 = ::risc0::Fp::fromRaw(efl_args1_164_0);
   auto x847 = ef_lsub(x31, x171);
@@ -8488,7 +8540,7 @@ __device__ FpExt poly_fp(uint32_t cycle, uint32_t steps, Fp** args) {
   const uint32_t efl_args1_182_0 = EF_LDCR(args[1], 182u, 0u);
   const uint32_t efl_args1_183_0 = EF_LDCR(args[1], 183u, 0u);
   auto x925 = x131 - x924;
-  RK_ST1(x33, 20u, x925);
+  RK_ST1M(x33, 20u, x925);
   EF_W((const int efq_114_52 = ef_wq(efw, 53u); ef_wst(efw, 4u, x925);), RkAcc x926 = rk_link_nf_k(x894, x925, 53u);)
   auto x187 = ::risc0::Fp::fromRaw(efl_args1_180_0);
   auto x927 = ef_lsub(x31, x187);
@@ -8596,9 +8648,9 @@ __device__ FpExt poly_fp(uint32_t cycle, uint32_t steps, Fp** args) {
   auto x1002 = x1001 + x987;
   auto x1003 = x1002 + x988;
   auto x1004 = x1003 + x989;
-  RK_ST1(x33, 21u, x1004);
+  RK_ST1M(x33, 21u, x1004);
   auto x1005 = x133 - x1004;
-  RK_ST1(x33, 22u, x1005);
+  RK_ST1M(x33, 22u, x1005);
   EF_W((ef_wst(efw, 21u, x1005);), RkAcc x1006 = rk_link_k(x974, x1005, 70u);)
   EF_W((ef_wst(efw, 22u, x134);), RkAcc x1007 = rk_link_nf_k(x1006, x134, 71u);)
   EF_W((ef_wst(efw, 23u, x135); ef_wblk(efw, efd_114, 16u, efq_114_64);), RkAcc x1008 = rk_link_k(x1007, x135, 72u);)
@@ -8663,7 +8715,7 @@ __device__ FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg0, Fp arg
 __device__ FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3);
 __device__ FpExt poly_fp(uint32_t cycle, uint32_t steps, Fp** args);
 
-__device__ EF_NOINLINE FpExt rv32im_v2_18(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3) {
+__device__ EF_CHAIN FpExt rv32im_v2_18(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3) {
   FpExt* arg4 = reinterpret_cast<FpExt*>(arg0);
   Fp* arg5 = EF_GPTR(0);
   Fp* arg6 = EF_GPTR(1);
@@ -8673,17 +8725,17 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(uint32_t cycle, uint32_t steps, Fp* ar
   FpExt arg1(arg1_e0, arg1_e1, arg1_e2, arg1_e3);
   FpExt arg2(arg2_e0, arg2_e1, arg2_e2, arg2_e3);
   FpExt arg3(arg3_e0, arg3_e1, arg3_e2, arg3_e3);
-  size_t mask = steps - 1; const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = (uint32_t)cycle;
+  size_t mask = steps - 1; uint32_t rk_c_o = (uint32_t)cycle; EF_OPQ(rk_c_o, 8); const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = rk_c_o;
   const uint32_t efl_arg5_138_0 = EF_LDCR(arg5, 138u, 0u);
   const uint32_t efl_arg5_18_0 = EF_LDCR(arg5, 18u, 0u);
   const uint32_t efl_arg5_14_4 = EF_LDCR(arg5, 14u, 4u);
   const uint32_t efl_arg5_21_0 = EF_LDCR(arg5, 21u, 0u);
   const uint32_t efl_arg5_133_0 = EF_LDCR(arg5, 133u, 0u);
-  auto x174 = RK_LD1(arg0, 20u);
-  auto x175 = RK_LD1(arg0, 19u);
+  auto x174 = RK_LD1M(arg0, 20u);
+  auto x175 = RK_LD1M(arg0, 19u);
   auto x176 = x174 + x175;
   auto x177 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg5_138_0));
-  auto x178 = RK_LD1(arg0, 17u);
+  auto x178 = RK_LD1M(arg0, 17u);
   // lincombF: fused into a lazy Fp linear combination
   constexpr Fp x26(1);
   auto x180 = x26 - x177;
@@ -8711,11 +8763,11 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(uint32_t cycle, uint32_t steps, Fp* ar
   auto x29 = ::risc0::Fp::fromRaw(efl_arg5_23_0);
   // lincombF: fused into a lazy Fp linear combination
   auto x196 = ((Fp(1u) - ::risc0::Fp::fromRaw(efl_arg5_18_0)) * ::risc0::Fp::fromRaw(efl_arg5_14_4));
-  auto x197 = RK_LD1(arg0, 7u);
+  auto x197 = RK_LD1M(arg0, 7u);
   auto x198 = x196 + x197;
   auto x30 = ::risc0::Fp::fromRaw(efl_arg5_24_0);
   // lincombF: fused into a lazy Fp linear combination
-  auto x200 = RK_LD1(arg0, 15u);
+  auto x200 = RK_LD1M(arg0, 15u);
   const uint32_t efl_arg5_27_0 = EF_LDCR(arg5, 27u, 0u);
   const uint32_t efl_arg5_15_4 = EF_LDCR(arg5, 15u, 4u);
   const uint32_t efl_arg5_28_0 = EF_LDCR(arg5, 28u, 0u);
@@ -8729,9 +8781,9 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(uint32_t cycle, uint32_t steps, Fp* ar
   // lincombF: fused into a lazy Fp linear combination
   auto x208 = ((((Fp(1u) - ::risc0::Fp::fromRaw(efl_arg5_18_0)) * ::risc0::Fp::fromRaw(efl_arg5_14_4)) + Fp(4u)) * ::risc0::Fp::fromRaw(efl_arg5_27_0));
   // lincombF: fused into a lazy Fp linear combination
-  auto x210 = RK_LD1(arg0, 0u);
+  auto x210 = RK_LD1M(arg0, 0u);
   // lincombF: fused into a lazy Fp linear combination
-  auto x212 = RK_LD1(arg0, 5u);
+  auto x212 = RK_LD1M(arg0, 5u);
   // lincombF: fused into a lazy Fp linear combination
   auto x214 = ((Fp(1u) - ::risc0::Fp::fromRaw(efl_arg5_18_0)) * ::risc0::Fp::fromRaw(efl_arg5_15_4));
   // lincombF: fused into a lazy Fp linear combination
@@ -8745,7 +8797,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(uint32_t cycle, uint32_t steps, Fp* ar
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx224 = rkw1_ff0(x187, x212, false); rkw1_ff(_wx224, x192, x214, false); auto x224 = rkw1_fin(_wx224);
   // lincombF: fused into a lazy Fp linear combination
-  auto x226 = RK_LD1(arg0, 18u);
+  auto x226 = RK_LD1M(arg0, 18u);
   const uint32_t efl_arg5_39_0 = EF_LDCR(arg5, 39u, 0u);
   const uint32_t efl_arg5_41_0 = EF_LDCR(arg5, 41u, 0u);
   const uint32_t efl_arg5_40_0 = EF_LDCR(arg5, 40u, 0u);
@@ -8754,7 +8806,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg5_43_0 = EF_LDCR(arg5, 43u, 0u);
   auto x227 = x214 + x226;
   // lincombF: fused into a lazy Fp linear combination
-  auto x229 = RK_LD1(arg0, 16u);
+  auto x229 = RK_LD1M(arg0, 16u);
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
@@ -8770,7 +8822,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_v4i efd_117[4] = {}; const int efq_117_0 = ef_wq(efw, 153u); ef_wst(efw, 0u, x241);), RkAcc x242 = rk_link_nf_k(arg1, x241, 153u);)
   auto x243 = (::risc0::Fp::fromRaw(efl_arg5_41_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg5_41_0)));
   EF_W((ef_wst(efw, 1u, x243);), RkAcc x244 = rk_link_k(x242, x243, 154u);)
-  auto x245 = RK_LD1(arg0, 14u);
+  auto x245 = RK_LD1M(arg0, 14u);
   auto x246 = ((::risc0::Fp::fromRaw(efl_arg5_41_0) * Fp(65536u)) + ::risc0::Fp::fromRaw(efl_arg5_40_0));
   auto x247 = x245 - x246;
   const uint32_t efl_arg5_45_0 = EF_LDCR(arg5, 45u, 0u);
@@ -8812,9 +8864,9 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 11u, x270); ef_wblk(efw, efd_117, 4u, efq_117_4);), RkAcc x271 = rk_link_k(x268, x270, 164u);)
   auto x272 = (::risc0::Fp::fromRaw(efl_arg5_51_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg5_51_0)));
   EF_W((const int efq_117_12 = ef_wq(efw, 165u); ef_wst(efw, 12u, x272);), RkAcc x273 = rk_link_nf_k(x271, x272, 165u);)
-  auto x274 = RK_LD1(arg0, 6u);
+  auto x274 = RK_LD1M(arg0, 6u);
   EF_W((ef_wst(efw, 13u, x274);), RkAcc x275 = rk_link_k(x273, x274, 166u);)
-  auto x276 = RK_LD1(arg0, 8u);
+  auto x276 = RK_LD1M(arg0, 8u);
   EF_W((ef_wst(efw, 14u, x276);), RkAcc x277 = rk_link_nf_k(x275, x276, 167u);)
   const uint32_t efl_arg5_53_0 = EF_LDCR(arg5, 53u, 0u);
   auto x278 = (::risc0::Fp::fromRaw(efl_arg5_51_0) * ::risc0::Fp::fromRaw(efl_arg5_52_0));
@@ -8830,7 +8882,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg5_54_0 = EF_LDCR(arg5, 54u, 0u);
   constexpr Fp x25(64);
   // lincombF: fused into a lazy Fp linear combination
-  auto x287 = RK_LD1(arg0, 4u);
+  auto x287 = RK_LD1M(arg0, 4u);
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   auto x34 = ::risc0::Fp::fromRaw(efl_arg5_53_0);
@@ -8846,7 +8898,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 17u, x292);), RkAcc x293 = rk_link_k(x291, x292, 170u);)
   auto x294 = (::risc0::Fp::fromRaw(efl_arg5_59_0) - Fp(1u));
   EF_W((ef_wst(efw, 18u, x294);), RkAcc x295 = rk_link_nf_k(x293, x294, 171u);)
-  auto x296 = RK_LD1(arg0, 1u);
+  auto x296 = RK_LD1M(arg0, 1u);
   EF_W((ef_wst(efw, 19u, x296); ef_wblk(efw, efd_117, 12u, efq_117_12);), RkAcc x297 = rk_link_k(x295, x296, 172u);)
   auto x299 = (::risc0::Fp::fromRaw(efl_arg5_54_0) - ::risc0::Fp::fromRaw(efl_arg5_53_0));
   EF_W((const int efq_117_20 = ef_wq(efw, 174u); ef_wst(efw, 20u, x299);), RkAcc x300 = rk_link_nf_k(x297, x299, 174u);)
@@ -8893,7 +8945,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(uint32_t cycle, uint32_t steps, Fp* ar
   auto x325 = x39 - x26;
   const uint32_t efl_arg5_91_0 = EF_LDCR(arg5, 91u, 0u);
   EF_W((const int efq_118_4 = ef_wq(efw, 4u); ef_wst(efw, 4u, x325);), RkAcc x326 = rk_link_nf_k(x324, x325, 4u);)
-  auto x327 = RK_LD1(arg0, 3u);
+  auto x327 = RK_LD1M(arg0, 3u);
   auto x40 = ::risc0::Fp::fromRaw(efl_arg5_89_0);
   auto x328 = x40 - x327;
   EF_W((ef_wst(efw, 5u, x328);), RkAcc x329 = rk_link_k(x326, x328, 5u);)
@@ -8969,13 +9021,13 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 21u, x367);), RkAcc x368 = rk_link_k(x366, x367, 22u);)
   auto x369 = (::risc0::Fp::fromRaw(efl_arg5_71_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg5_71_0)));
   EF_W((ef_wst(efw, 22u, x369);), RkAcc x370 = rk_link_nf_k(x368, x369, 23u);)
-  auto x371 = RK_LD1(arg0, 9u);
+  auto x371 = RK_LD1M(arg0, 9u);
   EF_W((ef_wst(efw, 23u, x371); ef_wblk(efw, efd_118, 16u, efq_118_16);), RkAcc x372 = rk_link_k(x370, x371, 24u);)
   const uint32_t efl_arg5_77_0 = EF_LDCR(arg5, 77u, 0u);
   const uint32_t efl_arg5_78_0 = EF_LDCR(arg5, 78u, 0u);
-  auto x373 = RK_LD1(arg0, 10u);
+  auto x373 = RK_LD1M(arg0, 10u);
   EF_W((const int efq_118_24 = ef_wq(efw, 25u); ef_wst(efw, 0u, x373);), RkAcc x374 = rk_link_nf_k(x372, x373, 25u);)
-  auto x375 = RK_LD1(arg0, 11u);
+  auto x375 = RK_LD1M(arg0, 11u);
   EF_W((ef_wst(efw, 1u, x375);), RkAcc x376 = rk_link_k(x374, x375, 26u);)
   auto x56 = ::risc0::Fp::fromRaw(efl_arg5_75_0);
   auto x377 = x23 - x56;
@@ -8985,7 +9037,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(uint32_t cycle, uint32_t steps, Fp* ar
   auto x380 = x22 - x56;
   auto x381 = x379 * x380;
   EF_W((ef_wst(efw, 2u, x381);), RkAcc x382 = rk_link_nf_k(x376, x381, 27u);)
-  auto x383 = RK_LD1(arg0, 12u);
+  auto x383 = RK_LD1M(arg0, 12u);
   EF_W((ef_wst(efw, 3u, x383); ef_wblk(efw, efd_118, 20u, efq_118_20);), RkAcc x384 = rk_link_k(x382, x383, 28u);)
   auto x385 = (::risc0::Fp::fromRaw(efl_arg5_77_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg5_77_0)));
   EF_W((const int efq_118_28 = ef_wq(efw, 29u); ef_wst(efw, 4u, x385);), RkAcc x386 = rk_link_nf_k(x384, x385, 29u);)
@@ -9009,7 +9061,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(uint32_t cycle, uint32_t steps, Fp* ar
   auto x401 = (::risc0::Fp::fromRaw(efl_arg5_81_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg5_81_0)));
   const uint32_t efl_arg5_84_0 = EF_LDCR(arg5, 84u, 0u);
   EF_W((const int efq_118_32 = ef_wq(efw, 33u); ef_wst(efw, 8u, x401);), RkAcc x402 = rk_link_nf_k(x400, x401, 33u);)
-  auto x403 = RK_LD1(arg0, 13u);
+  auto x403 = RK_LD1M(arg0, 13u);
   EF_W((ef_wst(efw, 9u, x403);), RkAcc x404 = rk_link_k(x402, x403, 34u);)
   auto x59 = ::risc0::Fp::fromRaw(efl_arg5_83_0);
   auto x405 = x23 - x59;
@@ -9196,7 +9248,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(uint32_t cycle, uint32_t steps, Fp* ar
   auto x518 = ef_lsub(x85, x26);
   auto x88 = ::risc0::Fp::fromRaw(efl_arg5_120_0);
   auto x520 = x88 - x310;
-  RK_ST1(arg0, 0u, x520);
+  RK_ST1M(arg0, 0u, x520);
   const uint32_t efl_arg5_116_0 = EF_LDCR(arg5, 116u, 0u);
   const uint32_t efl_arg5_126_0 = EF_LDCR(arg5, 126u, 0u);
   auto x89 = ::risc0::Fp::fromRaw(efl_arg5_115_0);
@@ -9796,7 +9848,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(uint32_t cycle, uint32_t steps, Fp* ar
   RkW1 _wx2002002 = rkw1_ff0(x2001996, x163, false); rkw1_ff(_wx2002002, x2001998, x161, false); rkw1_ff(_wx2002002, x162, x29, false); auto x2002002 = rkw1_fin(_wx2002002);
   const uint32_t efl_arg5_153_0 = EF_LDCR(arg5, 153u, 0u);
   const uint32_t efl_arg5_154_0 = EF_LDCR(arg5, 154u, 0u);
-  RK_ST1(arg0, 1u, x2002002);
+  RK_ST1M(arg0, 1u, x2002002);
   auto x2002003 = x30 + x31;
   auto x2002004 = ef_ladd(x2002003, x150);
   auto x164 = ::risc0::Fp::fromRaw(efl_arg5_38_0);
@@ -9806,7 +9858,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(uint32_t cycle, uint32_t steps, Fp* ar
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002010 = rkw1_ff0(x2002004, x164, false); rkw1_ff(_wx2002010, x2002006, x163, false); rkw1_ff(_wx2002010, x161, x29, false); auto x2002010 = rkw1_fin(_wx2002010);
-  RK_ST1(arg0, 5u, x2002010);
+  RK_ST1M(arg0, 5u, x2002010);
   auto x1142 = (::risc0::Fp::fromRaw(efl_arg5_153_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg5_153_0)));
   EF_W((ef_v4i efd_129[4] = {}; const int efq_129_0 = ef_wq(efw, 327u); ef_wst(efw, 0u, x1142);), RkAcc x1143 = rk_link_nf_k(x1119, x1142, 327u);)
   auto x165 = ::risc0::Fp::fromRaw(efl_arg5_154_0);
@@ -9854,7 +9906,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(uint32_t cycle, uint32_t steps, Fp* ar
   auto x1171 = rv32im_v2_17(cycle, steps, arg0, x1167.elems[0], x1167.elems[1], x1167.elems[2], x1167.elems[3], x309.elems[0], x309.elems[1], x309.elems[2], x309.elems[3], arg3.elems[0], arg3.elems[1], arg3.elems[2], arg3.elems[3], x1098.elems[0], x1098.elems[1], x1098.elems[2], x1098.elems[3], x1102.elems[0], x1102.elems[1], x1102.elems[2], x1102.elems[3], x1099.elems[0], x1099.elems[1], x1099.elems[2], x1099.elems[3]);
   return x1171;
 }
-__device__ EF_NOINLINE FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg0_e0, Fp arg0_e1, Fp arg0_e2, Fp arg0_e3, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp* arg3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3, Fp arg7_e0, Fp arg7_e1, Fp arg7_e2, Fp arg7_e3, Fp arg9_e0, Fp arg9_e1, Fp arg9_e2, Fp arg9_e3) {
+__device__ EF_CHAIN FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg0_e0, Fp arg0_e1, Fp arg0_e2, Fp arg0_e3, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp* arg3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3, Fp arg7_e0, Fp arg7_e1, Fp arg7_e2, Fp arg7_e3, Fp arg9_e0, Fp arg9_e1, Fp arg9_e2, Fp arg9_e3) {
   FpExt* arg8 = reinterpret_cast<FpExt*>(arg3);
   Fp* arg10 = EF_GPTR(0);
   Fp* arg11 = EF_GPTR(1);
@@ -9869,7 +9921,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg
   FpExt arg6(arg6_e0, arg6_e1, arg6_e2, arg6_e3);
   FpExt arg7(arg7_e0, arg7_e1, arg7_e2, arg7_e3);
   FpExt arg9(arg9_e0, arg9_e1, arg9_e2, arg9_e3);
-  size_t mask = steps - 1; const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = (uint32_t)cycle;
+  size_t mask = steps - 1; uint32_t rk_c_o = (uint32_t)cycle; EF_OPQ(rk_c_o, 9); const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = rk_c_o;
   auto x109 = EF_LDU(arg13, 17);
   auto x110 = EF_LDU(arg13, 18);
   auto x111 = EF_LDU(arg13, 19);
@@ -10003,7 +10055,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg
   const uint32_t efl_arg10_45_0 = EF_LDCR(arg10, 45u, 0u);
   auto x263 = (((Fp(1u) - ::risc0::Fp::fromRaw(efl_arg10_18_0)) * ::risc0::Fp::fromRaw(efl_arg10_16_4)) - Fp(48u));
   EF_W((ef_wst(efw, 2u, x263);), RkAcc x264 = rk_link_nf_k(x262, x263, 24u);)
-  auto x265 = RK_LD1(arg3, 2u);
+  auto x265 = RK_LD1M(arg3, 2u);
   EF_W((ef_wst(efw, 3u, x265);), RkAcc x266 = rk_link_k(x264, x265, 25u);)
   auto x267 = (::risc0::Fp::fromRaw(efl_arg10_38_0) - Fp(2013265920u));
   EF_W((const int efq_131_4 = ef_wq4(efw, 26u, 27u, 28u, 30u, 4u); ef_wst(efw, 4u, x267);), RkAcc x268 = rk_link_nf_k(x266, x267, 26u);)
@@ -10015,7 +10067,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg
   const uint32_t efl_arg10_104_0 = EF_LDCR(arg10, 104u, 0u);
   const uint32_t efl_arg10_44_0 = EF_LDCR(arg10, 44u, 0u);
   const uint32_t efl_arg10_40_0 = EF_LDCR(arg10, 40u, 0u);
-  auto x271 = RK_LD1(arg3, 9u);
+  auto x271 = RK_LD1M(arg3, 9u);
   EF_W((ef_wst(efw, 6u, x271);), RkAcc x272 = rk_link_nf_k(x270, x271, 28u);)
   constexpr Fp x40(1073725568);
   auto x70 = ::risc0::Fp::fromRaw(efl_arg10_39_0);
@@ -10156,7 +10208,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg
   RkW _cx348 = _cx258; rk_cl_acc(_cx348, x98 * x347, 292u); FpExt x348 = rkw_fin(_cx348);
   auto x349 = (::risc0::Fp::fromRaw(efl_arg10_182_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg10_182_0)));
   RkAcc x350 = rk_link_nf_k(arg4, x349, 0u);
-  auto x351 = RK_LD1(arg3, 1u);
+  auto x351 = RK_LD1M(arg3, 1u);
   const uint32_t efl_arg10_29_0 = EF_LDCR(arg10, 29u, 0u);
   const uint32_t efl_arg10_34_0 = EF_LDCR(arg10, 34u, 0u);
   auto x99 = ::risc0::Fp::fromRaw(efl_arg10_183_0);
@@ -10164,14 +10216,14 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg
   auto x353 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg10_182_0));
   auto x354 = x352 - x353;
   RkAcc x355 = rk_link_k(x350, x354, 1u);
-  auto x356 = RK_LD1(arg3, 15u);
+  auto x356 = RK_LD1M(arg3, 15u);
   RkAcc x357 = rk_link_nf_k(x355, x356, 2u);
   auto x100 = ::risc0::Fp::fromRaw(efl_arg10_182_0);
   const uint32_t efl_arg10_30_0 = EF_LDCR(arg10, 30u, 0u);
   const uint32_t efl_arg10_32_0 = EF_LDCR(arg10, 32u, 0u);
   auto x358 = x100 * x99;
   FpExt x359 = rk_fin(rk_link_k(x357, x358, 3u));
-  auto x360 = RK_LD1(arg3, 4u);
+  auto x360 = RK_LD1M(arg3, 4u);
   EF_W((ef_v4i efd_133[4] = {}; FpExt efb_133 = arg4; const int efq_133_0 = ef_wq(efw, 0u); ef_wst(efw, 0u, x360);), RkAcc x361 = rk_link_nf_k(arg4, x360, 0u);)
   auto x362 = (::risc0::Fp::fromRaw(efl_arg10_29_0) - Fp(2013265920u));
   EF_W((ef_wst(efw, 1u, x362);), RkAcc x363 = rk_link_k(x361, x362, 1u);)
@@ -10179,7 +10231,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg
   EF_W((ef_wst(efw, 2u, x364);), RkAcc x365 = rk_link_nf_k(x363, x364, 2u);)
   const uint32_t efl_arg10_33_0 = EF_LDCR(arg10, 33u, 0u);
   const uint32_t efl_arg10_101_0 = EF_LDCR(arg10, 101u, 0u);
-  auto x366 = RK_LD1(arg3, 8u);
+  auto x366 = RK_LD1M(arg3, 8u);
   EF_W((ef_wst(efw, 3u, x366);), RkAcc x367 = rk_link_k(x365, x366, 3u);)
   constexpr Fp x37(1073725584);
   auto x101 = ::risc0::Fp::fromRaw(efl_arg10_30_0);
@@ -10191,7 +10243,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg
   EF_W((ef_wst(efw, 6u, x373);), RkAcc x374 = rk_link_nf_k(x372, x373, 7u);)
   auto x375 = (::risc0::Fp::fromRaw(efl_arg10_101_0) - Fp(1u));
   EF_W((ef_wst(efw, 7u, x375); ef_wblk(efw, efd_133, 0u, efq_133_0);), RkAcc x376 = rk_link_k(x374, x375, 8u);)
-  auto x377 = RK_LD1(arg3, 17u);
+  auto x377 = RK_LD1M(arg3, 17u);
   EF_W((const int efq_133_8 = ef_wq(efw, 9u); ef_wst(efw, 8u, x377);), RkAcc x378 = rk_link_nf_k(x376, x377, 9u);)
   EF_W((ef_wst(efw, 9u, x267);), RkAcc x379 = rk_link_k(x378, x267, 10u);)
   EF_W((ef_wst(efw, 10u, x269);), RkAcc x380 = rk_link_nf_k(x379, x269, 11u);)
@@ -10212,7 +10264,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg
   EF_W((ef_wst(efw, 17u, x389);), RkAcc x390 = rk_link_k(x388, x389, 19u);)
   auto x391 = (::risc0::Fp::fromRaw(efl_arg10_52_0) - Fp(1u));
   EF_W((ef_wst(efw, 18u, x391);), RkAcc x392 = rk_link_nf_k(x390, x391, 20u);)
-  auto x393 = RK_LD1(arg3, 10u);
+  auto x393 = RK_LD1M(arg3, 10u);
   EF_W((ef_wst(efw, 19u, x393); ef_wblk(efw, efd_133, 12u, efq_133_12);), RkAcc x394 = rk_link_k(x392, x393, 21u);)
   constexpr Fp x35(1073725586);
   auto x102 = ::risc0::Fp::fromRaw(efl_arg10_48_0);
@@ -10229,13 +10281,13 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg
   const uint32_t efl_arg10_63_0 = EF_LDCR(arg10, 63u, 0u);
   const uint32_t efl_arg10_60_0 = EF_LDCR(arg10, 60u, 0u);
   const uint32_t efl_arg10_64_0 = EF_LDCR(arg10, 64u, 0u);
-  auto x404 = RK_LD1(arg3, 22u);
+  auto x404 = RK_LD1M(arg3, 22u);
   EF_W((const int efq_133_24 = ef_wq(efw, 27u); ef_wst(efw, 0u, x404);), RkAcc x405 = rk_link_nf_k(x403, x404, 27u);)
   auto x406 = (::risc0::Fp::fromRaw(efl_arg10_56_0) - Fp(2013265920u));
   EF_W((ef_wst(efw, 1u, x406);), RkAcc x407 = rk_link_k(x405, x406, 28u);)
   auto x408 = (::risc0::Fp::fromRaw(efl_arg10_61_0) - Fp(1u));
   EF_W((ef_wst(efw, 2u, x408);), RkAcc x409 = rk_link_nf_k(x407, x408, 29u);)
-  auto x410 = RK_LD1(arg3, 11u);
+  auto x410 = RK_LD1M(arg3, 11u);
   EF_W((ef_wst(efw, 3u, x410); ef_wblk(efw, efd_133, 20u, efq_133_20);), RkAcc x411 = rk_link_k(x409, x410, 30u);)
   constexpr Fp x34(1073725587);
   auto x103 = ::risc0::Fp::fromRaw(efl_arg10_57_0);
@@ -10250,7 +10302,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg
   const uint32_t efl_arg10_72_0 = EF_LDCR(arg10, 72u, 0u);
   auto x419 = (::risc0::Fp::fromRaw(efl_arg10_107_0) - Fp(1u));
   EF_W((ef_wst(efw, 7u, x419); ef_wblk(efw, efd_133, 0u, efq_133_24);), RkAcc x420 = rk_link_k(x418, x419, 35u);)
-  auto x421 = RK_LD1(arg3, 25u);
+  auto x421 = RK_LD1M(arg3, 25u);
   EF_W((const int efq_133_32 = ef_wq(efw, 36u); ef_wst(efw, 8u, x421);), RkAcc x422 = rk_link_nf_k(x420, x421, 36u);)
   auto x423 = (::risc0::Fp::fromRaw(efl_arg10_65_0) - Fp(2013265920u));
   EF_W((ef_wst(efw, 9u, x423);), RkAcc x424 = rk_link_k(x422, x423, 37u);)
@@ -10258,7 +10310,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg
   EF_W((ef_wst(efw, 10u, x425);), RkAcc x426 = rk_link_nf_k(x424, x425, 38u);)
   const uint32_t efl_arg10_69_0 = EF_LDCR(arg10, 69u, 0u);
   const uint32_t efl_arg10_73_0 = EF_LDCR(arg10, 73u, 0u);
-  auto x427 = RK_LD1(arg3, 12u);
+  auto x427 = RK_LD1M(arg3, 12u);
   EF_W((ef_wst(efw, 11u, x427); ef_wblk(efw, efd_133, 4u, efq_133_28);), RkAcc x428 = rk_link_k(x426, x427, 39u);)
   constexpr Fp x33(1073725588);
   auto x104 = ::risc0::Fp::fromRaw(efl_arg10_66_0);
@@ -10271,7 +10323,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg
   EF_W((ef_wst(efw, 14u, x434);), RkAcc x435 = rk_link_nf_k(x433, x434, 43u);)
   auto x436 = (::risc0::Fp::fromRaw(efl_arg10_109_0) - Fp(1u));
   EF_W((ef_wst(efw, 15u, x436); ef_wblk(efw, efd_133, 8u, efq_133_32);), RkAcc x437 = rk_link_k(x435, x436, 44u);)
-  auto x438 = RK_LD1(arg3, 27u);
+  auto x438 = RK_LD1M(arg3, 27u);
   EF_W((const int efq_133_40 = ef_wq(efw, 45u); ef_wst(efw, 16u, x438);), RkAcc x439 = rk_link_nf_k(x437, x438, 45u);)
   auto x440 = (::risc0::Fp::fromRaw(efl_arg10_74_0) - Fp(2013265920u));
   EF_W((ef_wst(efw, 17u, x440);), RkAcc x441 = rk_link_k(x439, x440, 46u);)
@@ -10281,7 +10333,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg
   const uint32_t efl_arg10_82_0 = EF_LDCR(arg10, 82u, 0u);
   auto x442 = (::risc0::Fp::fromRaw(efl_arg10_79_0) - Fp(1u));
   EF_W((ef_wst(efw, 18u, x442);), RkAcc x443 = rk_link_nf_k(x441, x442, 47u);)
-  auto x444 = RK_LD1(arg3, 13u);
+  auto x444 = RK_LD1M(arg3, 13u);
   EF_W((ef_wst(efw, 19u, x444); ef_wblk(efw, efd_133, 12u, efq_133_36);), RkAcc x445 = rk_link_k(x443, x444, 48u);)
   constexpr Fp x32(1073725589);
   auto x105 = ::risc0::Fp::fromRaw(efl_arg10_75_0);
@@ -10294,7 +10346,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg
   EF_W((ef_wst(efw, 22u, x451);), RkAcc x452 = rk_link_nf_k(x450, x451, 52u);)
   auto x453 = (::risc0::Fp::fromRaw(efl_arg10_111_0) - Fp(1u));
   EF_W((ef_wst(efw, 23u, x453); ef_wblk(efw, efd_133, 16u, efq_133_40); ef_wblk(efw, efd_133, 20u, efq_133_44); efb_133 = ef_wfin(efw, efd_133, 0u, efb_133);), RkAcc x454 = rk_link_k(x452, x453, 53u);)
-  auto x455 = RK_LD1(arg3, 28u);
+  auto x455 = RK_LD1M(arg3, 28u);
   EF_W((efd_133[0] = efd_133[1] = efd_133[2] = efd_133[3] = ef_v4i{}; const int efq_133_48 = ef_wq(efw, 54u); ef_wst(efw, 0u, x455);), RkAcc x456 = rk_link_nf_k(x454, x455, 54u);)
   const uint32_t efl_arg10_86_0 = EF_LDCR(arg10, 86u, 0u);
   const uint32_t efl_arg10_90_0 = EF_LDCR(arg10, 90u, 0u);
@@ -10304,7 +10356,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg
   EF_W((ef_wst(efw, 1u, x457);), RkAcc x458 = rk_link_k(x456, x457, 55u);)
   auto x459 = (::risc0::Fp::fromRaw(efl_arg10_88_0) - Fp(1u));
   EF_W((ef_wst(efw, 2u, x459);), RkAcc x460 = rk_link_nf_k(x458, x459, 56u);)
-  auto x461 = RK_LD1(arg3, 14u);
+  auto x461 = RK_LD1M(arg3, 14u);
   EF_W((ef_wst(efw, 3u, x461);), RkAcc x462 = rk_link_k(x460, x461, 57u);)
   constexpr Fp x31(1073725590);
   auto x106 = ::risc0::Fp::fromRaw(efl_arg10_84_0);
@@ -10344,7 +10396,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg
   EF_W((ef_wst(efw, 14u, x485);), RkAcc x486 = rk_link_nf_k(x484, x485, 70u);)
   auto x487 = (::risc0::Fp::fromRaw(efl_arg10_115_0) - Fp(1u));
   EF_W((ef_wst(efw, 15u, x487); ef_wblk(efw, efd_133, 8u, efq_133_56);), RkAcc x488 = rk_link_k(x486, x487, 71u);)
-  auto x489 = RK_LD1(arg3, 29u);
+  auto x489 = RK_LD1M(arg3, 29u);
   EF_W((const int efq_133_64 = ef_wq(efw, 72u); ef_wst(efw, 16u, x489);), RkAcc x490 = rk_link_nf_k(x488, x489, 72u);)
   auto x108 = ::risc0::Fp::fromRaw(efl_arg10_36_0);
   auto x491 = x108 - x109;
@@ -10419,7 +10471,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg
   const uint32_t efl_arg10_15_4 = EF_LDCR(arg10, 15u, 4u);
   EF_W((ef_wst(efw, 3u, x362);), RkAcc x544 = rk_link_k(x543, x362, 3u);)
   EF_W((const int efq_134_4 = ef_wq4(efw, 4u, 5u, 7u, 8u, 4u); ef_wst(efw, 4u, x364);), RkAcc x545 = rk_link_nf_k(x544, x364, 4u);)
-  auto x546 = RK_LD1(arg3, 18u);
+  auto x546 = RK_LD1M(arg3, 18u);
   EF_W((ef_wst(efw, 5u, x546);), RkAcc x547 = rk_link_k(x545, x546, 5u);)
   auto x549 = (::risc0::Fp::fromRaw(efl_arg10_30_0) - Fp(1073725572u));
   EF_W((ef_wst(efw, 6u, x549);), RkAcc x550 = rk_link_nf_k(x547, x549, 7u);)
@@ -10434,7 +10486,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg
   EF_W((ef_wst(efw, 10u, x557);), RkAcc x558 = rk_link_nf_k(x555, x557, 11u);)
   EF_W((ef_wst(efw, 11u, x267); ef_wblk(efw, efd_134, 4u, efq_134_4);), RkAcc x559 = rk_link_k(x558, x267, 12u);)
   EF_W((const int efq_134_12 = ef_wq4(efw, 13u, 14u, 16u, 17u, 4u); ef_wst(efw, 12u, x269);), RkAcc x560 = rk_link_nf_k(x559, x269, 13u);)
-  auto x561 = RK_LD1(arg3, 19u);
+  auto x561 = RK_LD1M(arg3, 19u);
   EF_W((ef_wst(efw, 13u, x561);), RkAcc x562 = rk_link_k(x560, x561, 14u);)
   auto x564 = (::risc0::Fp::fromRaw(efl_arg10_39_0) - Fp(1073725573u));
   EF_W((ef_wst(efw, 14u, x564);), RkAcc x565 = rk_link_nf_k(x562, x564, 16u);)
@@ -10504,7 +10556,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg
   EF_W((ef_wst(efw, 7u, x67); ef_wblk(efw, efd_135, 0u, efq_135_24); ef_wblk(efw, efd_135, 4u, efq_135_28); FpExt x622 = ef_wfin(efw, efd_135, 0u, x590);), FpExt x622 = rk_fin(rk_link_k(x621, x67, 167u));)
   auto x147 = ::risc0::Fp::fromRaw(efl_arg10_25_0);
   RkW _cx623 = _cx348; rk_cl_acc(_cx623, x147 * x622, 347u); FpExt x623 = rkw_fin(_cx623);
-  auto x624 = RK_LD1(arg3, 5u);
+  auto x624 = RK_LD1M(arg3, 5u);
   EF_W((ef_v4i efd_136[4] = {}; FpExt efb_136 = arg4; const int efq_136_0 = ef_wq(efw, 0u); ef_wst(efw, 0u, x624);), RkAcc x625 = rk_link_nf_k(arg4, x624, 0u);)
   EF_W((ef_wst(efw, 1u, x362);), RkAcc x626 = rk_link_k(x625, x362, 1u);)
   EF_W((ef_wst(efw, 2u, x364);), RkAcc x627 = rk_link_nf_k(x626, x364, 2u);)
@@ -10654,7 +10706,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg
   EF_W((efd_136[0] = efd_136[1] = efd_136[2] = efd_136[3] = ef_v4i{}; const int efq_136_96 = ef_wq4(efw, 104u, 104u, 104u, 104u, 1u); ef_wst(efw, 0u, x67); ef_wblk(efw, efd_136, 0u, efq_136_96); FpExt x753 = ef_wfin(efw, efd_136, 0u, efb_136);), FpExt x753 = rk_fin(rk_link_k(x752, x67, 104u));)
   auto x180 = ::risc0::Fp::fromRaw(efl_arg10_26_0);
   RkW _cx754 = _cx623; rk_cl_acc(_cx754, x180 * x753, 355u); FpExt x754 = rkw_fin(_cx754);
-  auto x755 = RK_LD1(arg3, 6u);
+  auto x755 = RK_LD1M(arg3, 6u);
   RkAcc x756 = rk_link_nf_k(arg4, x755, 0u);
   auto x757 = x553 - x99;
   RkAcc x758 = rk_link_k(x756, x757, 1u);
@@ -10905,7 +10957,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg
   const uint32_t efl_arg10_102_0 = EF_LDCR(arg10, 102u, 0u);
   auto x218 = ::risc0::Fp::fromRaw(efl_arg10_27_0);
   RkW _cx919 = _cx754; rk_cl_acc(_cx919, x218 * x918, 383u); FpExt x919 = rkw_fin(_cx919);
-  auto x920 = RK_LD1(arg3, 7u);
+  auto x920 = RK_LD1M(arg3, 7u);
   EF_W((ef_v4i efd_141[4] = {}; FpExt efb_141 = arg4; const int efq_141_0 = ef_wq4(efw, 0u, 554u, 555u, 556u, 4u); ef_wst(efw, 0u, x920);), RkAcc x921 = rk_link_nf_k(arg4, x920, 0u);)
   auto x922 = (Fp(1u) - (((Fp(1u) - ::risc0::Fp::fromRaw(efl_arg10_18_0)) * ::risc0::Fp::fromRaw(efl_arg10_17_4)) + ::risc0::Fp::fromRaw(efl_arg10_18_0)));
   auto x923 = x922 * x523;
@@ -10986,17 +11038,17 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg
   auto x989 = x534 - x12;
   auto x990 = x534 - x11;
   auto x991 = x534 - x10;
-  RK_ST1(arg3, 2u, x991);
+  RK_ST1M(arg3, 2u, x991);
   auto x992 = x534 - x9;
-  RK_ST1(arg3, 4u, x992);
+  RK_ST1M(arg3, 4u, x992);
   auto x993 = x534 - x8;
-  RK_ST1(arg3, 5u, x993);
+  RK_ST1M(arg3, 5u, x993);
   auto x224 = ::risc0::Fp::fromRaw(efl_arg10_22_0);
   auto x994 = x224 * x39;
   auto x995 = x98 * x28;
   auto x996 = (::risc0::Fp::fromRaw(efl_arg10_0_0) * Fp(2u));
   auto x997 = x107 - x996;
-  RK_ST1(arg3, 6u, x997);
+  RK_ST1M(arg3, 6u, x997);
   EF_W((ef_v4i efd_142[4] = {}; const int efq_142_0 = ef_wq(efw, 0u); ef_wst(efw, 0u, x997);), RkAcc x998 = rk_link_nf_k(arg4, x997, 0u);)
   auto x999 = ((::risc0::Fp::fromRaw(efl_arg10_0_0) * Fp(2u)) + Fp(1u));
   auto x1000 = x176 - x999;
@@ -11009,7 +11061,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg
   auto x1007 = x1006 + x178;
   auto x1008 = (::risc0::Fp::fromRaw(efl_arg10_98_0) - Fp(1u));
   EF_W((const int efq_142_4 = ef_wq(efw, 4u); ef_wst(efw, 4u, x1008);), RkAcc x1009 = rk_link_nf_k(x1005, x1008, 4u);)
-  auto x1010 = RK_LD1(arg3, 3u);
+  auto x1010 = RK_LD1M(arg3, 3u);
   auto x1011 = x133 - x1010;
   EF_W((ef_wst(efw, 5u, x1011);), RkAcc x1012 = rk_link_k(x1009, x1011, 5u);)
   auto x1013 = (::risc0::Fp::fromRaw(efl_arg10_100_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg10_100_0)));
@@ -11038,9 +11090,9 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg
   EF_W((ef_wst(efw, 2u, x373);), RkAcc x1036 = rk_link_nf_k(x1035, x373, 6u);)
   auto x1037 = (::risc0::Fp::fromRaw(efl_arg10_65_0) - Fp(1u));
   EF_W((ef_wst(efw, 3u, x1037);), RkAcc x1038 = rk_link_k(x1036, x1037, 7u);)
-  auto x1039 = RK_LD1(arg3, 16u);
+  auto x1039 = RK_LD1M(arg3, 16u);
   auto x1040 = x104 - x1039;
-  RK_ST1(arg3, 3u, x1040);
+  RK_ST1M(arg3, 3u, x1040);
   EF_W((const int efq_143_4 = ef_wq(efw, 8u); ef_wst(efw, 4u, x1040);), RkAcc x1041 = rk_link_nf_k(x1038, x1040, 8u);)
   const uint32_t efl_arg10_67_0 = EF_LDCR(arg10, 67u, 0u);
   EF_W((ef_wst(efw, 5u, x263);), RkAcc x1042 = rk_link_k(x1041, x263, 9u);)
@@ -11061,7 +11113,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg
   auto x1056 = ((::risc0::Fp::fromRaw(efl_arg10_44_0) - Fp(1u)) - ::risc0::Fp::fromRaw(efl_arg10_40_0));
   auto x1057 = x164 - x1056;
   const uint32_t efl_arg10_108_0 = EF_LDCR(arg10, 108u, 0u);
-  RK_ST1(arg3, 7u, x1057);
+  RK_ST1M(arg3, 7u, x1057);
   EF_W((const int efq_143_16 = ef_wq(efw, 21u); ef_wst(efw, 16u, x1057);), RkAcc x1058 = rk_link_nf_k(x1055, x1057, 21u);)
   EF_W((ef_wst(efw, 17u, x74);), RkAcc x1059 = rk_link_k(x1058, x74, 22u);)
   auto x1060 = (::risc0::Fp::fromRaw(efl_arg10_104_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg10_104_0)));
@@ -11165,20 +11217,20 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg
   constexpr Fp x0(1073725452);
   auto x1172 = x102 - x0;
   auto x1176 = (::risc0::Fp::fromRaw(efl_arg10_69_0) - Fp(1u));
-  auto x1178 = RK_LD1(arg3, 21u);
+  auto x1178 = RK_LD1M(arg3, 21u);
   auto x1179 = x82 - x1178;
-  RK_ST1(arg3, 11u, x1179);
+  RK_ST1M(arg3, 11u, x1179);
   auto x1182 = (::risc0::Fp::fromRaw(efl_arg10_73_0) - Fp(1u));
   auto x1184 = x113 - x83;
   auto x1185 = (::risc0::Fp::fromRaw(efl_arg10_75_0) - Fp(1u));
   auto x231 = ::risc0::Fp::fromRaw(efl_arg10_76_0);
   auto x1187 = x231 - x1184;
-  auto x1191 = RK_LD1(arg3, 23u);
+  auto x1191 = RK_LD1M(arg3, 23u);
   auto x1194 = x103 - x2;
   auto x1196 = (::risc0::Fp::fromRaw(efl_arg10_71_0) - Fp(1u));
-  auto x1198 = RK_LD1(arg3, 24u);
+  auto x1198 = RK_LD1M(arg3, 24u);
   auto x1199 = x121 - x1198;
-  RK_ST1(arg3, 12u, x1199);
+  RK_ST1M(arg3, 12u, x1199);
   auto x1201 = x117 - x83;
   auto x1204 = (::risc0::Fp::fromRaw(efl_arg10_77_0) - Fp(1u));
   auto x1206 = (::risc0::Fp::fromRaw(efl_arg10_78_0) * Fp(4u));
@@ -11194,7 +11246,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx1223 = rkw1_ff0(x90, x18, false); rkw1_v(_wx1223, x227, false); rkw1_ff(_wx1223, x225, x17, false); rkw1_v(_wx1223, x226, true); auto x1223 = rkw1_fin(_wx1223);
-  RK_ST1(arg3, 13u, x1223);
+  RK_ST1M(arg3, 13u, x1223);
   auto x232 = ::risc0::Fp::fromRaw(efl_arg10_110_0);
   auto x1226 = x170 * x232;
   auto x1227 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg10_109_0));
@@ -11265,7 +11317,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg
   auto x1239 = rv32im_v2_13(cycle, steps, arg3, x1236.elems[0], x1236.elems[1], x1236.elems[2], x1236.elems[3], x1148.elems[0], x1148.elems[1], x1148.elems[2], x1148.elems[3], arg4.elems[0], arg4.elems[1], arg4.elems[2], arg4.elems[3], arg7.elems[0], arg7.elems[1], arg7.elems[2], arg7.elems[3], x988.elems[0], x988.elems[1], x988.elems[2], x988.elems[3], arg9.elems[0], arg9.elems[1], arg9.elems[2], arg9.elems[3]);
   return x1239;
 }
-__device__ EF_NOINLINE FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3, Fp arg7_e0, Fp arg7_e1, Fp arg7_e2, Fp arg7_e3, Fp arg8_e0, Fp arg8_e1, Fp arg8_e2, Fp arg8_e3, Fp arg9_e0, Fp arg9_e1, Fp arg9_e2, Fp arg9_e3, Fp arg10_e0, Fp arg10_e1, Fp arg10_e2, Fp arg10_e3, Fp arg11_e0, Fp arg11_e1, Fp arg11_e2, Fp arg11_e3, Fp arg12_e0, Fp arg12_e1, Fp arg12_e2, Fp arg12_e3, Fp arg13_e0, Fp arg13_e1, Fp arg13_e2, Fp arg13_e3, Fp arg14_e0, Fp arg14_e1, Fp arg14_e2, Fp arg14_e3, Fp arg15_e0, Fp arg15_e1, Fp arg15_e2, Fp arg15_e3, Fp arg16_e0, Fp arg16_e1, Fp arg16_e2, Fp arg16_e3, Fp arg17_e0, Fp arg17_e1, Fp arg17_e2, Fp arg17_e3, Fp arg18_e0, Fp arg18_e1, Fp arg18_e2, Fp arg18_e3, Fp arg19_e0, Fp arg19_e1, Fp arg19_e2, Fp arg19_e3, Fp arg20_e0, Fp arg20_e1, Fp arg20_e2, Fp arg20_e3, Fp arg21_e0, Fp arg21_e1, Fp arg21_e2, Fp arg21_e3, Fp arg22_e0, Fp arg22_e1, Fp arg22_e2, Fp arg22_e3, Fp arg23_e0, Fp arg23_e1, Fp arg23_e2, Fp arg23_e3, Fp arg24_e0, Fp arg24_e1, Fp arg24_e2, Fp arg24_e3, Fp arg25_e0, Fp arg25_e1, Fp arg25_e2, Fp arg25_e3, Fp arg26_e0, Fp arg26_e1, Fp arg26_e2, Fp arg26_e3) {
+__device__ EF_CHAIN FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3, Fp arg7_e0, Fp arg7_e1, Fp arg7_e2, Fp arg7_e3, Fp arg8_e0, Fp arg8_e1, Fp arg8_e2, Fp arg8_e3, Fp arg9_e0, Fp arg9_e1, Fp arg9_e2, Fp arg9_e3, Fp arg10_e0, Fp arg10_e1, Fp arg10_e2, Fp arg10_e3, Fp arg11_e0, Fp arg11_e1, Fp arg11_e2, Fp arg11_e3, Fp arg12_e0, Fp arg12_e1, Fp arg12_e2, Fp arg12_e3, Fp arg13_e0, Fp arg13_e1, Fp arg13_e2, Fp arg13_e3, Fp arg14_e0, Fp arg14_e1, Fp arg14_e2, Fp arg14_e3, Fp arg15_e0, Fp arg15_e1, Fp arg15_e2, Fp arg15_e3, Fp arg16_e0, Fp arg16_e1, Fp arg16_e2, Fp arg16_e3, Fp arg17_e0, Fp arg17_e1, Fp arg17_e2, Fp arg17_e3, Fp arg18_e0, Fp arg18_e1, Fp arg18_e2, Fp arg18_e3, Fp arg19_e0, Fp arg19_e1, Fp arg19_e2, Fp arg19_e3, Fp arg20_e0, Fp arg20_e1, Fp arg20_e2, Fp arg20_e3, Fp arg21_e0, Fp arg21_e1, Fp arg21_e2, Fp arg21_e3, Fp arg22_e0, Fp arg22_e1, Fp arg22_e2, Fp arg22_e3, Fp arg23_e0, Fp arg23_e1, Fp arg23_e2, Fp arg23_e3, Fp arg24_e0, Fp arg24_e1, Fp arg24_e2, Fp arg24_e3, Fp arg25_e0, Fp arg25_e1, Fp arg25_e2, Fp arg25_e3, Fp arg26_e0, Fp arg26_e1, Fp arg26_e2, Fp arg26_e3) {
   FpExt* arg2 = reinterpret_cast<FpExt*>(arg0);
   Fp* arg27 = EF_GPTR(0);
   Fp* arg28 = EF_GPTR(1);
@@ -11296,7 +11348,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* ar
   FpExt arg24(arg24_e0, arg24_e1, arg24_e2, arg24_e3);
   FpExt arg25(arg25_e0, arg25_e1, arg25_e2, arg25_e3);
   FpExt arg26(arg26_e0, arg26_e1, arg26_e2, arg26_e3);
-  size_t mask = steps - 1; const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = (uint32_t)cycle;
+  size_t mask = steps - 1; uint32_t rk_c_o = (uint32_t)cycle; EF_OPQ(rk_c_o, 10); const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = rk_c_o;
   const uint32_t efl_arg27_58_0 = EF_LDCR(arg27, 58u, 0u);
   const uint32_t efl_arg27_59_0 = EF_LDCR(arg27, 59u, 0u);
   const uint32_t efl_arg27_60_0 = EF_LDCR(arg27, 60u, 0u);
@@ -11320,7 +11372,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((const int efq_146_4 = ef_wq4(efw, 33u, 34u, 33u, 33u, 2u); ef_wst(efw, 4u, x351);), RkAcc x352 = rk_link_nf_k(x350, x351, 33u);)
   auto x353 = (Fp(0u) - ::risc0::Fp::fromRaw(efl_arg27_63_0));
   EF_W((ef_wst(efw, 5u, x353); ef_wblk(efw, efd_146, 0u, efq_146_0); ef_wblk(efw, efd_146, 4u, efq_146_4);), RkAcc x354 = rk_link_k(x352, x353, 34u);)
-  auto x355 = RK_LD4(arg2, 5u, 7u, 8u, 9u);
+  auto x355 = RK_LD4M(arg2, 5u, 7u, 8u, 9u);
   EF_W((efs_146 = rk_link_k(efs_146, x355, 35u); FpExt x356 = ef_wfin(efw, efd_146, 0u, rk_fin(efs_146));), FpExt x356 = rk_fin(rk_link_k(x354, x355, 35u));)
   auto x206 = ::risc0::Fp::fromRaw(efl_arg27_203_0);
   RkW _cx357 = rk_cl0(arg3, x206 * x356, 190u); FpExt x357 = rkw_fin(_cx357);
@@ -11490,7 +11542,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 1u, x416);), RkAcc x417 = rk_link_k(x415, x416, 10u);)
   const uint32_t efl_arg27_57_4 = EF_LDCR(arg27, 57u, 4u);
   const uint32_t efl_arg27_84_0 = EF_LDCR(arg27, 84u, 0u);
-  auto x418 = RK_LD1(arg0, 10u);
+  auto x418 = RK_LD1M(arg0, 10u);
   EF_W((ef_wst(efw, 2u, x418);), RkAcc x419 = rk_link_nf_k(x417, x418, 11u);)
   auto x421 = (::risc0::Fp::fromRaw(efl_arg27_69_0) - ::risc0::Fp::fromRaw(efl_arg27_30_4));
   EF_W((ef_wst(efw, 3u, x421);), RkAcc x422 = rk_link_k(x419, x421, 13u);)
@@ -11523,7 +11575,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_v4i efd_150[4] = {}; const int efq_150_0 = ef_wq4(efw, 27u, 28u, 29u, 31u, 4u); ef_wst(efw, 0u, x442);), RkAcc x443 = rk_link_nf_k(x441, x442, 27u);)
   auto x444 = (::risc0::Fp::fromRaw(efl_arg27_82_0) - Fp(1u));
   EF_W((ef_wst(efw, 1u, x444);), RkAcc x445 = rk_link_k(x443, x444, 28u);)
-  auto x446 = RK_LD1(arg0, 12u);
+  auto x446 = RK_LD1M(arg0, 12u);
   EF_W((ef_wst(efw, 2u, x446);), RkAcc x447 = rk_link_nf_k(x445, x446, 29u);)
   auto x449 = (::risc0::Fp::fromRaw(efl_arg27_78_0) - (::risc0::Fp::fromRaw(efl_arg27_30_4) + Fp(1u)));
   const uint32_t efl_arg27_93_0 = EF_LDCR(arg27, 93u, 0u);
@@ -11531,7 +11583,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 3u, x449);), RkAcc x450 = rk_link_k(x447, x449, 31u);)
   auto x451 = (::risc0::Fp::fromRaw(efl_arg27_142_0) - Fp(1u));
   EF_W((const int efq_150_4 = ef_wq4(efw, 32u, 33u, 36u, 37u, 4u); ef_wst(efw, 4u, x451);), RkAcc x452 = rk_link_nf_k(x450, x451, 32u);)
-  auto x453 = RK_LD1(arg0, 11u);
+  auto x453 = RK_LD1M(arg0, 11u);
   EF_W((ef_wst(efw, 5u, x453);), RkAcc x454 = rk_link_k(x452, x453, 33u);)
   auto x457 = (::risc0::Fp::fromRaw(efl_arg27_164_0) - Fp(1u));
   EF_W((ef_wst(efw, 6u, x457);), RkAcc x458 = rk_link_nf_k(x454, x457, 36u);)
@@ -11558,7 +11610,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg27_102_0 = EF_LDCR(arg27, 102u, 0u);
   auto x472 = (::risc0::Fp::fromRaw(efl_arg27_91_0) - Fp(1u));
   EF_W((ef_wst(efw, 1u, x472);), RkAcc x473 = rk_link_k(x471, x472, 46u);)
-  auto x474 = RK_LD1(arg0, 14u);
+  auto x474 = RK_LD1M(arg0, 14u);
   EF_W((ef_wst(efw, 2u, x474);), RkAcc x475 = rk_link_nf_k(x473, x474, 47u);)
   auto x477 = (::risc0::Fp::fromRaw(efl_arg27_87_0) - (::risc0::Fp::fromRaw(efl_arg27_30_4) + Fp(2u)));
   EF_W((ef_wst(efw, 3u, x477);), RkAcc x478 = rk_link_k(x475, x477, 49u);)
@@ -11566,7 +11618,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((const int efq_151_4 = ef_wq4(efw, 50u, 51u, 54u, 55u, 4u); ef_wst(efw, 4u, x479);), RkAcc x480 = rk_link_nf_k(x478, x479, 50u);)
   const uint32_t efl_arg27_103_0 = EF_LDCR(arg27, 103u, 0u);
   const uint32_t efl_arg27_199_0 = EF_LDCR(arg27, 199u, 0u);
-  auto x481 = RK_LD1(arg0, 13u);
+  auto x481 = RK_LD1M(arg0, 13u);
   EF_W((ef_wst(efw, 5u, x481);), RkAcc x482 = rk_link_k(x480, x481, 51u);)
   auto x485 = (::risc0::Fp::fromRaw(efl_arg27_168_0) - Fp(1u));
   EF_W((ef_wst(efw, 6u, x485);), RkAcc x486 = rk_link_nf_k(x482, x485, 54u);)
@@ -11590,7 +11642,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_v4i efd_152[4] = {}; const int efq_152_0 = ef_wq4(efw, 63u, 64u, 65u, 67u, 4u); ef_wst(efw, 0u, x498);), RkAcc x499 = rk_link_nf_k(x497, x498, 63u);)
   auto x500 = (::risc0::Fp::fromRaw(efl_arg27_100_0) - Fp(1u));
   EF_W((ef_wst(efw, 1u, x500);), RkAcc x501 = rk_link_k(x499, x500, 64u);)
-  auto x502 = RK_LD1(arg0, 16u);
+  auto x502 = RK_LD1M(arg0, 16u);
   const uint32_t efl_arg27_60_4 = EF_LDCR(arg27, 60u, 4u);
   const uint32_t efl_arg27_111_0 = EF_LDCR(arg27, 111u, 0u);
   const uint32_t efl_arg27_112_0 = EF_LDCR(arg27, 112u, 0u);
@@ -11599,7 +11651,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 3u, x505);), RkAcc x506 = rk_link_k(x503, x505, 67u);)
   auto x507 = (::risc0::Fp::fromRaw(efl_arg27_146_0) - Fp(1u));
   EF_W((const int efq_152_4 = ef_wq4(efw, 68u, 69u, 72u, 73u, 4u); ef_wst(efw, 4u, x507);), RkAcc x508 = rk_link_nf_k(x506, x507, 68u);)
-  auto x509 = RK_LD1(arg0, 15u);
+  auto x509 = RK_LD1M(arg0, 15u);
   EF_W((ef_wst(efw, 5u, x509);), RkAcc x510 = rk_link_k(x508, x509, 69u);)
   auto x513 = (::risc0::Fp::fromRaw(efl_arg27_172_0) - Fp(1u));
   const uint32_t efl_arg27_200_0 = EF_LDCR(arg27, 200u, 0u);
@@ -11626,7 +11678,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_v4i efd_153[4] = {}; const int efq_153_0 = ef_wq4(efw, 81u, 82u, 83u, 85u, 4u); ef_wst(efw, 0u, x526);), RkAcc x527 = rk_link_nf_k(x525, x526, 81u);)
   auto x528 = (::risc0::Fp::fromRaw(efl_arg27_109_0) - Fp(1u));
   EF_W((ef_wst(efw, 1u, x528);), RkAcc x529 = rk_link_k(x527, x528, 82u);)
-  auto x530 = RK_LD1(arg0, 18u);
+  auto x530 = RK_LD1M(arg0, 18u);
   EF_W((ef_wst(efw, 2u, x530);), RkAcc x531 = rk_link_nf_k(x529, x530, 83u);)
   auto x533 = (::risc0::Fp::fromRaw(efl_arg27_105_0) - (::risc0::Fp::fromRaw(efl_arg27_30_4) + Fp(4u)));
   EF_W((ef_wst(efw, 3u, x533);), RkAcc x534 = rk_link_k(x531, x533, 85u);)
@@ -11634,7 +11686,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg27_201_0 = EF_LDCR(arg27, 201u, 0u);
   auto x535 = (::risc0::Fp::fromRaw(efl_arg27_148_0) - Fp(1u));
   EF_W((const int efq_153_4 = ef_wq4(efw, 86u, 87u, 90u, 91u, 4u); ef_wst(efw, 4u, x535);), RkAcc x536 = rk_link_nf_k(x534, x535, 86u);)
-  auto x537 = RK_LD1(arg0, 17u);
+  auto x537 = RK_LD1M(arg0, 17u);
   EF_W((ef_wst(efw, 5u, x537);), RkAcc x538 = rk_link_k(x536, x537, 87u);)
   auto x541 = (::risc0::Fp::fromRaw(efl_arg27_176_0) - Fp(1u));
   EF_W((ef_wst(efw, 6u, x541);), RkAcc x542 = rk_link_nf_k(x538, x541, 90u);)
@@ -11659,13 +11711,13 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg27_62_4 = EF_LDCR(arg27, 62u, 4u);
   const uint32_t efl_arg27_129_0 = EF_LDCR(arg27, 129u, 0u);
   EF_W((ef_wst(efw, 1u, x556);), RkAcc x557 = rk_link_k(x555, x556, 100u);)
-  auto x558 = RK_LD1(arg0, 21u);
+  auto x558 = RK_LD1M(arg0, 21u);
   EF_W((ef_wst(efw, 2u, x558);), RkAcc x559 = rk_link_nf_k(x557, x558, 101u);)
-  auto x561 = RK_LD1(arg0, 19u);
+  auto x561 = RK_LD1M(arg0, 19u);
   EF_W((ef_wst(efw, 3u, x561);), RkAcc x562 = rk_link_k(x559, x561, 103u);)
   auto x563 = (::risc0::Fp::fromRaw(efl_arg27_150_0) - Fp(1u));
   EF_W((const int efq_154_4 = ef_wq4(efw, 104u, 105u, 108u, 109u, 4u); ef_wst(efw, 4u, x563);), RkAcc x564 = rk_link_nf_k(x562, x563, 104u);)
-  auto x565 = RK_LD1(arg0, 20u);
+  auto x565 = RK_LD1M(arg0, 20u);
   const uint32_t efl_arg27_130_0 = EF_LDCR(arg27, 130u, 0u);
   const uint32_t efl_arg27_202_0 = EF_LDCR(arg27, 202u, 0u);
   EF_W((ef_wst(efw, 5u, x565);), RkAcc x566 = rk_link_k(x564, x565, 105u);)
@@ -11694,7 +11746,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_v4i efd_155[4] = {}; const int efq_155_0 = ef_wq4(efw, 117u, 118u, 119u, 121u, 4u); ef_wst(efw, 0u, x582);), RkAcc x583 = rk_link_nf_k(x581, x582, 117u);)
   auto x584 = (::risc0::Fp::fromRaw(efl_arg27_127_0) - Fp(1u));
   EF_W((ef_wst(efw, 1u, x584);), RkAcc x585 = rk_link_k(x583, x584, 118u);)
-  auto x586 = RK_LD1(arg0, 22u);
+  auto x586 = RK_LD1M(arg0, 22u);
   EF_W((ef_wst(efw, 2u, x586);), RkAcc x587 = rk_link_nf_k(x585, x586, 119u);)
   const uint32_t efl_arg27_63_4 = EF_LDCR(arg27, 63u, 4u);
   const uint32_t efl_arg27_138_0 = EF_LDCR(arg27, 138u, 0u);
@@ -11731,7 +11783,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg27_31_0 = EF_LDCR(arg27, 31u, 0u);
   auto x612 = (::risc0::Fp::fromRaw(efl_arg27_136_0) - Fp(1u));
   EF_W((ef_wst(efw, 1u, x612);), RkAcc x613 = rk_link_k(x611, x612, 136u);)
-  auto x614 = RK_LD1(arg0, 29u);
+  auto x614 = RK_LD1M(arg0, 29u);
   EF_W((ef_wst(efw, 2u, x614);), RkAcc x615 = rk_link_nf_k(x613, x614, 137u);)
   auto x617 = (::risc0::Fp::fromRaw(efl_arg27_132_0) - (::risc0::Fp::fromRaw(efl_arg27_30_4) + Fp(7u)));
   EF_W((ef_wst(efw, 3u, x617);), RkAcc x618 = rk_link_k(x615, x617, 139u);)
@@ -11744,7 +11796,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg27_34_4 = EF_LDCR(arg27, 34u, 4u);
   const uint32_t efl_arg27_34_0 = EF_LDCR(arg27, 34u, 0u);
   const uint32_t efl_arg27_35_0 = EF_LDCR(arg27, 35u, 0u);
-  auto x621 = RK_LD1(arg0, 23u);
+  auto x621 = RK_LD1M(arg0, 23u);
   EF_W((ef_wst(efw, 5u, x621);), RkAcc x622 = rk_link_k(x620, x621, 141u);)
   auto x625 = (::risc0::Fp::fromRaw(efl_arg27_29_4) - ::risc0::Fp::fromRaw(efl_arg27_29_0));
   EF_W((ef_wst(efw, 6u, x625);), RkAcc x626 = rk_link_nf_k(x622, x625, 144u);)
@@ -11885,7 +11937,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* ar
   auto x291 = ::risc0::Fp::fromRaw(efl_arg27_69_0);
   auto x704 = x291 - x703;
   RkAcc x705 = rk_link_nf_k(arg23, x704, 0u);
-  auto x706 = RK_LD1(arg0, 26u);
+  auto x706 = RK_LD1M(arg0, 26u);
   RkAcc x707 = rk_link_k(x705, x706, 1u);
   FpExt x708 = rk_fin(rk_link_k(x707, x702, 2u));
   constexpr Fp x201(3);
@@ -11945,10 +11997,10 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* ar
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002018 = rkw1_ff0(x2002013, x3000009, false); rkw1_ff(_wx2002018, x293, x198, false); rkw1_ff(_wx2002018, x744, x202, false); auto x2002018 = rkw1_fin(_wx2002018);
-  RK_ST1(arg0, 5u, x2002018);
+  RK_ST1M(arg0, 5u, x2002018);
   auto x753 = x292 + x199;
   auto x754 = x744 * x753;
-  RK_ST1(arg0, 7u, x754);
+  RK_ST1M(arg0, 7u, x754);
   auto x296 = ::risc0::Fp::fromRaw(efl_arg27_126_0);
   auto x755 = ef_lsub(x199, x296);
   auto x756 = x296 * x755;
@@ -12831,11 +12883,11 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((const int efq_158_68 = ef_wq4(efw, 68u, 68u, 68u, 68u, 1u); ef_wst(efw, 20u, x1367); ef_wblk(efw, efd_158, 16u, efq_158_64); ef_wblk(efw, efd_158, 20u, efq_158_68); FpExt x1368 = ef_wfin(efw, efd_158, 0u, efb_158);), FpExt x1368 = rk_fin(rk_link_k(x1363, x1367, 68u));)
   auto x1369 = ef_lmul(x342, x342);
   auto x1370 = x1369 * x1364;
-  RK_ST1(arg0, 8u, x1370);
+  RK_ST1M(arg0, 8u, x1370);
   auto x1371 = rv32im_v2_9(cycle, steps, arg0, x1368.elems[0], x1368.elems[1], x1368.elems[2], x1368.elems[3], x708.elems[0], x708.elems[1], x708.elems[2], x708.elems[3], arg23.elems[0], arg23.elems[1], arg23.elems[2], arg23.elems[3], arg24.elems[0], arg24.elems[1], arg24.elems[2], arg24.elems[3], x699.elems[0], x699.elems[1], x699.elems[2], x699.elems[3], arg25.elems[0], arg25.elems[1], arg25.elems[2], arg25.elems[3], arg26.elems[0], arg26.elems[1], arg26.elems[2], arg26.elems[3]);
   return x1371;
 }
-__device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3, Fp arg7_e0, Fp arg7_e1, Fp arg7_e2, Fp arg7_e3, Fp arg8_e0, Fp arg8_e1, Fp arg8_e2, Fp arg8_e3) {
+__device__ EF_CHAIN FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3, Fp arg7_e0, Fp arg7_e1, Fp arg7_e2, Fp arg7_e3, Fp arg8_e0, Fp arg8_e1, Fp arg8_e2, Fp arg8_e3) {
   FpExt* arg9 = reinterpret_cast<FpExt*>(arg0);
   Fp* arg10 = EF_GPTR(0);
   Fp* arg11 = EF_GPTR(1);
@@ -12848,7 +12900,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   FpExt arg6(arg6_e0, arg6_e1, arg6_e2, arg6_e3);
   FpExt arg7(arg7_e0, arg7_e1, arg7_e2, arg7_e3);
   FpExt arg8(arg8_e0, arg8_e1, arg8_e2, arg8_e3);
-  size_t mask = steps - 1; const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = (uint32_t)cycle;
+  size_t mask = steps - 1; uint32_t rk_c_o = (uint32_t)cycle; EF_OPQ(rk_c_o, 11); const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = rk_c_o;
   const uint32_t efl_arg10_60_4 = EF_LDCR(arg10, 60u, 4u);
   const uint32_t efl_arg10_39_4 = EF_LDCR(arg10, 39u, 4u);
   const uint32_t efl_arg10_48_4 = EF_LDCR(arg10, 48u, 4u);
@@ -12859,9 +12911,9 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   auto x238 = (::risc0::Fp::fromRaw(efl_arg10_60_4) * Fp(2u));
   auto x239 = ((::risc0::Fp::fromRaw(efl_arg10_39_4) + ::risc0::Fp::fromRaw(efl_arg10_48_4)) - ((::risc0::Fp::fromRaw(efl_arg10_39_4) * Fp(2u)) * ::risc0::Fp::fromRaw(efl_arg10_48_4)));
   auto x240 = x238 * x239;
-  auto x241 = RK_LD1(arg0, 46u);
+  auto x241 = RK_LD1M(arg0, 46u);
   auto x242 = x241 - x240;
-  RK_ST1(arg0, 46u, x242);
+  RK_ST1M(arg0, 46u, x242);
   auto x243 = ((::risc0::Fp::fromRaw(efl_arg10_40_4) + ::risc0::Fp::fromRaw(efl_arg10_49_4)) - ((::risc0::Fp::fromRaw(efl_arg10_40_4) * Fp(2u)) * ::risc0::Fp::fromRaw(efl_arg10_49_4)));
   auto x16 = ::risc0::Fp::fromRaw(efl_arg10_61_4);
   const uint32_t efl_arg10_42_4 = EF_LDCR(arg10, 42u, 4u);
@@ -12871,15 +12923,15 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   auto x245 = (::risc0::Fp::fromRaw(efl_arg10_61_4) * Fp(2u));
   auto x246 = x245 * x243;
   auto x247 = x244 - x246;
-  RK_ST1(arg0, 47u, x247);
-  auto x248 = RK_LD1(arg0, 20u);
+  RK_ST1M(arg0, 47u, x247);
+  auto x248 = RK_LD1M(arg0, 20u);
   auto x17 = ::risc0::Fp::fromRaw(efl_arg10_62_4);
   auto x249 = x17 + x248;
   const uint32_t efl_arg10_64_4 = EF_LDCR(arg10, 64u, 4u);
   auto x250 = (::risc0::Fp::fromRaw(efl_arg10_62_4) * Fp(2u));
   auto x251 = x250 * x248;
   auto x252 = x249 - x251;
-  RK_ST1(arg0, 20u, x252);
+  RK_ST1M(arg0, 20u, x252);
   auto x253 = ((::risc0::Fp::fromRaw(efl_arg10_42_4) + ::risc0::Fp::fromRaw(efl_arg10_51_4)) - ((::risc0::Fp::fromRaw(efl_arg10_42_4) * Fp(2u)) * ::risc0::Fp::fromRaw(efl_arg10_51_4)));
   auto x18 = ::risc0::Fp::fromRaw(efl_arg10_63_4);
   auto x254 = x18 + x253;
@@ -12889,15 +12941,15 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   const uint32_t efl_arg10_65_4 = EF_LDCR(arg10, 65u, 4u);
   auto x256 = x255 * x253;
   auto x257 = x254 - x256;
-  RK_ST1(arg0, 48u, x257);
-  auto x258 = RK_LD1(arg0, 21u);
+  RK_ST1M(arg0, 48u, x257);
+  auto x258 = RK_LD1M(arg0, 21u);
   auto x19 = ::risc0::Fp::fromRaw(efl_arg10_64_4);
   auto x259 = x19 + x258;
   auto x260 = (::risc0::Fp::fromRaw(efl_arg10_64_4) * Fp(2u));
   auto x261 = x260 * x258;
   const uint32_t efl_arg10_66_4 = EF_LDCR(arg10, 66u, 4u);
   auto x262 = x259 - x261;
-  RK_ST1(arg0, 21u, x262);
+  RK_ST1M(arg0, 21u, x262);
   auto x263 = ((::risc0::Fp::fromRaw(efl_arg10_44_4) + ::risc0::Fp::fromRaw(efl_arg10_53_4)) - ((::risc0::Fp::fromRaw(efl_arg10_44_4) * Fp(2u)) * ::risc0::Fp::fromRaw(efl_arg10_53_4)));
   auto x20 = ::risc0::Fp::fromRaw(efl_arg10_65_4);
   auto x264 = x20 + x263;
@@ -12907,14 +12959,14 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   const uint32_t efl_arg10_46_4 = EF_LDCR(arg10, 46u, 4u);
   const uint32_t efl_arg10_55_4 = EF_LDCR(arg10, 55u, 4u);
   const uint32_t efl_arg10_67_4 = EF_LDCR(arg10, 67u, 4u);
-  RK_ST1(arg0, 49u, x267);
-  auto x268 = RK_LD1(arg0, 22u);
+  RK_ST1M(arg0, 49u, x267);
+  auto x268 = RK_LD1M(arg0, 22u);
   auto x21 = ::risc0::Fp::fromRaw(efl_arg10_66_4);
   auto x269 = x21 + x268;
   auto x270 = (::risc0::Fp::fromRaw(efl_arg10_66_4) * Fp(2u));
   auto x271 = x270 * x268;
   auto x272 = x269 - x271;
-  RK_ST1(arg0, 22u, x272);
+  RK_ST1M(arg0, 22u, x272);
   const uint32_t efl_arg10_36_4 = EF_LDCR(arg10, 36u, 4u);
   const uint32_t efl_arg10_57_4 = EF_LDCR(arg10, 57u, 4u);
   const uint32_t efl_arg10_37_4 = EF_LDCR(arg10, 37u, 4u);
@@ -12924,8 +12976,8 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   auto x275 = (::risc0::Fp::fromRaw(efl_arg10_67_4) * Fp(2u));
   auto x276 = x275 * x273;
   auto x277 = x274 - x276;
-  RK_ST1(arg0, 50u, x277);
-  auto x278 = RK_LD1(arg0, 23u);
+  RK_ST1M(arg0, 50u, x277);
+  auto x278 = RK_LD1M(arg0, 23u);
   const uint32_t efl_arg10_79_4 = EF_LDCR(arg10, 79u, 4u);
   const uint32_t efl_arg10_93_4 = EF_LDCR(arg10, 93u, 4u);
   auto x23 = ::risc0::Fp::fromRaw(efl_arg10_36_4);
@@ -12933,7 +12985,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   auto x280 = (::risc0::Fp::fromRaw(efl_arg10_36_4) * Fp(2u));
   auto x281 = x280 * x278;
   auto x282 = x279 - x281;
-  RK_ST1(arg0, 23u, x282);
+  RK_ST1M(arg0, 23u, x282);
   auto x283 = ((::risc0::Fp::fromRaw(efl_arg10_48_4) + ::risc0::Fp::fromRaw(efl_arg10_57_4)) - ((::risc0::Fp::fromRaw(efl_arg10_48_4) * Fp(2u)) * ::risc0::Fp::fromRaw(efl_arg10_57_4)));
   auto x24 = ::risc0::Fp::fromRaw(efl_arg10_37_4);
   const uint32_t efl_arg10_80_4 = EF_LDCR(arg10, 80u, 4u);
@@ -12942,7 +12994,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   auto x285 = (::risc0::Fp::fromRaw(efl_arg10_37_4) * Fp(2u));
   auto x286 = x285 * x283;
   auto x287 = x284 - x286;
-  RK_ST1(arg0, 51u, x287);
+  RK_ST1M(arg0, 51u, x287);
   auto x25 = ::risc0::Fp::fromRaw(efl_arg10_79_4);
   auto x26 = ::risc0::Fp::fromRaw(efl_arg10_93_4);
   auto x288 = x25 + x26;
@@ -13261,7 +13313,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   const uint32_t efl_arg10_130_0 = EF_LDCR(arg10, 130u, 0u);
   auto x64 = ::risc0::Fp::fromRaw(efl_arg10_115_0);
   // lincombF: fused into a lazy Fp linear combination
-  auto x520 = RK_LD1(arg0, 18u);
+  auto x520 = RK_LD1M(arg0, 18u);
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
@@ -13270,7 +13322,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx528 = rkw1_ff0(x57, x14, false); rkw1_v(_wx528, x520, false); rkw1_ff(_wx528, x58, x13, false); rkw1_ff(_wx528, x59, x12, false); rkw1_ff(_wx528, x60, x11, false); rkw1_ff(_wx528, x61, x10, false); rkw1_ff(_wx528, x62, x9, false); rkw1_ff(_wx528, x63, x8, false); rkw1_ff(_wx528, x64, x7, false); auto x528 = rkw1_fin(_wx528);
-  RK_ST1(arg0, 18u, x528);
+  RK_ST1M(arg0, 18u, x528);
   auto x65 = ::risc0::Fp::fromRaw(efl_arg10_124_0);
   auto x529 = x65 * x14;
   const uint32_t efl_arg10_131_0 = EF_LDCR(arg10, 131u, 0u);
@@ -13292,7 +13344,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   auto x72 = ::risc0::Fp::fromRaw(efl_arg10_131_0);
   // lincombF: fused into a lazy Fp linear combination
-  auto x537 = RK_LD1(arg0, 19u);
+  auto x537 = RK_LD1M(arg0, 19u);
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
@@ -13301,7 +13353,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx545 = rkw1_ff0(x66, x13, false); rkw1_v(_wx545, x537, false); rkw1_v(_wx545, x529, false); rkw1_ff(_wx545, x67, x12, false); rkw1_ff(_wx545, x68, x11, false); rkw1_ff(_wx545, x69, x10, false); rkw1_ff(_wx545, x70, x9, false); rkw1_ff(_wx545, x71, x8, false); rkw1_ff(_wx545, x72, x7, false); auto x545 = rkw1_fin(_wx545);
-  RK_ST1(arg0, 19u, x545);
+  RK_ST1M(arg0, 19u, x545);
   auto x73 = ::risc0::Fp::fromRaw(efl_arg10_69_16);
   // lincombF: fused into a lazy Fp linear combination
   constexpr Fp x6(4);
@@ -13374,7 +13426,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   const uint32_t efl_arg10_90_16 = EF_LDCR(arg10, 90u, 16u);
   const uint32_t efl_arg10_91_16 = EF_LDCR(arg10, 91u, 16u);
   const uint32_t efl_arg10_92_16 = EF_LDCR(arg10, 92u, 16u);
-  RK_ST1(arg0, 52u, x575);
+  RK_ST1M(arg0, 52u, x575);
   const uint32_t efl_arg10_93_16 = EF_LDCR(arg10, 93u, 16u);
   const uint32_t efl_arg10_94_16 = EF_LDCR(arg10, 94u, 16u);
   const uint32_t efl_arg10_95_16 = EF_LDCR(arg10, 95u, 16u);
@@ -13431,7 +13483,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx605 = rkw1_ff0(x89, x15, false); rkw1_v(_wx605, x104, false); rkw1_ff(_wx605, x90, x6, false); rkw1_ff(_wx605, x91, x5, false); rkw1_ff(_wx605, x92, x4, false); rkw1_ff(_wx605, x93, x3, false); rkw1_ff(_wx605, x94, x2, false); rkw1_ff(_wx605, x95, x1, false); rkw1_ff(_wx605, x96, x14, false); rkw1_ff(_wx605, x97, x13, false); rkw1_ff(_wx605, x98, x12, false); rkw1_ff(_wx605, x99, x11, false); rkw1_ff(_wx605, x100, x10, false); rkw1_ff(_wx605, x101, x9, false); rkw1_ff(_wx605, x102, x8, false); rkw1_ff(_wx605, x103, x7, false); auto x605 = rkw1_fin(_wx605);
-  RK_ST1(arg0, 53u, x605);
+  RK_ST1M(arg0, 53u, x605);
   const uint32_t efl_arg10_70_8 = EF_LDCR(arg10, 70u, 8u);
   const uint32_t efl_arg10_70_12 = EF_LDCR(arg10, 70u, 12u);
   const uint32_t efl_arg10_71_8 = EF_LDCR(arg10, 71u, 8u);
@@ -13734,7 +13786,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002073 = rkw1_ff0(x2002019, x1, false); rkw1_ff(_wx2002073, x2002021, x2, false); rkw1_ff(_wx2002073, x2002023, x3, false); rkw1_ff(_wx2002073, x2002025, x4, false); rkw1_ff(_wx2002073, x2002027, x5, false); rkw1_ff(_wx2002073, x2002029, x6, false); rkw1_ff(_wx2002073, x2002031, x7, false); rkw1_ff(_wx2002073, x2002033, x8, false); rkw1_ff(_wx2002073, x2002035, x9, false); rkw1_ff(_wx2002073, x2002037, x10, false); rkw1_ff(_wx2002073, x2002039, x11, false); rkw1_ff(_wx2002073, x2002041, x12, false); rkw1_ff(_wx2002073, x2002043, x13, false); rkw1_ff(_wx2002073, x2002045, x14, false); rkw1_ff(_wx2002073, x2002047, x15, false); rkw1_v(_wx2002073, x528, false); rkw1_v(_wx2002073, x169, false); rkw1_v(_wx2002073, x575, false); rkw1_ff(_wx2002073, x40, x105, false); rkw1_ff(_wx2002073, x607, x106, false); rkw1_v(_wx2002073, x52, false); rkw1_v(_wx2002073, x291, false); rkw1_ff(_wx2002073, x397, x291, true); auto x2002073 = rkw1_fin(_wx2002073);
-  RK_ST1(arg0, 54u, x2002073);
+  RK_ST1M(arg0, 54u, x2002073);
   const uint32_t efl_arg10_84_8 = EF_LDCR(arg10, 84u, 8u);
   const uint32_t efl_arg10_84_12 = EF_LDCR(arg10, 84u, 12u);
   const uint32_t efl_arg10_140_0 = EF_LDCR(arg10, 140u, 0u);
@@ -13798,7 +13850,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002128 = rkw1_ff0(x2002074, x1, false); rkw1_ff(_wx2002128, x2002076, x2, false); rkw1_ff(_wx2002128, x2002078, x3, false); rkw1_ff(_wx2002128, x2002080, x4, false); rkw1_ff(_wx2002128, x2002082, x5, false); rkw1_ff(_wx2002128, x2002084, x6, false); rkw1_ff(_wx2002128, x2002086, x7, false); rkw1_ff(_wx2002128, x2002088, x8, false); rkw1_ff(_wx2002128, x2002090, x9, false); rkw1_ff(_wx2002128, x2002092, x10, false); rkw1_ff(_wx2002128, x2002094, x11, false); rkw1_ff(_wx2002128, x2002096, x12, false); rkw1_ff(_wx2002128, x2002098, x13, false); rkw1_ff(_wx2002128, x2002100, x14, false); rkw1_ff(_wx2002128, x2002102, x15, false); rkw1_v(_wx2002128, x545, false); rkw1_v(_wx2002128, x170, false); rkw1_v(_wx2002128, x605, false); rkw1_ff(_wx2002128, x35, x137, false); rkw1_ff(_wx2002128, x671, x138, false); rkw1_v(_wx2002128, x47, false); rkw1_v(_wx2002128, x355, false); rkw1_ff(_wx2002128, x333, x355, true); auto x2002128 = rkw1_fin(_wx2002128);
-  RK_ST1(arg0, 55u, x2002128);
+  RK_ST1M(arg0, 55u, x2002128);
   auto x171 = ::risc0::Fp::fromRaw(efl_arg10_36_8);
   auto x862 = x23 * x171;
   auto x172 = ::risc0::Fp::fromRaw(efl_arg10_36_12);
@@ -13814,7 +13866,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002135 = rkw1_ff0(x2002132, x172, false); rkw1_ff(_wx2002135, x862, x863, false); auto x2002135 = rkw1_fin(_wx2002135);
-  RK_ST1(arg0, 56u, x2002135);
+  RK_ST1M(arg0, 56u, x2002135);
   auto x173 = ::risc0::Fp::fromRaw(efl_arg10_37_8);
   auto x875 = x24 * x173;
   auto x174 = ::risc0::Fp::fromRaw(efl_arg10_37_12);
@@ -13831,7 +13883,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002142 = rkw1_ff0(x2002139, x174, false); rkw1_ff(_wx2002142, x875, x876, false); auto x2002142 = rkw1_fin(_wx2002142);
-  RK_ST1(arg0, 57u, x2002142);
+  RK_ST1M(arg0, 57u, x2002142);
   auto x175 = ::risc0::Fp::fromRaw(efl_arg10_38_4);
   auto x176 = ::risc0::Fp::fromRaw(efl_arg10_38_8);
   auto x888 = x175 * x176;
@@ -13848,7 +13900,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002149 = rkw1_ff0(x2002146, x177, false); rkw1_ff(_wx2002149, x888, x889, false); auto x2002149 = rkw1_fin(_wx2002149);
-  RK_ST1(arg0, 58u, x2002149);
+  RK_ST1M(arg0, 58u, x2002149);
   auto x178 = ::risc0::Fp::fromRaw(efl_arg10_39_4);
   auto x179 = ::risc0::Fp::fromRaw(efl_arg10_39_8);
   auto x901 = x178 * x179;
@@ -13865,7 +13917,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002156 = rkw1_ff0(x2002153, x180, false); rkw1_ff(_wx2002156, x901, x902, false); auto x2002156 = rkw1_fin(_wx2002156);
-  RK_ST1(arg0, 59u, x2002156);
+  RK_ST1M(arg0, 59u, x2002156);
   auto x181 = ::risc0::Fp::fromRaw(efl_arg10_40_4);
   const uint32_t efl_arg10_41_4 = EF_LDCR(arg10, 41u, 4u);
   const uint32_t efl_arg10_41_8 = EF_LDCR(arg10, 41u, 8u);
@@ -13883,7 +13935,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002163 = rkw1_ff0(x2002160, x183, false); rkw1_ff(_wx2002163, x914, x915, false); auto x2002163 = rkw1_fin(_wx2002163);
-  RK_ST1(arg0, 60u, x2002163);
+  RK_ST1M(arg0, 60u, x2002163);
   auto x184 = ::risc0::Fp::fromRaw(efl_arg10_41_4);
   auto x185 = ::risc0::Fp::fromRaw(efl_arg10_41_8);
   const uint32_t efl_arg10_42_8 = EF_LDCR(arg10, 42u, 8u);
@@ -13900,7 +13952,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002170 = rkw1_ff0(x2002167, x186, false); rkw1_ff(_wx2002170, x927, x928, false); auto x2002170 = rkw1_fin(_wx2002170);
-  RK_ST1(arg0, 61u, x2002170);
+  RK_ST1M(arg0, 61u, x2002170);
   auto x187 = ::risc0::Fp::fromRaw(efl_arg10_42_4);
   auto x188 = ::risc0::Fp::fromRaw(efl_arg10_42_8);
   auto x940 = x187 * x188;
@@ -13918,7 +13970,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002177 = rkw1_ff0(x2002174, x189, false); rkw1_ff(_wx2002177, x940, x941, false); auto x2002177 = rkw1_fin(_wx2002177);
-  RK_ST1(arg0, 62u, x2002177);
+  RK_ST1M(arg0, 62u, x2002177);
   auto x190 = ::risc0::Fp::fromRaw(efl_arg10_43_4);
   auto x191 = ::risc0::Fp::fromRaw(efl_arg10_43_8);
   auto x953 = x190 * x191;
@@ -13935,7 +13987,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002184 = rkw1_ff0(x2002181, x192, false); rkw1_ff(_wx2002184, x953, x954, false); auto x2002184 = rkw1_fin(_wx2002184);
-  RK_ST1(arg0, 63u, x2002184);
+  RK_ST1M(arg0, 63u, x2002184);
   auto x193 = ::risc0::Fp::fromRaw(efl_arg10_44_4);
   auto x194 = ::risc0::Fp::fromRaw(efl_arg10_44_8);
   auto x966 = x193 * x194;
@@ -13953,7 +14005,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002191 = rkw1_ff0(x2002188, x195, false); rkw1_ff(_wx2002191, x966, x967, false); auto x2002191 = rkw1_fin(_wx2002191);
-  RK_ST1(arg0, 64u, x2002191);
+  RK_ST1M(arg0, 64u, x2002191);
   auto x196 = ::risc0::Fp::fromRaw(efl_arg10_45_4);
   auto x197 = ::risc0::Fp::fromRaw(efl_arg10_45_8);
   auto x979 = x196 * x197;
@@ -13970,7 +14022,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002198 = rkw1_ff0(x2002195, x198, false); rkw1_ff(_wx2002198, x979, x980, false); auto x2002198 = rkw1_fin(_wx2002198);
-  RK_ST1(arg0, 65u, x2002198);
+  RK_ST1M(arg0, 65u, x2002198);
   auto x199 = ::risc0::Fp::fromRaw(efl_arg10_46_4);
   auto x200 = ::risc0::Fp::fromRaw(efl_arg10_46_8);
   auto x992 = x199 * x200;
@@ -13988,7 +14040,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002205 = rkw1_ff0(x2002202, x201, false); rkw1_ff(_wx2002205, x992, x993, false); auto x2002205 = rkw1_fin(_wx2002205);
-  RK_ST1(arg0, 66u, x2002205);
+  RK_ST1M(arg0, 66u, x2002205);
   auto x202 = ::risc0::Fp::fromRaw(efl_arg10_47_4);
   auto x203 = ::risc0::Fp::fromRaw(efl_arg10_47_8);
   auto x1005 = x202 * x203;
@@ -14005,7 +14057,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002212 = rkw1_ff0(x2002209, x204, false); rkw1_ff(_wx2002212, x1005, x1006, false); auto x2002212 = rkw1_fin(_wx2002212);
-  RK_ST1(arg0, 67u, x2002212);
+  RK_ST1M(arg0, 67u, x2002212);
   auto x205 = ::risc0::Fp::fromRaw(efl_arg10_48_4);
   const uint32_t efl_arg10_49_8 = EF_LDCR(arg10, 49u, 8u);
   auto x206 = ::risc0::Fp::fromRaw(efl_arg10_48_8);
@@ -14022,7 +14074,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002219 = rkw1_ff0(x2002216, x207, false); rkw1_ff(_wx2002219, x1018, x1019, false); auto x2002219 = rkw1_fin(_wx2002219);
-  RK_ST1(arg0, 68u, x2002219);
+  RK_ST1M(arg0, 68u, x2002219);
   auto x208 = ::risc0::Fp::fromRaw(efl_arg10_49_4);
   auto x209 = ::risc0::Fp::fromRaw(efl_arg10_49_8);
   const uint32_t efl_arg10_50_4 = EF_LDCR(arg10, 50u, 4u);
@@ -14040,7 +14092,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002226 = rkw1_ff0(x2002223, x210, false); rkw1_ff(_wx2002226, x1031, x1032, false); auto x2002226 = rkw1_fin(_wx2002226);
-  RK_ST1(arg0, 69u, x2002226);
+  RK_ST1M(arg0, 69u, x2002226);
   auto x211 = ::risc0::Fp::fromRaw(efl_arg10_50_4);
   auto x212 = ::risc0::Fp::fromRaw(efl_arg10_50_8);
   auto x1044 = x211 * x212;
@@ -14057,7 +14109,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002233 = rkw1_ff0(x2002230, x213, false); rkw1_ff(_wx2002233, x1044, x1045, false); auto x2002233 = rkw1_fin(_wx2002233);
-  RK_ST1(arg0, 70u, x2002233);
+  RK_ST1M(arg0, 70u, x2002233);
   auto x214 = ::risc0::Fp::fromRaw(efl_arg10_51_4);
   auto x215 = ::risc0::Fp::fromRaw(efl_arg10_51_8);
   auto x1057 = x214 * x215;
@@ -14075,7 +14127,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002240 = rkw1_ff0(x2002237, x216, false); rkw1_ff(_wx2002240, x1057, x1058, false); auto x2002240 = rkw1_fin(_wx2002240);
-  RK_ST1(arg0, 71u, x2002240);
+  RK_ST1M(arg0, 71u, x2002240);
   auto x217 = ::risc0::Fp::fromRaw(efl_arg10_52_4);
   auto x218 = ::risc0::Fp::fromRaw(efl_arg10_52_8);
   auto x1070 = x217 * x218;
@@ -14092,7 +14144,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002247 = rkw1_ff0(x2002244, x219, false); rkw1_ff(_wx2002247, x1070, x1071, false); auto x2002247 = rkw1_fin(_wx2002247);
-  RK_ST1(arg0, 72u, x2002247);
+  RK_ST1M(arg0, 72u, x2002247);
   auto x220 = ::risc0::Fp::fromRaw(efl_arg10_53_4);
   auto x221 = ::risc0::Fp::fromRaw(efl_arg10_53_8);
   auto x1083 = x220 * x221;
@@ -14110,7 +14162,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002254 = rkw1_ff0(x2002251, x222, false); rkw1_ff(_wx2002254, x1083, x1084, false); auto x2002254 = rkw1_fin(_wx2002254);
-  RK_ST1(arg0, 73u, x2002254);
+  RK_ST1M(arg0, 73u, x2002254);
   auto x223 = ::risc0::Fp::fromRaw(efl_arg10_54_4);
   auto x224 = ::risc0::Fp::fromRaw(efl_arg10_54_8);
   auto x1096 = x223 * x224;
@@ -14127,7 +14179,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002261 = rkw1_ff0(x2002258, x225, false); rkw1_ff(_wx2002261, x1096, x1097, false); auto x2002261 = rkw1_fin(_wx2002261);
-  RK_ST1(arg0, 74u, x2002261);
+  RK_ST1M(arg0, 74u, x2002261);
   const uint32_t efl_arg10_56_4 = EF_LDCR(arg10, 56u, 4u);
   auto x226 = ::risc0::Fp::fromRaw(efl_arg10_55_4);
   auto x227 = ::risc0::Fp::fromRaw(efl_arg10_55_8);
@@ -14145,7 +14197,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002268 = rkw1_ff0(x2002265, x228, false); rkw1_ff(_wx2002268, x1109, x1110, false); auto x2002268 = rkw1_fin(_wx2002268);
-  RK_ST1(arg0, 75u, x2002268);
+  RK_ST1M(arg0, 75u, x2002268);
   auto x229 = ::risc0::Fp::fromRaw(efl_arg10_56_4);
   const uint32_t efl_arg10_57_8 = EF_LDCR(arg10, 57u, 8u);
   auto x230 = ::risc0::Fp::fromRaw(efl_arg10_56_8);
@@ -14162,7 +14214,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002275 = rkw1_ff0(x2002272, x231, false); rkw1_ff(_wx2002275, x1122, x1123, false); auto x2002275 = rkw1_fin(_wx2002275);
-  RK_ST1(arg0, 76u, x2002275);
+  RK_ST1M(arg0, 76u, x2002275);
   auto x232 = ::risc0::Fp::fromRaw(efl_arg10_57_4);
   auto x233 = ::risc0::Fp::fromRaw(efl_arg10_57_8);
   const uint32_t efl_arg10_58_4 = EF_LDCR(arg10, 58u, 4u);
@@ -14180,7 +14232,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002282 = rkw1_ff0(x2002279, x234, false); rkw1_ff(_wx2002282, x1135, x1136, false); auto x2002282 = rkw1_fin(_wx2002282);
-  RK_ST1(arg0, 77u, x2002282);
+  RK_ST1M(arg0, 77u, x2002282);
   auto x235 = ::risc0::Fp::fromRaw(efl_arg10_58_4);
   auto x236 = ::risc0::Fp::fromRaw(efl_arg10_58_8);
   auto x1148 = ef_lmul(x235, x236);
@@ -14191,12 +14243,12 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(uint32_t cycle, uint32_t steps, Fp* arg
   auto x1152 = ef_lmul(x235, x1151);
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx1154 = rkw1_ff0(x1148, x1149, false); rkw1_ff(_wx1154, x1152, x237, false); auto x1154 = rkw1_fin(_wx1154);
-  RK_ST1(arg0, 78u, x1154);
+  RK_ST1M(arg0, 78u, x1154);
   auto x1155 = x0 - x235;
   auto x1156 = rv32im_v2_5(cycle, steps, arg0, arg1.elems[0], arg1.elems[1], arg1.elems[2], arg1.elems[3], arg2.elems[0], arg2.elems[1], arg2.elems[2], arg2.elems[3], arg3.elems[0], arg3.elems[1], arg3.elems[2], arg3.elems[3], arg4.elems[0], arg4.elems[1], arg4.elems[2], arg4.elems[3], arg5.elems[0], arg5.elems[1], arg5.elems[2], arg5.elems[3], arg6.elems[0], arg6.elems[1], arg6.elems[2], arg6.elems[3], arg7.elems[0], arg7.elems[1], arg7.elems[2], arg7.elems[3], arg8.elems[0], arg8.elems[1], arg8.elems[2], arg8.elems[3]);
   return x1156;
 }
-__device__ EF_NOINLINE FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3) {
+__device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3) {
   Fp* arg3 = EF_GPTR(0);
   Fp* arg4 = EF_GPTR(1);
   Fp* arg5 = EF_GPTR(2);
@@ -14206,13 +14258,13 @@ __device__ EF_NOINLINE FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* 
   FpExt arg1(arg1_e0, arg1_e1, arg1_e2, arg1_e3);
   FpExt arg2(arg2_e0, arg2_e1, arg2_e2, arg2_e3);
   size_t mask = steps - 1;
-  const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = (uint32_t)cycle;
+  uint32_t rk_c_o = (uint32_t)cycle; EF_OPQ(rk_c_o, 12); const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = rk_c_o;
   const uint32_t efl_rkBA_3_4 = EF_LDCR(rkBA, 3u, 4u);
   const uint32_t efl_rkBA_2_4 = EF_LDCR(rkBA, 2u, 4u);
   const uint32_t efl_rkBA_1_4 = EF_LDCR(rkBA, 1u, 4u);
   const uint32_t efl_rkBA_0_4 = EF_LDCR(rkBA, 0u, 4u);
   FpExt x273 = EF_PM(601);
-  auto x274 = RK_LD4(arg0, 16u, 17u, 18u, 19u);
+  auto x274 = RK_LD4L(arg0, 16u, 17u, 18u, 19u);
   auto x275 = x274 - x273;
   auto x276 = x275 * Fp(16384u);
   constexpr FpExt r1_x4(0,1,0,0);
@@ -14247,10 +14299,10 @@ __device__ EF_NOINLINE FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* 
   auto x279 = static_cast<const ::risc0::FpExt>(::risc0::FpExt(r2_x1108));
   auto x280 = x279 - x278;
   RkAcc x281 = rk_link_nf_k(arg1, x280, 0u);
-  auto x282 = RK_LD4(arg0, 32u, 33u, 34u, 35u);
+  auto x282 = RK_LD4L(arg0, 32u, 33u, 34u, 35u);
   const uint32_t efl_arg4_17_0 = EF_LDCR(arg4, 17u, 0u);
   RkAcc x283 = rk_link_k(x281, x282, 1u);
-  auto x284 = RK_LD4(arg0, 36u, 37u, 38u, 39u);
+  auto x284 = RK_LD4L(arg0, 36u, 37u, 38u, 39u);
   FpExt x285 = rk_fin(rk_link_k(x283, x284, 2u));
   auto x4 = ::risc0::Fp::fromRaw(efl_arg4_16_0);
   RkW _cx286 = rk_cl0(arg2, x4 * x285, 442u);
@@ -14270,7 +14322,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* 
   const uint32_t efl_rkBA_9_4 = EF_LDCR(rkBA, 9u, 4u);
   const uint32_t efl_rkBA_8_4 = EF_LDCR(rkBA, 8u, 4u);
   FpExt x295 = EF_PM(602);
-  auto x296 = RK_LD4(arg0, 28u, 29u, 30u, 31u);
+  auto x296 = RK_LD4L(arg0, 28u, 29u, 30u, 31u);
   constexpr FpExt r6_x4(0,1,0,0);
   auto r6_x251 = ::risc0::Fp::fromRaw(efl_rkBA_11_4);
   auto r6_x1204 = r6_x251 * r6_x4;
@@ -14399,7 +14451,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* 
   auto x374 = x48 + x373;
   // remat_lu: store dropped
   auto x375 = x374 - x355;
-  RK_ST4(arg0, 4u, 5u, 6u, 7u, x375);
+  RK_ST4L(arg0, 4u, 5u, 6u, 7u, x375);
   auto x2000883 = x375 * x360;
   auto x42 = ::risc0::Fp::fromRaw(efl_arg3_39_0);
   auto x2000884 = x42 * x359;
@@ -14462,7 +14514,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* 
   auto x63 = ::risc0::Fp::fromRaw(efl_arg4_27_0);
   auto x410 = x63 + x409;
   auto x411 = x410 - x374;
-  RK_ST4(arg0, 8u, 9u, 10u, 11u, x411);
+  RK_ST4L(arg0, 8u, 9u, 10u, 11u, x411);
   auto x2000891 = x411 * x391;
   auto x55 = ::risc0::Fp::fromRaw(efl_arg3_48_0);
   auto x2000892 = x55 * x390;
@@ -14508,7 +14560,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* 
   auto x73 = ::risc0::Fp::fromRaw(efl_arg4_31_0);
   auto x435 = x73 + x434;
   auto x436 = x435 - x410;
-  RK_ST4(arg0, 20u, 21u, 22u, 23u, x436);
+  RK_ST4L(arg0, 20u, 21u, 22u, 23u, x436);
   const uint32_t efl_arg3_87_0 = EF_LDCR(arg3, 87u, 0u);
   const uint32_t efl_arg3_91_0 = EF_LDCR(arg3, 91u, 0u);
   auto x2000899 = x436 * x421;
@@ -14568,7 +14620,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* 
   auto x86 = ::risc0::Fp::fromRaw(efl_arg4_35_0);
   auto x466 = x86 + x465;
   auto x467 = x466 - x435;
-  RK_ST4(arg0, 40u, 41u, 42u, 43u, x467);
+  RK_ST4L(arg0, 40u, 41u, 42u, 43u, x467);
   auto x2000907 = x467 * x446;
   const uint32_t efl_arg3_98_0 = EF_LDCR(arg3, 98u, 0u);
   const uint32_t efl_arg3_99_0 = EF_LDCR(arg3, 99u, 0u);
@@ -14636,7 +14688,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* 
   auto x101 = ::risc0::Fp::fromRaw(efl_arg4_39_0);
   auto x502 = x101 + x501;
   auto x503 = x502 - x466;
-  RK_ST4(arg0, 60u, 61u, 62u, 63u, x503);
+  RK_ST4L(arg0, 60u, 61u, 62u, 63u, x503);
   auto x2000915 = x503 * x482;
   auto x92 = ::risc0::Fp::fromRaw(efl_arg3_97_0);
   auto x2000916 = x92 * x481;
@@ -14712,7 +14764,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* 
   auto x543 = x118 + x542;
   // remat_lu: store dropped
   auto x544 = x543 - x502;
-  RK_ST4(arg0, 80u, 81u, 82u, 83u, x544);
+  RK_ST4L(arg0, 80u, 81u, 82u, 83u, x544);
   auto x2000923 = x544 * x524;
   const uint32_t efl_arg3_122_0 = EF_LDCR(arg3, 122u, 0u);
   const uint32_t efl_arg3_124_0 = EF_LDCR(arg3, 124u, 0u);
@@ -14757,7 +14809,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* 
   auto x569 = x568 - x543;
   const uint32_t efl_arg3_29_0 = EF_LDCR(arg3, 29u, 0u);
   const uint32_t efl_arg3_32_0 = EF_LDCR(arg3, 32u, 0u);
-  RK_ST4(arg0, 84u, 85u, 86u, 87u, x569);
+  RK_ST4L(arg0, 84u, 85u, 86u, 87u, x569);
   auto x2000931 = x569 * x554;
   auto x122 = ::risc0::Fp::fromRaw(efl_arg3_121_0);
   auto x2000932 = x122 * x553;
@@ -14801,7 +14853,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* 
   auto x138 = ::risc0::Fp::fromRaw(efl_arg4_51_0);
   auto x593 = x138 + x592;
   auto x594 = x593 - x568;
-  RK_ST4(arg0, 92u, 93u, 94u, 95u, x594);
+  RK_ST4L(arg0, 92u, 93u, 94u, 95u, x594);
   auto x2000939 = x594 * x579;
   auto x132 = ::risc0::Fp::fromRaw(efl_arg3_31_0);
   auto x2000940 = x132 * x578;
@@ -14836,7 +14888,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* 
   auto x143 = ::risc0::Fp::fromRaw(efl_arg4_55_0);
   auto x607 = x143 + x606;
   auto x608 = x607 - x593;
-  RK_ST4(arg0, 96u, 97u, 98u, 99u, x608);
+  RK_ST4L(arg0, 96u, 97u, 98u, 99u, x608);
   auto x609 = x608 * x601;
   const uint32_t efl_arg4_100_0 = EF_LDCR(arg4, 100u, 0u);
   const uint32_t efl_arg4_99_0 = EF_LDCR(arg4, 99u, 0u);
@@ -14857,7 +14909,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* 
   auto x617 = x148 + x616;
   // remat_lu: store dropped
   auto x618 = x617 - x607;
-  RK_ST4(arg0, 104u, 105u, 106u, 107u, x618);
+  RK_ST4L(arg0, 104u, 105u, 106u, 107u, x618);
   const uint32_t efl_arg3_3_0 = EF_LDCR(arg3, 3u, 0u);
   const uint32_t efl_arg3_70_0 = EF_LDCR(arg3, 70u, 0u);
   FpExt x619 = rk_fin(rk_link_k(x611, x618, 9u));
@@ -15094,7 +15146,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* 
   auto x826 = x172 + x825;
   // remat_lu: store dropped
   auto x827 = x826 - x607;
-  RK_ST4(arg0, 152u, 153u, 154u, 155u, x827);
+  RK_ST4L(arg0, 152u, 153u, 154u, 155u, x827);
   auto x2001018 = x827 * x812;
   auto x2001019 = x52 * x811;
   auto x2001020 = x59 * x809;
@@ -15146,7 +15198,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* 
   const uint32_t efl_arg3_164_0 = EF_LDCR(arg3, 164u, 0u);
   auto x857 = x181 + x856;
   auto x858 = x857 - x826;
-  RK_ST4(arg0, 156u, 157u, 158u, 159u, x858);
+  RK_ST4L(arg0, 156u, 157u, 158u, 159u, x858);
   auto x2001026 = x858 * x837;
   auto x2001027 = x2001026 - x839;
   auto x2001028 = x2001027 - x838;
@@ -15191,7 +15243,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* 
   auto x193 = ::risc0::Fp::fromRaw(efl_arg4_67_0);
   auto x887 = x193 + x886;
   auto x888 = x887 - x857;
-  RK_ST4(arg0, 160u, 161u, 162u, 163u, x888);
+  RK_ST4L(arg0, 160u, 161u, 162u, 163u, x888);
   auto x2001032 = x888 * x873;
   const uint32_t efl_arg3_171_0 = EF_LDCR(arg3, 171u, 0u);
   const uint32_t efl_arg4_74_0 = EF_LDCR(arg4, 74u, 0u);
@@ -15226,7 +15278,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* 
   const uint32_t efl_arg3_4_0 = EF_LDCR(arg3, 4u, 0u);
   auto x901 = x198 + x900;
   auto x902 = x901 - x887;
-  RK_ST4(arg0, 168u, 169u, 170u, 171u, x902);
+  RK_ST4L(arg0, 168u, 169u, 170u, 171u, x902);
   auto x903 = x902 * x895;
   auto x199 = ::risc0::Fp::fromRaw(efl_arg3_170_0);
   auto x904 = x903 - x199;
@@ -15533,7 +15585,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* 
   auto x1151 = x239 + x1150;
   // remat_lu: store dropped
   auto x1152 = x1151 - x901;
-  RK_ST4(arg0, 208u, 209u, 210u, 211u, x1152);
+  RK_ST4L(arg0, 208u, 209u, 210u, 211u, x1152);
   auto x2001133 = x1152 * x1137;
   const uint32_t efl_arg3_189_0 = EF_LDCR(arg3, 189u, 0u);
   const uint32_t efl_arg3_191_0 = EF_LDCR(arg3, 191u, 0u);
@@ -15587,7 +15639,7 @@ __device__ FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg0, Fp arg
 __device__ FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3);
 __device__ FpExt poly_fp(uint32_t cycle, uint32_t steps, Fp** args);
 
-__device__ EF_NOINLINE FpExt rv32im_v2_17(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3) {
+__device__ EF_CHAIN FpExt rv32im_v2_17(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3) {
   FpExt* arg7 = reinterpret_cast<FpExt*>(arg0);
   Fp* arg8 = EF_GPTR(0);
   Fp* arg9 = EF_GPTR(1);
@@ -15600,7 +15652,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(uint32_t cycle, uint32_t steps, Fp* ar
   FpExt arg4(arg4_e0, arg4_e1, arg4_e2, arg4_e3);
   FpExt arg5(arg5_e0, arg5_e1, arg5_e2, arg5_e3);
   FpExt arg6(arg6_e0, arg6_e1, arg6_e2, arg6_e3);
-  size_t mask = steps - 1; const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = (uint32_t)cycle;
+  size_t mask = steps - 1; uint32_t rk_c_o = (uint32_t)cycle; EF_OPQ(rk_c_o, 13); const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = rk_c_o;
   const uint32_t efl_arg8_165_0 = EF_LDCR(arg8, 165u, 0u);
   const uint32_t efl_arg8_162_0 = EF_LDCR(arg8, 162u, 0u);
   const uint32_t efl_arg8_158_0 = EF_LDCR(arg8, 158u, 0u);
@@ -15614,13 +15666,13 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(uint32_t cycle, uint32_t steps, Fp* ar
   auto x29 = ::risc0::Fp::fromRaw(efl_arg8_166_0);
   auto x169 = x29 - x168;
   EF_W((ef_wst(efw, 1u, x169);), RkAcc x170 = rk_link_k(x167, x169, 338u);)
-  auto x171 = RK_LD1(arg0, 1u);
+  auto x171 = RK_LD1M(arg0, 1u);
   auto x30 = ::risc0::Fp::fromRaw(efl_arg8_163_0);
   const uint32_t efl_arg8_169_0 = EF_LDCR(arg8, 169u, 0u);
   const uint32_t efl_arg8_168_0 = EF_LDCR(arg8, 168u, 0u);
   auto x172 = x30 - x171;
   EF_W((ef_wst(efw, 2u, x172);), RkAcc x173 = rk_link_nf_k(x170, x172, 339u);)
-  auto x174 = RK_LD1(arg0, 5u);
+  auto x174 = RK_LD1M(arg0, 5u);
   auto x31 = ::risc0::Fp::fromRaw(efl_arg8_164_0);
   auto x175 = x31 - x174;
   EF_W((ef_wst(efw, 3u, x175);), RkAcc x176 = rk_link_k(x173, x175, 340u);)
@@ -15691,7 +15743,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(uint32_t cycle, uint32_t steps, Fp* ar
   auto x212 = (::risc0::Fp::fromRaw(efl_arg8_108_0) - Fp(1u));
   const uint32_t efl_arg8_111_0 = EF_LDCR(arg8, 111u, 0u);
   EF_W((const int efq_166_4 = ef_wq(efw, 4u); ef_wst(efw, 4u, x212);), RkAcc x213 = rk_link_nf_k(x211, x212, 4u);)
-  auto x214 = RK_LD1(arg0, 3u);
+  auto x214 = RK_LD1M(arg0, 3u);
   auto x42 = ::risc0::Fp::fromRaw(efl_arg8_109_0);
   auto x215 = x42 - x214;
   EF_W((ef_wst(efw, 5u, x215);), RkAcc x216 = rk_link_k(x213, x215, 5u);)
@@ -15737,7 +15789,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 14u, x238);), RkAcc x239 = rk_link_nf_k(x237, x238, 14u);)
   auto x240 = (::risc0::Fp::fromRaw(efl_arg8_119_0) - Fp(1u));
   EF_W((ef_wst(efw, 15u, x240); ef_wblk(efw, efd_166, 8u, efq_166_8);), RkAcc x241 = rk_link_k(x239, x240, 15u);)
-  auto x242 = RK_LD1(arg0, 0u);
+  auto x242 = RK_LD1M(arg0, 0u);
   EF_W((const int efq_166_16 = ef_wq4(efw, 16u, 18u, 19u, 20u, 4u); ef_wst(efw, 16u, x242);), RkAcc x243 = rk_link_nf_k(x241, x242, 16u);)
   auto x48 = ::risc0::Fp::fromRaw(efl_arg8_114_0);
   const uint32_t efl_arg8_120_0 = EF_LDCR(arg8, 120u, 0u);
@@ -15941,7 +15993,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(uint32_t cycle, uint32_t steps, Fp* ar
   constexpr Fp x9(64);
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx390 = rkw1_ff0(x50, x9, false); rkw1_ff(_wx390, x51, x15, false); rkw1_v(_wx390, x386, false); rkw1_v(_wx390, x53, false); auto x390 = rkw1_fin(_wx390);
-  RK_ST1(arg0, 0u, x390);
+  RK_ST1M(arg0, 0u, x390);
   auto x391 = x60 * x24;
   auto x392 = x391 + x61;
   auto x393 = (::risc0::Fp::fromRaw(efl_arg8_147_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg8_147_0)));
@@ -15952,7 +16004,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg8_128_0 = EF_LDCR(arg8, 128u, 0u);
   const uint32_t efl_arg8_132_0 = EF_LDCR(arg8, 132u, 0u);
   const uint32_t efl_arg8_129_0 = EF_LDCR(arg8, 129u, 0u);
-  auto x396 = RK_LD1(arg0, 4u);
+  auto x396 = RK_LD1M(arg0, 4u);
   auto x397 = x396 + x376;
   auto x68 = ::risc0::Fp::fromRaw(efl_arg8_148_0);
   auto x399 = x397 - x68;
@@ -16307,7 +16359,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(uint32_t cycle, uint32_t steps, Fp* ar
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx604 = rkw1_ff0(x112, x122, false); rkw1_ff(_wx604, x111, x123, false); auto x604 = rkw1_fin(_wx604);
   auto x605 = x604 * x11;
-  RK_ST1(arg0, 1u, x605);
+  RK_ST1M(arg0, 1u, x605);
   auto x606 = x601 + x605;
   auto x607 = (::risc0::Fp::fromRaw(efl_arg8_37_0) - Fp(1u));
   EF_W((ef_wst(efw, 10u, x607);), RkAcc x608 = rk_link_nf_k(x599, x607, 36u);)
@@ -16345,7 +16397,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(uint32_t cycle, uint32_t steps, Fp* ar
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx638 = rkw1_ff0(x112, x127, false); rkw1_ff(_wx638, x111, x125, false); rkw1_ff(_wx638, x115, x122, false); rkw1_ff(_wx638, x116, x123, false); auto x638 = rkw1_fin(_wx638);
   auto x639 = x638 * x11;
-  RK_ST1(arg0, 5u, x639);
+  RK_ST1M(arg0, 5u, x639);
   auto x641 = (::risc0::Fp::fromRaw(efl_arg8_39_0) - Fp(1u));
   EF_W((ef_wst(efw, 15u, x641); ef_wblk(efw, efd_169, 8u, efq_169_32);), RkAcc x642 = rk_link_k(x622, x641, 41u);)
   auto x133 = ::risc0::Fp::fromRaw(efl_arg8_83_0);
@@ -16389,7 +16441,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(uint32_t cycle, uint32_t steps, Fp* ar
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx667 = rkw1_ff0(x115, x127, false); rkw1_ff(_wx667, x116, x125, false); auto x667 = rkw1_fin(_wx667);
   auto x668 = x667 * x11;
-  RK_ST1(arg0, 6u, x668);
+  RK_ST1M(arg0, 6u, x668);
   auto x670 = (::risc0::Fp::fromRaw(efl_arg8_41_0) - Fp(1u));
   EF_W((const int efq_169_44 = ef_wq(efw, 46u); ef_wst(efw, 20u, x670);), RkAcc x671 = rk_link_nf_k(x655, x670, 46u);)
   auto x136 = ::risc0::Fp::fromRaw(efl_arg8_85_0);
@@ -16629,7 +16681,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(uint32_t cycle, uint32_t steps, Fp* ar
   auto x856 = x116 - x855;
   auto x865 = x581 + x595;
   auto x866 = x108 - x865;
-  RK_ST1(arg0, 7u, x866);
+  RK_ST1M(arg0, 7u, x866);
   auto x868 = x29 * x17;
   auto x869 = x586 + x868;
   auto x870 = x127 - x869;
@@ -16638,7 +16690,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(uint32_t cycle, uint32_t steps, Fp* ar
   auto x876 = x874 + x875;
   auto x161 = ::risc0::Fp::fromRaw(efl_arg8_36_0);
   auto x877 = x161 - x876;
-  RK_ST1(arg0, 8u, x877);
+  RK_ST1M(arg0, 8u, x877);
   auto x879 = x128 + x600;
   auto x880 = x879 + x605;
   auto x885 = x33 * x26;
@@ -16647,7 +16699,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(uint32_t cycle, uint32_t steps, Fp* ar
   auto x888 = x887 + x618;
   auto x889 = x888 + x135;
   auto x890 = x880 - x889;
-  RK_ST1(arg0, 9u, x890);
+  RK_ST1M(arg0, 9u, x890);
   auto x903 = x37 * x26;
   auto x904 = x903 + x35;
   auto x2002329 = ef_ladd(x886, x638);
@@ -16668,7 +16720,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(uint32_t cycle, uint32_t steps, Fp* ar
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002343 = rkw1_ff0(x2002329, x11, false); rkw1_v(_wx2002343, x161, false); rkw1_v(_wx2002343, x131, false); rkw1_ff(_wx2002343, x112, x3000023, false); rkw1_ff(_wx2002343, x111, x3000024, false); rkw1_ff(_wx2002343, x115, x123, false); rkw1_ff(_wx2002343, x904, x5, true); rkw1_ff(_wx2002343, x3000025, x27, true); rkw1_v(_wx2002343, x138, true); auto x2002343 = rkw1_fin(_wx2002343);
-  RK_ST1(arg0, 10u, x2002343);
+  RK_ST1M(arg0, 10u, x2002343);
   auto x921 = x141 * x26;
   auto x922 = x921 + x36;
   auto x2002344 = ef_ladd(x904, x667);
@@ -16689,7 +16741,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(uint32_t cycle, uint32_t steps, Fp* ar
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002358 = rkw1_ff0(x2002344, x11, false); rkw1_v(_wx2002358, x3000028, false); rkw1_v(_wx2002358, x4, false); rkw1_ff(_wx2002358, x111, x127, false); rkw1_ff(_wx2002358, x115, x3000026, false); rkw1_ff(_wx2002358, x116, x3000027, false); rkw1_ff(_wx2002358, x922, x5, true); rkw1_ff(_wx2002358, x137, x27, true); rkw1_v(_wx2002358, x139, true); auto x2002358 = rkw1_fin(_wx2002358);
-  RK_ST1(arg0, 11u, x2002358);
+  RK_ST1M(arg0, 11u, x2002358);
   auto x928 = x922 * x11;
   auto x929 = x928 + x137;
   auto x930 = x929 + x3;
@@ -16699,11 +16751,11 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(uint32_t cycle, uint32_t steps, Fp* ar
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx939 = rkw1_ff0(x933, x2, false); rkw1_ff(_wx939, x142, x26, true); rkw1_v(_wx939, x140, true); auto x939 = rkw1_fin(_wx939);
-  RK_ST1(arg0, 12u, x939);
+  RK_ST1M(arg0, 12u, x939);
   auto x941 = x135 - x838;
-  RK_ST1(arg0, 13u, x941);
+  RK_ST1M(arg0, 13u, x941);
   auto x943 = x138 - x841;
-  RK_ST1(arg0, 14u, x943);
+  RK_ST1M(arg0, 14u, x943);
   auto x946 = x143 * x1;
   auto x947 = x139 - x946;
   auto x949 = x144 - x946;
@@ -16711,7 +16763,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(uint32_t cycle, uint32_t steps, Fp* ar
   auto x953 = ef_lsub(x841, x952);
   auto x954 = x953 * x26;
   auto x956 = x146 - x954;
-  RK_ST1(arg0, 15u, x956);
+  RK_ST1M(arg0, 15u, x956);
   auto x960 = x107 - x736;
   const uint32_t efl_arg8_185_0 = EF_LDCR(arg8, 185u, 0u);
   auto x962 = x108 + x147;
@@ -16727,7 +16779,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(uint32_t cycle, uint32_t steps, Fp* ar
   auto x982 = x154 + x1;
   auto x983 = x982 - x150;
   auto x986 = x981 - x778;
-  RK_ST1(arg0, 16u, x986);
+  RK_ST1M(arg0, 16u, x986);
   auto x988 = x983 + x155;
   auto x989 = (::risc0::Fp::fromRaw(efl_arg8_59_0) - Fp(1u));
   auto x991 = (::risc0::Fp::fromRaw(efl_arg8_185_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg8_185_0)));
@@ -16736,10 +16788,10 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(uint32_t cycle, uint32_t steps, Fp* ar
   auto x163 = ::risc0::Fp::fromRaw(efl_arg8_60_0);
   auto x994 = x993 + x163;
   auto x995 = x988 - x994;
-  RK_ST1(arg0, 17u, x995);
+  RK_ST1M(arg0, 17u, x995);
   auto x997 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg8_182_0));
   auto x998 = x997 - x153;
-  RK_ST1(arg0, 18u, x998);
+  RK_ST1M(arg0, 18u, x998);
   auto x999 = x128 - x838;
   auto x1000 = x161 - x841;
   auto x1001 = x31 - x1;
@@ -16945,7 +16997,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(uint32_t cycle, uint32_t steps, Fp* ar
   auto x1144 = rv32im_v2_16(cycle, steps, arg0, x1143.elems[0], x1143.elems[1], x1143.elems[2], x1143.elems[3], x1005.elems[0], x1005.elems[1], x1005.elems[2], x1005.elems[3], x1016.elems[0], x1016.elems[1], x1016.elems[2], x1016.elems[3], x1021.elems[0], x1021.elems[1], x1021.elems[2], x1021.elems[3], x1113.elems[0], x1113.elems[1], x1113.elems[2], x1113.elems[3], x479.elems[0], x479.elems[1], x479.elems[2], x479.elems[3], arg3.elems[0], arg3.elems[1], arg3.elems[2], arg3.elems[3], x480.elems[0], x480.elems[1], x480.elems[2], x480.elems[3], x798.elems[0], x798.elems[1], x798.elems[2], x798.elems[3], x196.elems[0], x196.elems[1], x196.elems[2], x196.elems[3], arg5.elems[0], arg5.elems[1], arg5.elems[2], arg5.elems[3], arg6.elems[0], arg6.elems[1], arg6.elems[2], arg6.elems[3], arg4.elems[0], arg4.elems[1], arg4.elems[2], arg4.elems[3]);
   return x1144;
 }
-__device__ EF_NOINLINE FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg7_e0, Fp arg7_e1, Fp arg7_e2, Fp arg7_e3) {
+__device__ EF_CHAIN FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg7_e0, Fp arg7_e1, Fp arg7_e2, Fp arg7_e3) {
   FpExt* arg6 = reinterpret_cast<FpExt*>(arg0);
   Fp* arg8 = EF_GPTR(0);
   Fp* arg9 = EF_GPTR(1);
@@ -16958,7 +17010,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* ar
   FpExt arg4(arg4_e0, arg4_e1, arg4_e2, arg4_e3);
   FpExt arg5(arg5_e0, arg5_e1, arg5_e2, arg5_e3);
   FpExt arg7(arg7_e0, arg7_e1, arg7_e2, arg7_e3);
-  size_t mask = steps - 1; const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = (uint32_t)cycle;
+  size_t mask = steps - 1; uint32_t rk_c_o = (uint32_t)cycle; EF_OPQ(rk_c_o, 14); const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = rk_c_o;
   const uint32_t efl_arg8_79_0 = EF_LDCR(arg8, 79u, 0u);
   const uint32_t efl_arg8_80_0 = EF_LDCR(arg8, 80u, 0u);
   const uint32_t efl_arg8_112_0 = EF_LDCR(arg8, 112u, 0u);
@@ -17062,7 +17114,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 18u, x53); ef_wblk(efw, efd_184, 12u, efq_184_12); ef_wblk(efw, efd_184, 16u, efq_184_16); FpExt x282 = ef_wfin(efw, efd_184, 0u, arg1);), FpExt x282 = rk_fin(rk_link_k(x281, x53, 72u));)
   auto x54 = ::risc0::Fp::fromRaw(efl_arg8_23_0);
   RkW _cx283 = rk_cl0(arg2, x54 * x282, 96u); FpExt x283 = rkw_fin(_cx283);
-  auto x284 = RK_LD1(arg0, 2u);
+  auto x284 = RK_LD1M(arg0, 2u);
   EF_W((ef_v4i efd_185[4] = {}; const int efq_185_0 = ef_wq(efw, 0u); ef_wst(efw, 0u, x284);), RkAcc x285 = rk_link_nf_k(arg3, x284, 0u);)
   auto x286 = (::risc0::Fp::fromRaw(efl_arg8_29_0) - Fp(2013265920u));
   const uint32_t efl_arg8_33_0 = EF_LDCR(arg8, 33u, 0u);
@@ -17072,7 +17124,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 1u, x286);), RkAcc x287 = rk_link_k(x285, x286, 1u);)
   auto x288 = (::risc0::Fp::fromRaw(efl_arg8_34_0) - Fp(1u));
   EF_W((ef_wst(efw, 2u, x288);), RkAcc x289 = rk_link_nf_k(x287, x288, 2u);)
-  auto x290 = RK_LD1(arg0, 8u);
+  auto x290 = RK_LD1M(arg0, 8u);
   EF_W((ef_wst(efw, 3u, x290);), RkAcc x291 = rk_link_k(x289, x290, 3u);)
   auto x293 = (::risc0::Fp::fromRaw(efl_arg8_30_0) - Fp(1073725450u));
   EF_W((const int efq_185_4 = ef_wq(efw, 5u); ef_wst(efw, 4u, x293);), RkAcc x294 = rk_link_nf_k(x291, x293, 5u);)
@@ -17086,7 +17138,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 6u, x297);), RkAcc x298 = rk_link_nf_k(x296, x297, 7u);)
   auto x299 = (::risc0::Fp::fromRaw(efl_arg8_65_0) - Fp(1u));
   EF_W((ef_wst(efw, 7u, x299); ef_wblk(efw, efd_185, 0u, efq_185_0);), RkAcc x300 = rk_link_k(x298, x299, 8u);)
-  auto x301 = RK_LD1(arg0, 3u);
+  auto x301 = RK_LD1M(arg0, 3u);
   EF_W((const int efq_185_8 = ef_wq(efw, 9u); ef_wst(efw, 8u, x301);), RkAcc x302 = rk_link_nf_k(x300, x301, 9u);)
   auto x303 = (::risc0::Fp::fromRaw(efl_arg8_38_0) - Fp(2013265920u));
   const uint32_t efl_arg8_42_0 = EF_LDCR(arg8, 42u, 0u);
@@ -17096,7 +17148,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 9u, x303);), RkAcc x304 = rk_link_k(x302, x303, 10u);)
   auto x305 = (::risc0::Fp::fromRaw(efl_arg8_43_0) - Fp(1u));
   EF_W((ef_wst(efw, 10u, x305);), RkAcc x306 = rk_link_nf_k(x304, x305, 11u);)
-  auto x307 = RK_LD1(arg0, 9u);
+  auto x307 = RK_LD1M(arg0, 9u);
   EF_W((ef_wst(efw, 11u, x307); ef_wblk(efw, efd_185, 4u, efq_185_4);), RkAcc x308 = rk_link_k(x306, x307, 12u);)
   auto x310 = (::risc0::Fp::fromRaw(efl_arg8_39_0) - Fp(1073725451u));
   EF_W((const int efq_185_12 = ef_wq(efw, 14u); ef_wst(efw, 12u, x310);), RkAcc x311 = rk_link_nf_k(x308, x310, 14u);)
@@ -17110,7 +17162,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 14u, x314);), RkAcc x315 = rk_link_nf_k(x313, x314, 16u);)
   auto x316 = (::risc0::Fp::fromRaw(efl_arg8_67_0) - Fp(1u));
   EF_W((ef_wst(efw, 15u, x316); ef_wblk(efw, efd_185, 8u, efq_185_8);), RkAcc x317 = rk_link_k(x315, x316, 17u);)
-  auto x318 = RK_LD1(arg0, 7u);
+  auto x318 = RK_LD1M(arg0, 7u);
   EF_W((const int efq_185_16 = ef_wq(efw, 18u); ef_wst(efw, 16u, x318);), RkAcc x319 = rk_link_nf_k(x317, x318, 18u);)
   auto x320 = (::risc0::Fp::fromRaw(efl_arg8_47_0) - Fp(2013265920u));
   const uint32_t efl_arg8_51_0 = EF_LDCR(arg8, 51u, 0u);
@@ -17119,7 +17171,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 17u, x320);), RkAcc x321 = rk_link_k(x319, x320, 19u);)
   auto x322 = (::risc0::Fp::fromRaw(efl_arg8_52_0) - Fp(1u));
   EF_W((ef_wst(efw, 18u, x322);), RkAcc x323 = rk_link_nf_k(x321, x322, 20u);)
-  auto x324 = RK_LD1(arg0, 10u);
+  auto x324 = RK_LD1M(arg0, 10u);
   EF_W((ef_wst(efw, 19u, x324); ef_wblk(efw, efd_185, 12u, efq_185_12);), RkAcc x325 = rk_link_k(x323, x324, 21u);)
   auto x327 = (::risc0::Fp::fromRaw(efl_arg8_48_0) - Fp(1073725452u));
   EF_W((const int efq_185_20 = ef_wq(efw, 23u); ef_wst(efw, 20u, x327);), RkAcc x328 = rk_link_nf_k(x325, x327, 23u);)
@@ -17132,7 +17184,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 22u, x331);), RkAcc x332 = rk_link_nf_k(x330, x331, 25u);)
   auto x333 = (::risc0::Fp::fromRaw(efl_arg8_69_0) - Fp(1u));
   EF_W((ef_wst(efw, 23u, x333); ef_wblk(efw, efd_185, 16u, efq_185_16);), RkAcc x334 = rk_link_k(x332, x333, 26u);)
-  auto x335 = RK_LD1(arg0, 11u);
+  auto x335 = RK_LD1M(arg0, 11u);
   EF_W((const int efq_185_24 = ef_wq(efw, 27u); ef_wst(efw, 0u, x335);), RkAcc x336 = rk_link_nf_k(x334, x335, 27u);)
   auto x55 = ::risc0::Fp::fromRaw(efl_arg8_37_0);
   const uint32_t efl_arg8_56_0 = EF_LDCR(arg8, 56u, 0u);
@@ -17154,14 +17206,14 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 6u, x345);), RkAcc x346 = rk_link_nf_k(x344, x345, 33u);)
   auto x347 = (::risc0::Fp::fromRaw(efl_arg8_61_0) - Fp(1u));
   EF_W((ef_wst(efw, 7u, x347); ef_wblk(efw, efd_185, 0u, efq_185_24);), RkAcc x348 = rk_link_k(x346, x347, 34u);)
-  auto x349 = RK_LD1(arg0, 23u);
+  auto x349 = RK_LD1M(arg0, 23u);
   EF_W((const int efq_185_32 = ef_wq4(efw, 35u, 37u, 38u, 39u, 4u); ef_wst(efw, 8u, x349);), RkAcc x350 = rk_link_nf_k(x348, x349, 35u);)
   auto x352 = (::risc0::Fp::fromRaw(efl_arg8_57_0) - Fp(1073725450u));
   const uint32_t efl_arg8_77_0 = EF_LDCR(arg8, 77u, 0u);
   EF_W((ef_wst(efw, 9u, x352);), RkAcc x353 = rk_link_k(x350, x352, 37u);)
   auto x354 = (::risc0::Fp::fromRaw(efl_arg8_71_0) - Fp(1u));
   EF_W((ef_wst(efw, 10u, x354);), RkAcc x355 = rk_link_nf_k(x353, x354, 38u);)
-  auto x356 = RK_LD1(arg0, 12u);
+  auto x356 = RK_LD1M(arg0, 12u);
   EF_W((ef_wst(efw, 11u, x356); ef_wblk(efw, efd_185, 4u, efq_185_28);), RkAcc x357 = rk_link_k(x355, x356, 39u);)
   auto x358 = (::risc0::Fp::fromRaw(efl_arg8_63_0) - ::risc0::Fp::fromRaw(efl_arg8_74_0));
   EF_W((const int efq_185_36 = ef_wq(efw, 40u); ef_wst(efw, 12u, x358);), RkAcc x359 = rk_link_nf_k(x357, x358, 40u);)
@@ -17181,7 +17233,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 19u, x53); ef_wblk(efw, efd_185, 12u, efq_185_36); ef_wblk(efw, efd_185, 16u, efq_185_40); FpExt x366 = ef_wfin(efw, efd_185, 0u, arg3);), FpExt x366 = rk_fin(rk_link_k(x365, x53, 47u));)
   auto x60 = ::risc0::Fp::fromRaw(efl_arg8_24_0);
   RkW _cx367 = _cx283; rk_cl_acc(_cx367, x60 * x366, 169u); FpExt x367 = rkw_fin(_cx367);
-  auto x368 = RK_LD1(arg0, 4u);
+  auto x368 = RK_LD1M(arg0, 4u);
   EF_W((ef_v4i efd_186[4] = {}; FpExt efb_186 = arg3; const int efq_186_0 = ef_wq(efw, 0u); ef_wst(efw, 0u, x368);), RkAcc x369 = rk_link_nf_k(arg3, x368, 0u);)
   auto x61 = ::risc0::Fp::fromRaw(efl_arg8_91_4);
   auto x370 = x61 - x36;
@@ -17203,7 +17255,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 6u, x382);), RkAcc x383 = rk_link_nf_k(x381, x382, 6u);)
   auto x384 = ((((::risc0::Fp::fromRaw(efl_arg8_105_0) + ::risc0::Fp::fromRaw(efl_arg8_106_0)) + ::risc0::Fp::fromRaw(efl_arg8_107_0)) + ::risc0::Fp::fromRaw(efl_arg8_108_0)) - Fp(1u));
   EF_W((ef_wst(efw, 7u, x384); ef_wblk(efw, efd_186, 0u, efq_186_0);), RkAcc x385 = rk_link_k(x383, x384, 7u);)
-  auto x386 = RK_LD1(arg0, 13u);
+  auto x386 = RK_LD1M(arg0, 13u);
   const uint32_t efl_arg8_111_0 = EF_LDCR(arg8, 111u, 0u);
   EF_W((const int efq_186_8 = ef_wq(efw, 8u); ef_wst(efw, 8u, x386);), RkAcc x387 = rk_link_nf_k(x385, x386, 8u);)
   auto x388 = (::risc0::Fp::fromRaw(efl_arg8_109_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg8_109_0)));
@@ -17273,7 +17325,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 10u, x301);), RkAcc x445 = rk_link_nf_k(x444, x301, 35u);)
   EF_W((ef_wst(efw, 11u, x303); ef_wblk(efw, efd_186, 4u, efq_186_28);), RkAcc x446 = rk_link_k(x445, x303, 36u);)
   EF_W((const int efq_186_36 = ef_wq4(efw, 37u, 38u, 40u, 41u, 4u); ef_wst(efw, 12u, x305);), RkAcc x447 = rk_link_nf_k(x446, x305, 37u);)
-  auto x448 = RK_LD1(arg0, 19u);
+  auto x448 = RK_LD1M(arg0, 19u);
   EF_W((ef_wst(efw, 13u, x448);), RkAcc x449 = rk_link_k(x447, x448, 38u);)
   auto x68 = ::risc0::Fp::fromRaw(efl_arg8_39_0);
   auto x451 = x68 - x67;
@@ -17345,7 +17397,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 11u, x59); ef_wblk(efw, efd_186, 4u, efq_186_52); ef_wblk(efw, efd_186, 8u, efq_186_56); FpExt x497 = ef_wfin(efw, efd_186, 0u, efb_186);), FpExt x497 = rk_fin(rk_link_k(x496, x59, 61u));)
   auto x83 = ::risc0::Fp::fromRaw(efl_arg8_25_0);
   RkW _cx498 = _cx367; rk_cl_acc(_cx498, x83 * x497, 208u); FpExt x498 = rkw_fin(_cx498);
-  auto x499 = RK_LD1(arg0, 5u);
+  auto x499 = RK_LD1M(arg0, 5u);
   auto x502 = x61 - x373;
   auto x516 = (::risc0::Fp::fromRaw(efl_arg8_76_0) * Fp(4u));
   auto x517 = x516 + x39;
@@ -17368,7 +17420,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* ar
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
-  auto x550 = RK_LD1(arg0, 18u);
+  auto x550 = RK_LD1M(arg0, 18u);
   auto x553 = x66 - x48;
   const uint32_t efl_arg8_122_0 = EF_LDCR(arg8, 122u, 0u);
   auto x557 = ef_ladd(x67, x36);
@@ -17388,7 +17440,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* ar
   // lincombF: fused into a lazy Fp linear combination
   auto x85 = ::risc0::Fp::fromRaw(efl_arg8_122_0);
   RkW1 _wx577 = rkw1_ff0(x538, x572, false); rkw1_ff(_wx577, x574, x28, false); rkw1_v(_wx577, x85, true); auto x577 = rkw1_fin(_wx577);
-  auto x581 = RK_LD1(arg0, 20u);
+  auto x581 = RK_LD1M(arg0, 20u);
   auto x86 = ::risc0::Fp::fromRaw(efl_arg8_48_0);
   const uint32_t efl_arg8_124_0 = EF_LDCR(arg8, 124u, 0u);
   const uint32_t efl_arg8_125_0 = EF_LDCR(arg8, 125u, 0u);
@@ -17623,7 +17675,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* ar
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx694 = rkw1_ff0(x656, x107, false); rkw1_v(_wx694, x688, false); rkw1_ff(_wx694, x2002364, x54, false); rkw1_v(_wx694, x691, false); rkw1_ff(_wx694, x2002370, x83, false); rkw1_ff(_wx694, x2002376, x92, false); auto x694 = rkw1_fin(_wx694);
-  RK_ST1(arg0, 2u, x694);
+  RK_ST1M(arg0, 2u, x694);
   constexpr Fp x17(16384);
   auto x114 = ::risc0::Fp::fromRaw(efl_arg8_46_0);
   auto x695 = x114 * x17;
@@ -17822,12 +17874,12 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* ar
   auto x141 = ::risc0::Fp::fromRaw(efl_arg8_193_0);
   auto x830 = x141 - x829;
   RkAcc x831 = rk_link_nf_k(arg3, x830, 0u);
-  auto x832 = RK_LD1(arg0, 0u);
+  auto x832 = RK_LD1M(arg0, 0u);
   RkAcc x833 = rk_link_k(x831, x832, 1u);
   FpExt x834 = rk_fin(rk_link_k(x833, x822, 2u));
   auto x835 = (::risc0::Fp::fromRaw(efl_arg8_202_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg8_202_0)));
   RkAcc x836 = rk_link_nf_k(arg3, x835, 0u);
-  auto x837 = RK_LD1(arg0, 1u);
+  auto x837 = RK_LD1M(arg0, 1u);
   auto x142 = ::risc0::Fp::fromRaw(efl_arg8_203_0);
   const uint32_t efl_arg8_31_0 = EF_LDCR(arg8, 31u, 0u);
   auto x838 = x837 * x142;
@@ -17949,10 +18001,10 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* ar
   auto x919 = x96 + x918;
   auto x920 = rk_xmul(x919);
   auto x921 = x57 + x920;
-  RK_ST4(arg6, 0u, 1u, 3u, 4u, x921);
+  RK_ST4M(arg6, 0u, 1u, 3u, 4u, x921);
   constexpr FpExt x10(0,0,0,0);
   auto x922 = x921 - x10;
-  RK_ST4(arg6, 5u, 7u, 8u, 9u, x922);
+  RK_ST4M(arg6, 5u, 7u, 8u, 9u, x922);
   const uint32_t efl_arg8_95_0 = EF_LDCR(arg8, 95u, 0u);
   const uint32_t efl_arg8_100_0 = EF_LDCR(arg8, 100u, 0u);
   EF_W((efs_193 = rk_link_k(efs_193, x922, 35u);), RkAcc x923 = rk_link_k(x915, x922, 35u);)
@@ -18010,7 +18062,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* ar
   auto x959 = x72 - x36;
   EF_W((ef_wst(efw, 6u, x959);), RkAcc x960 = rk_link_nf_k(x958, x959, 10u);)
   auto x961 = x51 - x829;
-  RK_ST1(arg0, 10u, x961);
+  RK_ST1M(arg0, 10u, x961);
   EF_W((ef_wst(efw, 7u, x961); ef_wblk(efw, efd_195, 0u, efq_195_0);), RkAcc x962 = rk_link_k(x960, x961, 11u);)
   constexpr Fp x6(1073725451);
   auto x174 = ::risc0::Fp::fromRaw(efl_arg8_78_0);
@@ -18027,7 +18079,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg8_92_0 = EF_LDCR(arg8, 92u, 0u);
   auto x175 = ::risc0::Fp::fromRaw(efl_arg8_143_0);
   auto x973 = x175 - x970;
-  RK_ST1(arg0, 11u, x973);
+  RK_ST1M(arg0, 11u, x973);
   EF_W((const int efq_195_12 = ef_wq(efw, 17u); ef_wst(efw, 12u, x973);), RkAcc x974 = rk_link_nf_k(x972, x973, 17u);)
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
@@ -18040,7 +18092,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 14u, x980);), RkAcc x981 = rk_link_nf_k(x979, x980, 19u);)
   auto x176 = ::risc0::Fp::fromRaw(efl_arg8_92_0);
   auto x982 = x176 - x829;
-  RK_ST1(arg0, 12u, x982);
+  RK_ST1M(arg0, 12u, x982);
   EF_W((ef_wst(efw, 15u, x982); ef_wblk(efw, efd_195, 8u, efq_195_8);), RkAcc x983 = rk_link_k(x981, x982, 20u);)
   constexpr Fp x5(1073725452);
   const uint32_t efl_arg8_145_0 = EF_LDCR(arg8, 145u, 0u);
@@ -18059,7 +18111,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 19u, x993); ef_wblk(efw, efd_195, 12u, efq_195_12);), RkAcc x994 = rk_link_k(x990, x993, 25u);)
   auto x179 = ::risc0::Fp::fromRaw(efl_arg8_145_0);
   auto x995 = x179 - x992;
-  RK_ST1(arg0, 13u, x995);
+  RK_ST1M(arg0, 13u, x995);
   const uint32_t efl_arg8_96_0 = EF_LDCR(arg8, 96u, 0u);
   const uint32_t efl_arg8_98_0 = EF_LDCR(arg8, 98u, 0u);
   const uint32_t efl_arg8_102_0 = EF_LDCR(arg8, 102u, 0u);
@@ -18076,7 +18128,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg8_103_0 = EF_LDCR(arg8, 103u, 0u);
   const uint32_t efl_arg8_97_0 = EF_LDCR(arg8, 97u, 0u);
   auto x1004 = x180 - x829;
-  RK_ST1(arg0, 14u, x1004);
+  RK_ST1M(arg0, 14u, x1004);
   EF_W((ef_wst(efw, 23u, x1004); ef_wblk(efw, efd_195, 16u, efq_195_16);), RkAcc x1005 = rk_link_k(x1003, x1004, 29u);)
   constexpr Fp x4(1073725453);
   auto x181 = ::risc0::Fp::fromRaw(efl_arg8_96_0);
@@ -18098,7 +18150,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 3u, x1015); ef_wblk(efw, efd_195, 20u, efq_195_20);), RkAcc x1016 = rk_link_k(x1012, x1015, 34u);)
   auto x185 = ::risc0::Fp::fromRaw(efl_arg8_147_0);
   auto x1017 = x185 - x1014;
-  RK_ST1(arg0, 15u, x1017);
+  RK_ST1M(arg0, 15u, x1017);
   EF_W((const int efq_195_28 = ef_wq(efw, 35u); ef_wst(efw, 4u, x1017);), RkAcc x1018 = rk_link_nf_k(x1016, x1017, 35u);)
   auto x186 = ::risc0::Fp::fromRaw(efl_arg8_196_0);
   auto x1019 = x36 - x186;
@@ -18349,7 +18401,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* ar
   auto x1193 = (::risc0::Fp::fromRaw(efl_arg8_109_0) - Fp(1u));
   EF_W((ef_wst(efw, 6u, x1193);), RkAcc x1194 = rk_link_nf_k(x1192, x1193, 37u);)
   auto x1195 = x63 - x829;
-  RK_ST1(arg0, 16u, x1195);
+  RK_ST1M(arg0, 16u, x1195);
   EF_W((ef_wst(efw, 7u, x1195); ef_wblk(efw, efd_197, 0u, efq_197_24);), RkAcc x1196 = rk_link_k(x1194, x1195, 38u);)
   auto x224 = ::risc0::Fp::fromRaw(efl_arg8_105_0);
   auto x1198 = x224 - x1190;
@@ -18366,7 +18418,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 11u, x1206); ef_wblk(efw, efd_197, 4u, efq_197_28);), RkAcc x1207 = rk_link_k(x1203, x1206, 43u);)
   auto x226 = ::risc0::Fp::fromRaw(efl_arg8_149_0);
   auto x1208 = x226 - x1205;
-  RK_ST1(arg0, 17u, x1208);
+  RK_ST1M(arg0, 17u, x1208);
   EF_W((const int efq_197_36 = ef_wq4(efw, 44u, 45u, 46u, 44u, 3u); ef_wst(efw, 12u, x1208);), RkAcc x1209 = rk_link_nf_k(x1207, x1208, 44u);)
   auto x1210 = x39 * x16;
   auto x227 = ::risc0::Fp::fromRaw(efl_arg8_111_0);
@@ -18378,11 +18430,11 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* ar
   auto x1215 = (::risc0::Fp::fromRaw(efl_arg8_118_0) - Fp(1u));
   EF_W((ef_wst(efw, 14u, x1215); ef_wblk(efw, efd_197, 8u, efq_197_32); ef_wblk(efw, efd_197, 12u, efq_197_36); FpExt x1216 = ef_wfin(efw, efd_197, 0u, x941);), FpExt x1216 = rk_fin(rk_link_k(x1214, x1215, 46u));)
   auto x1217 = x47 - x829;
-  RK_ST1(arg0, 18u, x1217);
+  RK_ST1M(arg0, 18u, x1217);
   auto x1218 = rv32im_v2_12(cycle, steps, arg0, x1216.elems[0], x1216.elems[1], x1216.elems[2], x1216.elems[3], x1142.elems[0], x1142.elems[1], x1142.elems[2], x1142.elems[3], arg3.elems[0], arg3.elems[1], arg3.elems[2], arg3.elems[3], x941.elems[0], x941.elems[1], x941.elems[2], x941.elems[3], arg7.elems[0], arg7.elems[1], arg7.elems[2], arg7.elems[3], x849.elems[0], x849.elems[1], x849.elems[2], x849.elems[3], x819.elems[0], x819.elems[1], x819.elems[2], x819.elems[3]);
   return x1218;
 }
-__device__ EF_NOINLINE FpExt rv32im_v2_9(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3, Fp arg7_e0, Fp arg7_e1, Fp arg7_e2, Fp arg7_e3, Fp arg8_e0, Fp arg8_e1, Fp arg8_e2, Fp arg8_e3) {
+__device__ EF_CHAIN FpExt rv32im_v2_9(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3, Fp arg7_e0, Fp arg7_e1, Fp arg7_e2, Fp arg7_e3, Fp arg8_e0, Fp arg8_e1, Fp arg8_e2, Fp arg8_e3) {
   FpExt* arg2 = reinterpret_cast<FpExt*>(arg0);
   Fp* arg9 = EF_GPTR(0);
   Fp* arg10 = EF_GPTR(1);
@@ -18395,13 +18447,13 @@ __device__ EF_NOINLINE FpExt rv32im_v2_9(uint32_t cycle, uint32_t steps, Fp* arg
   FpExt arg6(arg6_e0, arg6_e1, arg6_e2, arg6_e3);
   FpExt arg7(arg7_e0, arg7_e1, arg7_e2, arg7_e3);
   FpExt arg8(arg8_e0, arg8_e1, arg8_e2, arg8_e3);
-  size_t mask = steps - 1; const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = (uint32_t)cycle;
+  size_t mask = steps - 1; uint32_t rk_c_o = (uint32_t)cycle; EF_OPQ(rk_c_o, 15); const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = rk_c_o;
   const uint32_t efl_arg9_124_0 = EF_LDCR(arg9, 124u, 0u);
   const uint32_t efl_arg9_78_0 = EF_LDCR(arg9, 78u, 0u);
   const uint32_t efl_arg9_80_0 = EF_LDCR(arg9, 80u, 0u);
   const uint32_t efl_arg9_82_0 = EF_LDCR(arg9, 82u, 0u);
   const uint32_t efl_arg9_84_0 = EF_LDCR(arg9, 84u, 0u);
-  auto x124 = RK_LD1(arg0, 8u);
+  auto x124 = RK_LD1M(arg0, 8u);
   auto x36 = ::risc0::Fp::fromRaw(efl_arg9_124_0);
   auto x125 = x124 - x36;
   EF_W((ef_v4i efd_198[4] = {}; RkAcc efs_198 = rk_acc(arg1); const int efq_198_0 = ef_wq(efw, 69u); ef_wst(efw, 0u, x125);), RkAcc x126 = rk_link_nf_k(arg1, x125, 69u);)
@@ -18595,7 +18647,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_9(uint32_t cycle, uint32_t steps, Fp* arg
   EF_W((ef_wst(efw, 5u, x251);), RkAcc x252 = rk_link_k(x250, x251, 74u);)
   auto x253 = (::risc0::Fp::fromRaw(efl_arg9_34_4) - ::risc0::Fp::fromRaw(efl_arg9_34_0));
   EF_W((ef_wst(efw, 6u, x253);), RkAcc x254 = rk_link_nf_k(x252, x253, 75u);)
-  auto x255 = RK_LD1(arg0, 5u);
+  auto x255 = RK_LD1M(arg0, 5u);
   auto x60 = ::risc0::Fp::fromRaw(efl_arg9_35_0);
   auto x256 = x255 - x60;
   const uint32_t efl_arg9_38_0 = EF_LDCR(arg9, 38u, 0u);
@@ -18603,7 +18655,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_9(uint32_t cycle, uint32_t steps, Fp* arg
   const uint32_t efl_arg9_39_0 = EF_LDCR(arg9, 39u, 0u);
   const uint32_t efl_arg9_40_0 = EF_LDCR(arg9, 40u, 0u);
   EF_W((ef_wst(efw, 7u, x256); ef_wblk(efw, efd_198, 0u, efq_198_0);), RkAcc x257 = rk_link_k(x254, x256, 76u);)
-  auto x258 = RK_LD1(arg0, 7u);
+  auto x258 = RK_LD1M(arg0, 7u);
   auto x61 = ::risc0::Fp::fromRaw(efl_arg9_36_0);
   auto x259 = x258 - x61;
   EF_W((const int efq_198_8 = ef_wq(efw, 77u); ef_wst(efw, 8u, x259);), RkAcc x260 = rk_link_nf_k(x257, x259, 77u);)
@@ -18712,12 +18764,12 @@ __device__ EF_NOINLINE FpExt rv32im_v2_9(uint32_t cycle, uint32_t steps, Fp* arg
   auto x86 = ::risc0::Fp::fromRaw(efl_arg9_63_0);
   auto x314 = x242 - x86;
   EF_W((ef_wst(efw, 11u, x314); ef_wblk(efw, efd_198, 4u, efq_198_28); ef_wblk(efw, efd_198, 8u, efq_198_32);), RkAcc x315 = rk_link_k(x313, x314, 104u);)
-  auto x316 = RK_LD4(arg2, 0u, 1u, 3u, 4u);
-  auto x317 = RK_LD4(arg2, 24u, 25u, 27u, 28u);
+  auto x316 = RK_LD4M(arg2, 0u, 1u, 3u, 4u);
+  auto x317 = RK_LD4M(arg2, 24u, 25u, 27u, 28u);
   auto x318 = x316 - x317;
   const uint32_t efl_arg9_73_0 = EF_LDCR(arg9, 73u, 0u);
   const uint32_t efl_arg9_72_0 = EF_LDCR(arg9, 72u, 0u);
-  RK_ST4(arg2, 0u, 1u, 3u, 4u, x318);
+  RK_ST4M(arg2, 0u, 1u, 3u, 4u, x318);
   EF_W((efs_198 = rk_link_k(efs_198, x318, 105u); FpExt x319 = ef_wfin(efw, efd_198, 0u, rk_fin(efs_198));), FpExt x319 = rk_fin(rk_link_k(x315, x318, 105u));)
   auto x87 = ::risc0::Fp::fromRaw(efl_arg9_21_0);
   RkW _cx320 = rk_cl0(arg3, x87 * x319, 3u); FpExt x320 = rkw_fin(_cx320);
@@ -19498,80 +19550,80 @@ __device__ EF_NOINLINE FpExt rv32im_v2_9(uint32_t cycle, uint32_t steps, Fp* arg
   auto x994 = x992 + x993;
   auto x995 = x916 * x31;
   auto x996 = x992 + x995;
-  RK_ST1(arg0, 5u, x996);
+  RK_ST1M(arg0, 5u, x996);
   auto x997 = x918 * x30;
   auto x998 = x992 + x997;
-  RK_ST1(arg0, 7u, x998);
+  RK_ST1M(arg0, 7u, x998);
   auto x999 = x920 * x29;
   auto x1000 = x992 + x999;
-  RK_ST1(arg0, 8u, x1000);
+  RK_ST1M(arg0, 8u, x1000);
   auto x1001 = x922 * x28;
   auto x1002 = x992 + x1001;
-  RK_ST1(arg0, 9u, x1002);
+  RK_ST1M(arg0, 9u, x1002);
   auto x1003 = x924 * x27;
   auto x1004 = x992 + x1003;
-  RK_ST1(arg0, 10u, x1004);
+  RK_ST1M(arg0, 10u, x1004);
   auto x1005 = x926 * x26;
   auto x1006 = x992 + x1005;
-  RK_ST1(arg0, 11u, x1006);
+  RK_ST1M(arg0, 11u, x1006);
   auto x1007 = x928 * x25;
   auto x1008 = x992 + x1007;
-  RK_ST1(arg0, 12u, x1008);
+  RK_ST1M(arg0, 12u, x1008);
   auto x1009 = x930 * x24;
   auto x1010 = x992 + x1009;
-  RK_ST1(arg0, 13u, x1010);
+  RK_ST1M(arg0, 13u, x1010);
   auto x1011 = x932 * x23;
   auto x1012 = x992 + x1011;
-  RK_ST1(arg0, 14u, x1012);
+  RK_ST1M(arg0, 14u, x1012);
   auto x1013 = x934 * x22;
   auto x1014 = x992 + x1013;
-  RK_ST1(arg0, 15u, x1014);
+  RK_ST1M(arg0, 15u, x1014);
   auto x1015 = x936 * x21;
   auto x1016 = x992 + x1015;
-  RK_ST1(arg0, 16u, x1016);
+  RK_ST1M(arg0, 16u, x1016);
   auto x1017 = x938 * x20;
   auto x1018 = x992 + x1017;
-  RK_ST1(arg0, 17u, x1018);
+  RK_ST1M(arg0, 17u, x1018);
   auto x1019 = x940 * x19;
   auto x1020 = x992 + x1019;
-  RK_ST1(arg0, 18u, x1020);
+  RK_ST1M(arg0, 18u, x1020);
   auto x1021 = x942 * x18;
   auto x1022 = x992 + x1021;
-  RK_ST1(arg0, 19u, x1022);
+  RK_ST1M(arg0, 19u, x1022);
   auto x1023 = x944 * x17;
   auto x1024 = x992 + x1023;
-  RK_ST1(arg0, 20u, x1024);
+  RK_ST1M(arg0, 20u, x1024);
   auto x1025 = x946 * x16;
   auto x1026 = x992 + x1025;
-  RK_ST1(arg0, 21u, x1026);
+  RK_ST1M(arg0, 21u, x1026);
   auto x1027 = x948 * x15;
   auto x1028 = x992 + x1027;
-  RK_ST1(arg0, 22u, x1028);
+  RK_ST1M(arg0, 22u, x1028);
   auto x1029 = x950 * x14;
   auto x1030 = x992 + x1029;
-  RK_ST1(arg0, 23u, x1030);
+  RK_ST1M(arg0, 23u, x1030);
   auto x1031 = x952 * x13;
   auto x1032 = x992 + x1031;
-  RK_ST1(arg0, 24u, x1032);
+  RK_ST1M(arg0, 24u, x1032);
   auto x1033 = x954 * x12;
   auto x1034 = x992 + x1033;
-  RK_ST1(arg0, 25u, x1034);
+  RK_ST1M(arg0, 25u, x1034);
   auto x1035 = x956 * x11;
   auto x1036 = x992 + x1035;
-  RK_ST1(arg0, 26u, x1036);
+  RK_ST1M(arg0, 26u, x1036);
   auto x1037 = x958 * x10;
   auto x1038 = x992 + x1037;
-  RK_ST1(arg0, 27u, x1038);
+  RK_ST1M(arg0, 27u, x1038);
   auto x1039 = x960 * x9;
   auto x1040 = x992 + x1039;
-  RK_ST1(arg0, 28u, x1040);
+  RK_ST1M(arg0, 28u, x1040);
   constexpr Fp x0(822033215);
   auto x1041 = x994 + x0;
-  RK_ST1(arg0, 29u, x1041);
+  RK_ST1M(arg0, 29u, x1041);
   auto x1042 = rv32im_v2_8(cycle, steps, arg0, x969.elems[0], x969.elems[1], x969.elems[2], x969.elems[3], x320.elems[0], x320.elems[1], x320.elems[2], x320.elems[3], arg5.elems[0], arg5.elems[1], arg5.elems[2], arg5.elems[3], arg6.elems[0], arg6.elems[1], arg6.elems[2], arg6.elems[3], arg4.elems[0], arg4.elems[1], arg4.elems[2], arg4.elems[3], arg7.elems[0], arg7.elems[1], arg7.elems[2], arg7.elems[3], arg8.elems[0], arg8.elems[1], arg8.elems[2], arg8.elems[3]);
   return x1042;
 }
-__device__ EF_NOINLINE FpExt rv32im_v2_5(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3, Fp arg7_e0, Fp arg7_e1, Fp arg7_e2, Fp arg7_e3, Fp arg8_e0, Fp arg8_e1, Fp arg8_e2, Fp arg8_e3) {
+__device__ EF_CHAIN FpExt rv32im_v2_5(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3, Fp arg7_e0, Fp arg7_e1, Fp arg7_e2, Fp arg7_e3, Fp arg8_e0, Fp arg8_e1, Fp arg8_e2, Fp arg8_e3) {
   FpExt* arg9 = reinterpret_cast<FpExt*>(arg0);
   Fp* arg10 = EF_GPTR(0);
   Fp* arg11 = EF_GPTR(1);
@@ -19585,7 +19637,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_5(uint32_t cycle, uint32_t steps, Fp* arg
   FpExt arg6(arg6_e0, arg6_e1, arg6_e2, arg6_e3);
   FpExt arg7(arg7_e0, arg7_e1, arg7_e2, arg7_e3);
   FpExt arg8(arg8_e0, arg8_e1, arg8_e2, arg8_e3);
-  size_t mask = steps - 1; const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = (uint32_t)cycle;
+  size_t mask = steps - 1; uint32_t rk_c_o = (uint32_t)cycle; EF_OPQ(rk_c_o, 16); const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = rk_c_o;
   const uint32_t efl_arg10_58_4 = EF_LDCR(arg10, 58u, 4u);
   const uint32_t efl_arg10_58_8 = EF_LDCR(arg10, 58u, 8u);
   const uint32_t efl_arg10_58_12 = EF_LDCR(arg10, 58u, 12u);
@@ -19593,7 +19645,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_5(uint32_t cycle, uint32_t steps, Fp* arg
   const uint32_t efl_arg10_59_8 = EF_LDCR(arg10, 59u, 8u);
   const uint32_t efl_arg10_59_12 = EF_LDCR(arg10, 59u, 12u);
   auto x204 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg10_58_4));
-  auto x207 = RK_LD1(arg0, 78u);
+  auto x207 = RK_LD1M(arg0, 78u);
   auto x209 = (::risc0::Fp::fromRaw(efl_arg10_58_4) * ::risc0::Fp::fromRaw(efl_arg10_58_8));
   auto x21 = ::risc0::Fp::fromRaw(efl_arg10_58_8);
   auto x2002391 = x204 * x21;
@@ -19752,61 +19804,61 @@ __device__ EF_NOINLINE FpExt rv32im_v2_5(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
-  auto x329 = RK_LD1(arg0, 57u);
-  auto x331 = RK_LD1(arg0, 58u);
-  auto x333 = RK_LD1(arg0, 59u);
-  auto x335 = RK_LD1(arg0, 60u);
-  auto x337 = RK_LD1(arg0, 61u);
-  auto x339 = RK_LD1(arg0, 62u);
-  auto x341 = RK_LD1(arg0, 63u);
-  auto x343 = RK_LD1(arg0, 64u);
-  auto x345 = RK_LD1(arg0, 65u);
-  auto x347 = RK_LD1(arg0, 66u);
-  auto x349 = RK_LD1(arg0, 67u);
-  auto x351 = RK_LD1(arg0, 68u);
-  auto x353 = RK_LD1(arg0, 69u);
-  auto x355 = RK_LD1(arg0, 70u);
-  auto x357 = RK_LD1(arg0, 71u);
-  auto x359 = RK_LD1(arg0, 56u);
-  auto x375 = RK_LD1(arg0, 73u);
-  auto x377 = RK_LD1(arg0, 74u);
-  auto x379 = RK_LD1(arg0, 75u);
-  auto x381 = RK_LD1(arg0, 76u);
-  auto x383 = RK_LD1(arg0, 77u);
-  auto x395 = RK_LD1(arg0, 72u);
-  auto x411 = RK_LD1(arg0, 25u);
-  auto x413 = RK_LD1(arg0, 26u);
-  auto x415 = RK_LD1(arg0, 27u);
-  auto x417 = RK_LD1(arg0, 28u);
-  auto x419 = RK_LD1(arg0, 29u);
-  auto x421 = RK_LD1(arg0, 30u);
-  auto x423 = RK_LD1(arg0, 31u);
-  auto x425 = RK_LD1(arg0, 32u);
-  auto x427 = RK_LD1(arg0, 33u);
-  auto x429 = RK_LD1(arg0, 34u);
-  auto x431 = RK_LD1(arg0, 35u);
-  auto x433 = RK_LD1(arg0, 36u);
-  auto x435 = RK_LD1(arg0, 37u);
-  auto x437 = RK_LD1(arg0, 38u);
-  auto x439 = RK_LD1(arg0, 39u);
-  auto x441 = RK_LD1(arg0, 24u);
-  auto x457 = RK_LD1(arg0, 41u);
-  auto x459 = RK_LD1(arg0, 42u);
-  auto x461 = RK_LD1(arg0, 43u);
-  auto x463 = RK_LD1(arg0, 44u);
-  auto x465 = RK_LD1(arg0, 45u);
-  auto x467 = RK_LD1(arg0, 46u);
-  auto x469 = RK_LD1(arg0, 47u);
-  auto x471 = RK_LD1(arg0, 20u);
-  auto x473 = RK_LD1(arg0, 48u);
-  auto x475 = RK_LD1(arg0, 21u);
-  auto x477 = RK_LD1(arg0, 49u);
-  auto x479 = RK_LD1(arg0, 22u);
-  auto x481 = RK_LD1(arg0, 50u);
-  auto x483 = RK_LD1(arg0, 23u);
-  auto x485 = RK_LD1(arg0, 51u);
-  auto x487 = RK_LD1(arg0, 40u);
-  auto x505 = RK_LD1(arg0, 54u);
+  auto x329 = RK_LD1M(arg0, 57u);
+  auto x331 = RK_LD1M(arg0, 58u);
+  auto x333 = RK_LD1M(arg0, 59u);
+  auto x335 = RK_LD1M(arg0, 60u);
+  auto x337 = RK_LD1M(arg0, 61u);
+  auto x339 = RK_LD1M(arg0, 62u);
+  auto x341 = RK_LD1M(arg0, 63u);
+  auto x343 = RK_LD1M(arg0, 64u);
+  auto x345 = RK_LD1M(arg0, 65u);
+  auto x347 = RK_LD1M(arg0, 66u);
+  auto x349 = RK_LD1M(arg0, 67u);
+  auto x351 = RK_LD1M(arg0, 68u);
+  auto x353 = RK_LD1M(arg0, 69u);
+  auto x355 = RK_LD1M(arg0, 70u);
+  auto x357 = RK_LD1M(arg0, 71u);
+  auto x359 = RK_LD1M(arg0, 56u);
+  auto x375 = RK_LD1M(arg0, 73u);
+  auto x377 = RK_LD1M(arg0, 74u);
+  auto x379 = RK_LD1M(arg0, 75u);
+  auto x381 = RK_LD1M(arg0, 76u);
+  auto x383 = RK_LD1M(arg0, 77u);
+  auto x395 = RK_LD1M(arg0, 72u);
+  auto x411 = RK_LD1M(arg0, 25u);
+  auto x413 = RK_LD1M(arg0, 26u);
+  auto x415 = RK_LD1M(arg0, 27u);
+  auto x417 = RK_LD1M(arg0, 28u);
+  auto x419 = RK_LD1M(arg0, 29u);
+  auto x421 = RK_LD1M(arg0, 30u);
+  auto x423 = RK_LD1M(arg0, 31u);
+  auto x425 = RK_LD1M(arg0, 32u);
+  auto x427 = RK_LD1M(arg0, 33u);
+  auto x429 = RK_LD1M(arg0, 34u);
+  auto x431 = RK_LD1M(arg0, 35u);
+  auto x433 = RK_LD1M(arg0, 36u);
+  auto x435 = RK_LD1M(arg0, 37u);
+  auto x437 = RK_LD1M(arg0, 38u);
+  auto x439 = RK_LD1M(arg0, 39u);
+  auto x441 = RK_LD1M(arg0, 24u);
+  auto x457 = RK_LD1M(arg0, 41u);
+  auto x459 = RK_LD1M(arg0, 42u);
+  auto x461 = RK_LD1M(arg0, 43u);
+  auto x463 = RK_LD1M(arg0, 44u);
+  auto x465 = RK_LD1M(arg0, 45u);
+  auto x467 = RK_LD1M(arg0, 46u);
+  auto x469 = RK_LD1M(arg0, 47u);
+  auto x471 = RK_LD1M(arg0, 20u);
+  auto x473 = RK_LD1M(arg0, 48u);
+  auto x475 = RK_LD1M(arg0, 21u);
+  auto x477 = RK_LD1M(arg0, 49u);
+  auto x479 = RK_LD1M(arg0, 22u);
+  auto x481 = RK_LD1M(arg0, 50u);
+  auto x483 = RK_LD1M(arg0, 23u);
+  auto x485 = RK_LD1M(arg0, 51u);
+  auto x487 = RK_LD1M(arg0, 40u);
+  auto x505 = RK_LD1M(arg0, 54u);
   auto x2002458 = ef_ladd(x357, x439);
   constexpr Fp x5(32768);
   // lincombF: fused into a lazy Fp linear combination
@@ -19869,8 +19921,8 @@ __device__ EF_NOINLINE FpExt rv32im_v2_5(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002504 = rkw1_ff0(x2002458, x5, false); rkw1_ff(_wx2002504, x2002460, x6, false); rkw1_ff(_wx2002504, x2002462, x7, false); rkw1_ff(_wx2002504, x2002464, x8, false); rkw1_ff(_wx2002504, x2002466, x9, false); rkw1_ff(_wx2002504, x2002468, x10, false); rkw1_ff(_wx2002504, x2002470, x11, false); rkw1_ff(_wx2002504, x2002472, x12, false); rkw1_ff(_wx2002504, x2002474, x13, false); rkw1_ff(_wx2002504, x2002476, x14, false); rkw1_ff(_wx2002504, x2002478, x15, false); rkw1_ff(_wx2002504, x2002480, x16, false); rkw1_ff(_wx2002504, x2002482, x17, false); rkw1_ff(_wx2002504, x2002484, x18, false); rkw1_ff(_wx2002504, x2002486, x19, false); rkw1_v(_wx2002504, x505, false); rkw1_v(_wx2002504, x359, false); rkw1_v(_wx2002504, x441, false); auto x2002504 = rkw1_fin(_wx2002504);
-  RK_ST1(arg0, 20u, x2002504);
-  auto x507 = RK_LD1(arg0, 55u);
+  RK_ST1M(arg0, 20u, x2002504);
+  auto x507 = RK_LD1M(arg0, 55u);
   const uint32_t efl_arg10_37_16 = EF_LDCR(arg10, 37u, 16u);
   const uint32_t efl_arg10_38_16 = EF_LDCR(arg10, 38u, 16u);
   const uint32_t efl_arg10_39_16 = EF_LDCR(arg10, 39u, 16u);
@@ -19923,7 +19975,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_5(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002551 = rkw1_ff0(x2002505, x5, false); rkw1_ff(_wx2002551, x2002507, x6, false); rkw1_ff(_wx2002551, x2002509, x7, false); rkw1_ff(_wx2002551, x2002511, x8, false); rkw1_ff(_wx2002551, x2002513, x9, false); rkw1_ff(_wx2002551, x2002515, x10, false); rkw1_ff(_wx2002551, x2002517, x11, false); rkw1_ff(_wx2002551, x2002519, x12, false); rkw1_ff(_wx2002551, x2002521, x13, false); rkw1_ff(_wx2002551, x2002523, x14, false); rkw1_ff(_wx2002551, x2002525, x15, false); rkw1_ff(_wx2002551, x2002527, x16, false); rkw1_ff(_wx2002551, x2002529, x17, false); rkw1_ff(_wx2002551, x2002531, x18, false); rkw1_ff(_wx2002551, x2002533, x19, false); rkw1_v(_wx2002551, x507, false); rkw1_v(_wx2002551, x395, false); rkw1_v(_wx2002551, x487, false); auto x2002551 = rkw1_fin(_wx2002551);
-  RK_ST1(arg0, 21u, x2002551);
+  RK_ST1M(arg0, 21u, x2002551);
   const uint32_t efl_arg10_42_16 = EF_LDCR(arg10, 42u, 16u);
   const uint32_t efl_arg10_43_16 = EF_LDCR(arg10, 43u, 16u);
   const uint32_t efl_arg10_44_16 = EF_LDCR(arg10, 44u, 16u);
@@ -19986,7 +20038,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_5(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx538 = rkw1_ff0(x50, x19, false); rkw1_v(_wx538, x65, false); rkw1_ff(_wx538, x51, x18, false); rkw1_ff(_wx538, x52, x17, false); rkw1_ff(_wx538, x53, x16, false); rkw1_ff(_wx538, x54, x15, false); rkw1_ff(_wx538, x55, x14, false); rkw1_ff(_wx538, x56, x13, false); rkw1_ff(_wx538, x57, x12, false); rkw1_ff(_wx538, x58, x11, false); rkw1_ff(_wx538, x59, x10, false); rkw1_ff(_wx538, x60, x9, false); rkw1_ff(_wx538, x61, x8, false); rkw1_ff(_wx538, x62, x7, false); rkw1_ff(_wx538, x63, x6, false); rkw1_ff(_wx538, x64, x5, false); auto x538 = rkw1_fin(_wx538);
-  RK_ST1(arg0, 22u, x538);
+  RK_ST1M(arg0, 22u, x538);
   const uint32_t efl_arg10_58_16 = EF_LDCR(arg10, 58u, 16u);
   const uint32_t efl_arg10_59_16 = EF_LDCR(arg10, 59u, 16u);
   const uint32_t efl_arg10_60_16 = EF_LDCR(arg10, 60u, 16u);
@@ -20047,11 +20099,11 @@ __device__ EF_NOINLINE FpExt rv32im_v2_5(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx568 = rkw1_ff0(x66, x19, false); rkw1_v(_wx568, x81, false); rkw1_ff(_wx568, x67, x18, false); rkw1_ff(_wx568, x68, x17, false); rkw1_ff(_wx568, x69, x16, false); rkw1_ff(_wx568, x70, x15, false); rkw1_ff(_wx568, x71, x14, false); rkw1_ff(_wx568, x72, x13, false); rkw1_ff(_wx568, x73, x12, false); rkw1_ff(_wx568, x74, x11, false); rkw1_ff(_wx568, x75, x10, false); rkw1_ff(_wx568, x76, x9, false); rkw1_ff(_wx568, x77, x8, false); rkw1_ff(_wx568, x78, x7, false); rkw1_ff(_wx568, x79, x6, false); rkw1_ff(_wx568, x80, x5, false); auto x568 = rkw1_fin(_wx568);
-  RK_ST1(arg0, 23u, x568);
+  RK_ST1M(arg0, 23u, x568);
   auto x569 = x505 + x538;
-  RK_ST1(arg0, 24u, x569);
+  RK_ST1M(arg0, 24u, x569);
   auto x570 = x507 + x568;
-  RK_ST1(arg0, 25u, x570);
+  RK_ST1M(arg0, 25u, x570);
   auto x571 = (::risc0::Fp::fromRaw(efl_arg10_193_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg10_193_0)));
   EF_W((ef_v4i efd_200[4] = {}; FpExt efb_200 = arg1; const int efq_200_0 = ef_wq(efw, 56u); ef_wst(efw, 0u, x571);), RkAcc x572 = rk_link_nf_k(arg1, x571, 56u);)
   auto x573 = (::risc0::Fp::fromRaw(efl_arg10_194_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg10_194_0)));
@@ -20067,11 +20119,11 @@ __device__ EF_NOINLINE FpExt rv32im_v2_5(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   auto x84 = ::risc0::Fp::fromRaw(efl_arg10_193_0);
   RkW1 _wx580 = rkw1_ff0(x82, x18, false); rkw1_ff(_wx580, x83, x19, false); rkw1_v(_wx580, x84, false); auto x580 = rkw1_fin(_wx580);
-  RK_ST1(arg0, 26u, x580);
+  RK_ST1M(arg0, 26u, x580);
   constexpr Fp x4(65536);
   const uint32_t efl_arg10_198_0 = EF_LDCR(arg10, 198u, 0u);
   auto x581 = x580 * x4;
-  RK_ST1(arg0, 27u, x581);
+  RK_ST1M(arg0, 27u, x581);
   auto x582 = x2002504 - x581;
   auto x583 = x2002551 + x580;
   auto x584 = (::risc0::Fp::fromRaw(efl_arg10_196_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg10_196_0)));
@@ -20091,9 +20143,9 @@ __device__ EF_NOINLINE FpExt rv32im_v2_5(uint32_t cycle, uint32_t steps, Fp* arg
   const uint32_t efl_arg10_41_0 = EF_LDCR(arg10, 41u, 0u);
   RkW1 _wx593 = rkw1_ff0(x85, x18, false); rkw1_ff(_wx593, x86, x19, false); rkw1_v(_wx593, x87, false); auto x593 = rkw1_fin(_wx593);
   auto x594 = x593 * x4;
-  RK_ST1(arg0, 28u, x594);
+  RK_ST1M(arg0, 28u, x594);
   auto x595 = x583 - x594;
-  auto x596 = RK_LD1(arg0, 9u);
+  auto x596 = RK_LD1M(arg0, 9u);
   EF_W((ef_wst(efw, 6u, x596);), RkAcc x597 = rk_link_nf_k(x589, x596, 62u);)
   auto x598 = (::risc0::Fp::fromRaw(efl_arg10_37_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg10_37_0)));
   EF_W((ef_wst(efw, 7u, x598); ef_wblk(efw, efd_200, 0u, efq_200_0);), RkAcc x599 = rk_link_k(x597, x598, 63u);)
@@ -20101,9 +20153,9 @@ __device__ EF_NOINLINE FpExt rv32im_v2_5(uint32_t cycle, uint32_t steps, Fp* arg
   const uint32_t efl_arg10_43_0 = EF_LDCR(arg10, 43u, 0u);
   const uint32_t efl_arg10_44_0 = EF_LDCR(arg10, 44u, 0u);
   const uint32_t efl_arg10_45_0 = EF_LDCR(arg10, 45u, 0u);
-  auto x600 = RK_LD1(arg0, 10u);
+  auto x600 = RK_LD1M(arg0, 10u);
   EF_W((const int efq_200_8 = ef_wq(efw, 64u); ef_wst(efw, 8u, x600);), RkAcc x601 = rk_link_nf_k(x599, x600, 64u);)
-  auto x602 = RK_LD1(arg0, 11u);
+  auto x602 = RK_LD1M(arg0, 11u);
   EF_W((ef_wst(efw, 9u, x602);), RkAcc x603 = rk_link_k(x601, x602, 65u);)
   auto x604 = (::risc0::Fp::fromRaw(efl_arg10_40_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg10_40_0)));
   EF_W((ef_wst(efw, 10u, x604);), RkAcc x605 = rk_link_nf_k(x603, x604, 66u);)
@@ -20197,7 +20249,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_5(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   auto x94 = ::risc0::Fp::fromRaw(efl_arg10_51_0);
   // lincombF: fused into a lazy Fp linear combination
-  auto x667 = RK_LD1(arg0, 7u);
+  auto x667 = RK_LD1M(arg0, 7u);
   auto x668 = (::risc0::Fp::fromRaw(efl_arg10_44_0) * Fp(256u));
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
@@ -20207,7 +20259,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_5(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx676 = rkw1_ff0(x88, x11, false); rkw1_v(_wx676, x667, false); rkw1_v(_wx676, x668, false); rkw1_ff(_wx676, x89, x10, false); rkw1_ff(_wx676, x90, x9, false); rkw1_ff(_wx676, x91, x8, false); rkw1_ff(_wx676, x92, x7, false); rkw1_ff(_wx676, x93, x6, false); rkw1_ff(_wx676, x94, x5, false); auto x676 = rkw1_fin(_wx676);
-  RK_ST1(arg0, 7u, x676);
+  RK_ST1M(arg0, 7u, x676);
   const uint32_t efl_arg10_199_0 = EF_LDCR(arg10, 199u, 0u);
   const uint32_t efl_arg10_200_0 = EF_LDCR(arg10, 200u, 0u);
   const uint32_t efl_arg10_201_0 = EF_LDCR(arg10, 201u, 0u);
@@ -20227,7 +20279,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_5(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   auto x102 = ::risc0::Fp::fromRaw(efl_arg10_67_0);
   // lincombF: fused into a lazy Fp linear combination
-  auto x685 = RK_LD1(arg0, 8u);
+  auto x685 = RK_LD1M(arg0, 8u);
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
@@ -20236,7 +20288,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_5(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx693 = rkw1_ff0(x95, x12, false); rkw1_v(_wx693, x685, false); rkw1_ff(_wx693, x96, x11, false); rkw1_ff(_wx693, x97, x10, false); rkw1_ff(_wx693, x98, x9, false); rkw1_ff(_wx693, x99, x8, false); rkw1_ff(_wx693, x100, x7, false); rkw1_ff(_wx693, x101, x6, false); rkw1_ff(_wx693, x102, x5, false); auto x693 = rkw1_fin(_wx693);
-  RK_ST1(arg0, 8u, x693);
+  RK_ST1M(arg0, 8u, x693);
   auto x694 = x676 - x582;
   EF_W((ef_wst(efw, 14u, x694);), RkAcc x695 = rk_link_nf_k(x659, x694, 94u);)
   auto x696 = x693 - x595;
@@ -20255,10 +20307,10 @@ __device__ EF_NOINLINE FpExt rv32im_v2_5(uint32_t cycle, uint32_t steps, Fp* arg
   auto x706 = x704 + x705;
   auto x104 = ::risc0::Fp::fromRaw(efl_arg10_199_0);
   auto x707 = x706 + x104;
-  RK_ST1(arg0, 29u, x707);
+  RK_ST1M(arg0, 29u, x707);
   const uint32_t efl_arg10_204_0 = EF_LDCR(arg10, 204u, 0u);
   auto x708 = x707 * x4;
-  RK_ST1(arg0, 30u, x708);
+  RK_ST1M(arg0, 30u, x708);
   auto x709 = x569 - x708;
   auto x710 = x570 + x707;
   auto x711 = (::risc0::Fp::fromRaw(efl_arg10_202_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg10_202_0)));
@@ -20281,7 +20333,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_5(uint32_t cycle, uint32_t steps, Fp* arg
   const uint32_t efl_arg10_73_0 = EF_LDCR(arg10, 73u, 0u);
   RkW1 _wx720 = rkw1_ff0(x105, x18, false); rkw1_ff(_wx720, x106, x19, false); rkw1_v(_wx720, x107, false); auto x720 = rkw1_fin(_wx720);
   auto x721 = x720 * x4;
-  RK_ST1(arg0, 31u, x721);
+  RK_ST1M(arg0, 31u, x721);
   auto x722 = x710 - x721;
   auto x723 = (::risc0::Fp::fromRaw(efl_arg10_68_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg10_68_0)));
   EF_W((ef_wst(efw, 22u, x723);), RkAcc x724 = rk_link_nf_k(x716, x723, 102u);)
@@ -20387,7 +20439,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_5(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   auto x114 = ::risc0::Fp::fromRaw(efl_arg10_83_0);
   // lincombF: fused into a lazy Fp linear combination
-  auto x794 = RK_LD1(arg0, 14u);
+  auto x794 = RK_LD1M(arg0, 14u);
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
@@ -20397,7 +20449,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_5(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx803 = rkw1_ff0(x108, x12, false); rkw1_v(_wx803, x794, false); rkw1_ff(_wx803, x109, x11, false); rkw1_ff(_wx803, x110, x10, false); rkw1_ff(_wx803, x111, x9, false); rkw1_v(_wx803, x799, false); rkw1_ff(_wx803, x112, x7, false); rkw1_ff(_wx803, x113, x6, false); rkw1_ff(_wx803, x114, x5, false); auto x803 = rkw1_fin(_wx803);
-  RK_ST1(arg0, 14u, x803);
+  RK_ST1M(arg0, 14u, x803);
   const uint32_t efl_arg10_191_0 = EF_LDCR(arg10, 191u, 0u);
   auto x115 = ::risc0::Fp::fromRaw(efl_arg10_92_0);
   // lincombF: fused into a lazy Fp linear combination
@@ -20415,7 +20467,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_5(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   auto x122 = ::risc0::Fp::fromRaw(efl_arg10_99_0);
   // lincombF: fused into a lazy Fp linear combination
-  auto x812 = RK_LD1(arg0, 15u);
+  auto x812 = RK_LD1M(arg0, 15u);
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
@@ -20424,7 +20476,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_5(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx820 = rkw1_ff0(x115, x12, false); rkw1_v(_wx820, x812, false); rkw1_ff(_wx820, x116, x11, false); rkw1_ff(_wx820, x117, x10, false); rkw1_ff(_wx820, x118, x9, false); rkw1_ff(_wx820, x119, x8, false); rkw1_ff(_wx820, x120, x7, false); rkw1_ff(_wx820, x121, x6, false); rkw1_ff(_wx820, x122, x5, false); auto x820 = rkw1_fin(_wx820);
-  RK_ST1(arg0, 15u, x820);
+  RK_ST1M(arg0, 15u, x820);
   auto x821 = x803 - x709;
   const uint32_t efl_arg10_29_4 = EF_LDCR(arg10, 29u, 4u);
   const uint32_t efl_arg10_29_0 = EF_LDCR(arg10, 29u, 0u);
@@ -20456,13 +20508,13 @@ __device__ EF_NOINLINE FpExt rv32im_v2_5(uint32_t cycle, uint32_t steps, Fp* arg
   const uint32_t efl_arg10_150_0 = EF_LDCR(arg10, 150u, 0u);
   const uint32_t efl_arg10_155_0 = EF_LDCR(arg10, 155u, 0u);
   auto x834 = x833 - x124;
-  RK_ST1(arg0, 32u, x834);
+  RK_ST1M(arg0, 32u, x834);
   EF_W((ef_wst(efw, 10u, x834);), RkAcc x835 = rk_link_nf_k(x832, x834, 138u);)
   auto x836 = (::risc0::Fp::fromRaw(efl_arg10_32_4) - ::risc0::Fp::fromRaw(efl_arg10_32_0));
   EF_W((ef_wst(efw, 11u, x836); ef_wblk(efw, efd_200, 4u, efq_200_76);), RkAcc x837 = rk_link_k(x835, x836, 139u);)
   auto x838 = (::risc0::Fp::fromRaw(efl_arg10_33_4) - ::risc0::Fp::fromRaw(efl_arg10_33_0));
   EF_W((const int efq_200_84 = ef_wq(efw, 140u); ef_wst(efw, 12u, x838);), RkAcc x839 = rk_link_nf_k(x837, x838, 140u);)
-  auto x840 = RK_LD1(arg0, 5u);
+  auto x840 = RK_LD1M(arg0, 5u);
   const uint32_t efl_arg10_159_0 = EF_LDCR(arg10, 159u, 0u);
   const uint32_t efl_arg10_164_0 = EF_LDCR(arg10, 164u, 0u);
   const uint32_t efl_arg10_168_0 = EF_LDCR(arg10, 168u, 0u);
@@ -20524,7 +20576,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_5(uint32_t cycle, uint32_t steps, Fp* arg
   const uint32_t efl_arg10_118_60 = EF_LDCR(arg10, 118u, 60u);
   auto x866 = (::risc0::Fp::fromRaw(efl_arg10_137_0) - Fp(1u));
   EF_W((const int efq_201_4 = ef_wq4(efw, 5u, 6u, 8u, 9u, 4u); ef_wst(efw, 4u, x866);), RkAcc x867 = rk_link_nf_k(x865, x866, 5u);)
-  auto x868 = RK_LD1(arg0, 0u);
+  auto x868 = RK_LD1M(arg0, 0u);
   EF_W((ef_wst(efw, 5u, x868);), RkAcc x869 = rk_link_k(x867, x868, 6u);)
   auto x139 = ::risc0::Fp::fromRaw(efl_arg10_133_0);
   auto x871 = x139 - x863;
@@ -20538,7 +20590,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_5(uint32_t cycle, uint32_t steps, Fp* arg
   EF_W((const int efq_201_8 = ef_wq4(efw, 10u, 11u, 12u, 10u, 3u); ef_wst(efw, 8u, x875);), RkAcc x876 = rk_link_nf_k(x874, x875, 10u);)
   auto x877 = (::risc0::Fp::fromRaw(efl_arg10_177_0) - Fp(1u));
   EF_W((ef_wst(efw, 9u, x877);), RkAcc x878 = rk_link_k(x876, x877, 11u);)
-  auto x879 = RK_LD1(arg0, 1u);
+  auto x879 = RK_LD1M(arg0, 1u);
   EF_W((ef_wst(efw, 10u, x879); ef_wblk(efw, efd_201, 4u, efq_201_4); ef_wblk(efw, efd_201, 8u, efq_201_8); FpExt x880 = ef_wfin(efw, efd_201, 0u, arg3);), FpExt x880 = rk_fin(rk_link_k(x878, x879, 12u));)
   auto x140 = ::risc0::Fp::fromRaw(efl_arg10_118_60);
   const uint32_t efl_arg10_120_60 = EF_LDCR(arg10, 120u, 60u);
@@ -20719,124 +20771,124 @@ __device__ EF_NOINLINE FpExt rv32im_v2_5(uint32_t cycle, uint32_t steps, Fp* arg
   auto x997 = x149 + x884;
   auto x998 = x966 * x884;
   auto x999 = x997 - x998;
-  RK_ST1(arg0, 0u, x999);
+  RK_ST1M(arg0, 0u, x999);
   auto x1000 = x151 + x888;
   auto x1001 = x970 * x888;
   auto x1002 = x1000 - x1001;
-  RK_ST1(arg0, 33u, x1002);
+  RK_ST1M(arg0, 33u, x1002);
   auto x1003 = x153 + x892;
   auto x1004 = x974 * x892;
   auto x1005 = x1003 - x1004;
-  RK_ST1(arg0, 34u, x1005);
+  RK_ST1M(arg0, 34u, x1005);
   auto x1006 = x155 + x896;
   auto x1007 = x978 * x896;
   auto x1008 = x1006 - x1007;
-  RK_ST1(arg0, 35u, x1008);
+  RK_ST1M(arg0, 35u, x1008);
   auto x1009 = x157 + x900;
   auto x1010 = x982 * x900;
   auto x1011 = x1009 - x1010;
-  RK_ST1(arg0, 36u, x1011);
+  RK_ST1M(arg0, 36u, x1011);
   auto x1012 = x159 + x904;
   auto x1013 = x986 * x904;
   auto x1014 = x1012 - x1013;
-  RK_ST1(arg0, 37u, x1014);
+  RK_ST1M(arg0, 37u, x1014);
   auto x1015 = x161 + x908;
   auto x1016 = x990 * x908;
   auto x1017 = x1015 - x1016;
-  RK_ST1(arg0, 38u, x1017);
+  RK_ST1M(arg0, 38u, x1017);
   auto x1018 = x163 + x912;
   auto x1019 = x994 * x912;
   auto x1020 = x1018 - x1019;
-  RK_ST1(arg0, 39u, x1020);
+  RK_ST1M(arg0, 39u, x1020);
   auto x1021 = x165 + x916;
   auto x1022 = ef_lmul(x165, x19);
   auto x1023 = x1022 * x916;
   auto x1024 = x1021 - x1023;
-  RK_ST1(arg0, 40u, x1024);
+  RK_ST1M(arg0, 40u, x1024);
   auto x1025 = x167 + x920;
   auto x1026 = ef_lmul(x167, x19);
   auto x1027 = x1026 * x920;
   auto x1028 = x1025 - x1027;
-  RK_ST1(arg0, 41u, x1028);
+  RK_ST1M(arg0, 41u, x1028);
   auto x1029 = x169 + x924;
   auto x1030 = ef_lmul(x169, x19);
   auto x1031 = x1030 * x924;
   auto x1032 = x1029 - x1031;
-  RK_ST1(arg0, 42u, x1032);
+  RK_ST1M(arg0, 42u, x1032);
   auto x1033 = x140 + x928;
   auto x1034 = x882 * x928;
   auto x1035 = x1033 - x1034;
-  RK_ST1(arg0, 43u, x1035);
+  RK_ST1M(arg0, 43u, x1035);
   auto x1036 = x142 + x932;
   auto x1037 = x886 * x932;
   auto x1038 = x1036 - x1037;
-  RK_ST1(arg0, 44u, x1038);
+  RK_ST1M(arg0, 44u, x1038);
   auto x1039 = x144 + x936;
   auto x1040 = x890 * x936;
   auto x1041 = x1039 - x1040;
-  RK_ST1(arg0, 45u, x1041);
+  RK_ST1M(arg0, 45u, x1041);
   auto x1042 = x146 + x940;
   auto x1043 = x894 * x940;
   auto x1044 = x1042 - x1043;
-  RK_ST1(arg0, 46u, x1044);
+  RK_ST1M(arg0, 46u, x1044);
   auto x1045 = x148 + x944;
   auto x1046 = x898 * x944;
   auto x1047 = x1045 - x1046;
-  RK_ST1(arg0, 47u, x1047);
+  RK_ST1M(arg0, 47u, x1047);
   auto x1048 = x150 + x948;
   auto x1049 = x902 * x948;
   auto x1050 = x1048 - x1049;
-  RK_ST1(arg0, 48u, x1050);
+  RK_ST1M(arg0, 48u, x1050);
   auto x1051 = x152 + x952;
   auto x1052 = x906 * x952;
   auto x1053 = x1051 - x1052;
-  RK_ST1(arg0, 49u, x1053);
+  RK_ST1M(arg0, 49u, x1053);
   auto x1054 = x154 + x956;
   auto x1055 = x910 * x956;
   auto x1056 = x1054 - x1055;
-  RK_ST1(arg0, 50u, x1056);
+  RK_ST1M(arg0, 50u, x1056);
   auto x1057 = x156 + x960;
   auto x1058 = x914 * x960;
   auto x1059 = x1057 - x1058;
-  RK_ST1(arg0, 51u, x1059);
+  RK_ST1M(arg0, 51u, x1059);
   auto x1060 = x158 + x964;
   auto x1061 = x918 * x964;
   auto x1062 = x1060 - x1061;
-  RK_ST1(arg0, 54u, x1062);
+  RK_ST1M(arg0, 54u, x1062);
   auto x1063 = x160 + x968;
   auto x1064 = x922 * x968;
   auto x1065 = x1063 - x1064;
-  RK_ST1(arg0, 55u, x1065);
+  RK_ST1M(arg0, 55u, x1065);
   auto x1066 = x162 + x972;
   auto x1067 = x926 * x972;
   auto x1068 = x1066 - x1067;
-  RK_ST1(arg0, 56u, x1068);
+  RK_ST1M(arg0, 56u, x1068);
   auto x1069 = x164 + x976;
   auto x1070 = x930 * x976;
   auto x1071 = x1069 - x1070;
-  RK_ST1(arg0, 57u, x1071);
+  RK_ST1M(arg0, 57u, x1071);
   auto x1072 = x166 + x980;
   auto x1073 = x934 * x980;
   auto x1074 = x1072 - x1073;
-  RK_ST1(arg0, 58u, x1074);
+  RK_ST1M(arg0, 58u, x1074);
   auto x1075 = x168 + x984;
   auto x1076 = x938 * x984;
   auto x1077 = x1075 - x1076;
-  RK_ST1(arg0, 59u, x1077);
+  RK_ST1M(arg0, 59u, x1077);
   auto x1078 = x170 + x988;
   auto x1079 = x942 * x988;
   auto x1080 = x1078 - x1079;
-  RK_ST1(arg0, 60u, x1080);
+  RK_ST1M(arg0, 60u, x1080);
   auto x1081 = x171 + x992;
   auto x1082 = x946 * x992;
   auto x1083 = x1081 - x1082;
-  RK_ST1(arg0, 61u, x1083);
+  RK_ST1M(arg0, 61u, x1083);
   auto x1084 = x141 + x996;
   auto x1085 = x950 * x996;
   const uint32_t efl_arg10_119_8 = EF_LDCR(arg10, 119u, 8u);
   const uint32_t efl_arg10_110_8 = EF_LDCR(arg10, 110u, 8u);
   auto x1086 = x1084 - x1085;
-  RK_ST1(arg0, 62u, x1086);
+  RK_ST1M(arg0, 62u, x1086);
   auto x1087 = x143 + x165;
   auto x1088 = x954 * x165;
   auto x1089 = x1087 - x1088;
@@ -20998,93 +21050,93 @@ __device__ EF_NOINLINE FpExt rv32im_v2_5(uint32_t cycle, uint32_t steps, Fp* arg
   auto x1185 = ef_lmul(x187, x19);
   auto x1186 = x1185 * x1099;
   auto x1187 = x1184 - x1186;
-  RK_ST1(arg0, 63u, x1187);
+  RK_ST1M(arg0, 63u, x1187);
   auto x1188 = x189 + x1103;
   auto x1189 = ef_lmul(x189, x19);
   auto x1190 = x1189 * x1103;
   auto x1191 = x1188 - x1190;
-  RK_ST1(arg0, 64u, x1191);
+  RK_ST1M(arg0, 64u, x1191);
   auto x1192 = x172 + x1107;
   auto x1193 = x1097 * x1107;
   auto x1194 = x1192 - x1193;
-  RK_ST1(arg0, 65u, x1194);
+  RK_ST1M(arg0, 65u, x1194);
   auto x1195 = x174 + x1111;
   auto x1196 = x1101 * x1111;
   auto x1197 = x1195 - x1196;
-  RK_ST1(arg0, 66u, x1197);
+  RK_ST1M(arg0, 66u, x1197);
   auto x1198 = x176 + x1115;
   auto x1199 = x1105 * x1115;
   auto x1200 = x1198 - x1199;
-  RK_ST1(arg0, 67u, x1200);
+  RK_ST1M(arg0, 67u, x1200);
   auto x1201 = x178 + x1119;
   auto x1202 = x1109 * x1119;
   auto x1203 = x1201 - x1202;
-  RK_ST1(arg0, 68u, x1203);
+  RK_ST1M(arg0, 68u, x1203);
   auto x1204 = x180 + x1123;
   auto x1205 = x1113 * x1123;
   auto x1206 = x1204 - x1205;
-  RK_ST1(arg0, 69u, x1206);
+  RK_ST1M(arg0, 69u, x1206);
   auto x1207 = x182 + x1127;
   auto x1208 = x1117 * x1127;
   auto x1209 = x1207 - x1208;
-  RK_ST1(arg0, 70u, x1209);
+  RK_ST1M(arg0, 70u, x1209);
   auto x1210 = x184 + x1131;
   auto x1211 = x1121 * x1131;
   auto x1212 = x1210 - x1211;
-  RK_ST1(arg0, 71u, x1212);
+  RK_ST1M(arg0, 71u, x1212);
   auto x1213 = x186 + x1135;
   auto x1214 = x1125 * x1135;
   auto x1215 = x1213 - x1214;
-  RK_ST1(arg0, 72u, x1215);
+  RK_ST1M(arg0, 72u, x1215);
   auto x1216 = x188 + x1139;
   auto x1217 = x1129 * x1139;
   auto x1218 = x1216 - x1217;
-  RK_ST1(arg0, 73u, x1218);
+  RK_ST1M(arg0, 73u, x1218);
   auto x1219 = x190 + x1143;
   auto x1220 = x1133 * x1143;
   auto x1221 = x1219 - x1220;
-  RK_ST1(arg0, 74u, x1221);
+  RK_ST1M(arg0, 74u, x1221);
   auto x1222 = x191 + x1147;
   auto x1223 = x1137 * x1147;
   auto x1224 = x1222 - x1223;
-  RK_ST1(arg0, 75u, x1224);
+  RK_ST1M(arg0, 75u, x1224);
   auto x1225 = x192 + x1151;
   auto x1226 = x1141 * x1151;
   auto x1227 = x1225 - x1226;
-  RK_ST1(arg0, 76u, x1227);
+  RK_ST1M(arg0, 76u, x1227);
   auto x1228 = x193 + x1155;
   auto x1229 = x1145 * x1155;
   auto x1230 = x1228 - x1229;
-  RK_ST1(arg0, 77u, x1230);
+  RK_ST1M(arg0, 77u, x1230);
   auto x1231 = x194 + x1159;
   auto x1232 = x1149 * x1159;
   auto x1233 = x1231 - x1232;
-  RK_ST1(arg0, 78u, x1233);
+  RK_ST1M(arg0, 78u, x1233);
   auto x1234 = x195 + x1163;
   auto x1235 = x1153 * x1163;
   auto x1236 = x1234 - x1235;
-  RK_ST1(arg0, 79u, x1236);
+  RK_ST1M(arg0, 79u, x1236);
   auto x1237 = x196 + x1167;
   auto x1238 = x1157 * x1167;
   auto x1239 = x1237 - x1238;
-  RK_ST1(arg0, 80u, x1239);
+  RK_ST1M(arg0, 80u, x1239);
   auto x1240 = x197 + x1171;
   auto x1241 = x1161 * x1171;
   auto x1242 = x1240 - x1241;
-  RK_ST1(arg0, 81u, x1242);
+  RK_ST1M(arg0, 81u, x1242);
   const uint32_t efl_arg10_109_8 = EF_LDCR(arg10, 109u, 8u);
   auto x1243 = x198 + x1175;
   auto x1244 = x1165 * x1175;
   auto x1245 = x1243 - x1244;
-  RK_ST1(arg0, 82u, x1245);
+  RK_ST1M(arg0, 82u, x1245);
   auto x1246 = x199 + x1179;
   auto x1247 = x1169 * x1179;
   auto x1248 = x1246 - x1247;
-  RK_ST1(arg0, 83u, x1248);
+  RK_ST1M(arg0, 83u, x1248);
   auto x1249 = x200 + x1183;
   auto x1250 = x1173 * x1183;
   auto x1251 = x1249 - x1250;
-  RK_ST1(arg0, 84u, x1251);
+  RK_ST1M(arg0, 84u, x1251);
   auto x203 = ::risc0::Fp::fromRaw(efl_arg10_109_8);
   auto x1252 = x201 + x203;
   auto x1253 = x1177 * x203;
@@ -21092,7 +21144,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_5(uint32_t cycle, uint32_t steps, Fp* arg
   auto x1255 = rv32im_v2_4(cycle, steps, arg0, x880.elems[0], x880.elems[1], x880.elems[2], x880.elems[3], x853.elems[0], x853.elems[1], x853.elems[2], x853.elems[3], arg4.elems[0], arg4.elems[1], arg4.elems[2], arg4.elems[3], arg5.elems[0], arg5.elems[1], arg5.elems[2], arg5.elems[3], arg6.elems[0], arg6.elems[1], arg6.elems[2], arg6.elems[3], arg7.elems[0], arg7.elems[1], arg7.elems[2], arg7.elems[3], arg8.elems[0], arg8.elems[1], arg8.elems[2], arg8.elems[3]);
   return x1255;
 }
-__device__ EF_NOINLINE FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3) {
+__device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3) {
   Fp* arg4 = EF_GPTR(0);
   Fp* arg5 = EF_GPTR(1);
   Fp* rkBD = EF_GPTR(0);
@@ -21102,7 +21154,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* 
   FpExt arg2(arg2_e0, arg2_e1, arg2_e2, arg2_e3);
   FpExt arg3(arg3_e0, arg3_e1, arg3_e2, arg3_e3);
   size_t mask = steps - 1;
-  const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = (uint32_t)cycle;
+  uint32_t rk_c_o = (uint32_t)cycle; EF_OPQ(rk_c_o, 17); const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = rk_c_o;
   const uint32_t efl_arg4_193_0 = EF_LDCR(arg4, 193u, 0u);
   const uint32_t efl_rkBD_189_0 = EF_LDCR(rkBD, 189u, 0u);
   const uint32_t efl_rkBD_191_0 = EF_LDCR(rkBD, 191u, 0u);
@@ -21184,7 +21236,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* 
   auto r12_x1151 = r12_x239 + r12_x1150;
   auto x224 = static_cast<const ::risc0::FpExt>(::risc0::FpExt(r12_x1151));
   auto x225 = x223 - x224;
-  RK_ST4(arg0, 212u, 213u, 214u, 215u, x225);
+  RK_ST4L(arg0, 212u, 213u, 214u, 215u, x225);
   auto x6 = ::risc0::Fp::fromRaw(efl_arg4_190_0);
   const uint32_t efl_arg4_201_0 = EF_LDCR(arg4, 201u, 0u);
   const uint32_t efl_arg4_204_0 = EF_LDCR(arg4, 204u, 0u);
@@ -21231,7 +21283,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* 
   const uint32_t efl_rkBA_100_0 = EF_LDCR(rkBA, 100u, 0u);
   const uint32_t efl_rkBA_99_0 = EF_LDCR(rkBA, 99u, 0u);
   auto x245 = x244 - x223;
-  RK_ST4(arg0, 216u, 217u, 218u, 219u, x245);
+  RK_ST4L(arg0, 216u, 217u, 218u, 219u, x245);
   auto x246 = x245 * x236;
   auto x247 = x246 - x238;
   auto x248 = x247 - x237;
@@ -21271,7 +21323,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* 
   const uint32_t efl_arg4_58_0 = EF_LDCR(arg4, 58u, 0u);
   const uint32_t efl_arg4_63_0 = EF_LDCR(arg4, 63u, 0u);
   auto x262 = x261 + x196;
-  auto x267 = RK_LD4(arg0, 4u, 5u, 6u, 7u);
+  auto x267 = RK_LD4L(arg0, 4u, 5u, 6u, 7u);
   auto x25 = ::risc0::Fp::fromRaw(efl_arg4_37_0);
   auto x24 = ::risc0::Fp::fromRaw(efl_arg4_39_0);
   RkW _wx2001153 = rkw_ee(x267, x258);
@@ -21326,7 +21378,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* 
   // remat_lu: store dropped
   auto x292 = x290 + x291;
   auto x293 = x292 + x196;
-  auto x298 = RK_LD4(arg0, 8u, 9u, 10u, 11u);
+  auto x298 = RK_LD4L(arg0, 8u, 9u, 10u, 11u);
   auto x34 = ::risc0::Fp::fromRaw(efl_arg4_62_0);
   const uint32_t efl_arg4_74_0 = EF_LDCR(arg4, 74u, 0u);
   const uint32_t efl_arg4_75_0 = EF_LDCR(arg4, 75u, 0u);
@@ -21375,7 +21427,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* 
   auto x321 = x48 * x192;
   auto x322 = x320 + x321;
   auto x323 = x322 + x196;
-  auto x328 = RK_LD4(arg0, 20u, 21u, 22u, 23u);
+  auto x328 = RK_LD4L(arg0, 20u, 21u, 22u, 23u);
   auto x45 = ::risc0::Fp::fromRaw(efl_arg4_73_0);
   auto x3000031 = ::risc0::Fp::fromRaw(efl_arg4_76_0);
   RkW _wx2001169 = rkw_ee(x328, x314);
@@ -21406,7 +21458,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* 
   auto r17_x444 = r17_x75 * r17_x313;
   auto r17_x445 = r17_x444 + r17_x349;
   auto x341 = static_cast<const ::risc0::FpExt>(::risc0::FpExt(r17_x445));
-  auto x346 = RK_LD4(arg0, 40u, 41u, 42u, 43u);
+  auto x346 = RK_LD4L(arg0, 40u, 41u, 42u, 43u);
   auto x3000032 = ::risc0::Fp::fromRaw(efl_arg4_84_0);
   auto x52 = ::risc0::Fp::fromRaw(efl_arg4_87_0);
   const uint32_t efl_arg4_96_0 = EF_LDCR(arg4, 96u, 0u);
@@ -21445,7 +21497,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* 
   rkw_ef(_wx366, x62, x192, false);
   rkw_v(_wx366, x196, false);
   auto x366 = rkw_fin(_wx366);
-  auto x371 = RK_LD4(arg0, 60u, 61u, 62u, 63u);
+  auto x371 = RK_LD4L(arg0, 60u, 61u, 62u, 63u);
   auto x58 = ::risc0::Fp::fromRaw(efl_arg4_95_0);
   auto x57 = ::risc0::Fp::fromRaw(efl_arg4_99_0);
   RkW _wx2001185 = rkw_ee(x371, x356);
@@ -21489,7 +21541,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* 
   auto x67 = ::risc0::Fp::fromRaw(efl_arg4_30_0);
   auto x390 = x67 * x389;
   auto x391 = x390 + x196;
-  auto x396 = RK_LD4(arg0, 80u, 81u, 82u, 83u);
+  auto x396 = RK_LD4L(arg0, 80u, 81u, 82u, 83u);
   const uint32_t efl_arg4_32_0 = EF_LDCR(arg4, 32u, 0u);
   const uint32_t efl_arg4_34_0 = EF_LDCR(arg4, 34u, 0u);
   auto x66 = ::risc0::Fp::fromRaw(efl_arg4_106_0);
@@ -21525,7 +21577,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* 
   auto r24_x582 = r24_x133 * r24_x313;
   auto r24_x583 = r24_x582 + r24_x349;
   auto x409 = static_cast<const ::risc0::FpExt>(::risc0::FpExt(r24_x583));
-  auto x414 = RK_LD4(arg0, 84u, 85u, 86u, 87u);
+  auto x414 = RK_LD4L(arg0, 84u, 85u, 86u, 87u);
   RkW _wx2001199 = rkw_ee(x414, x406);
   rkw_v(_wx2001199, x408, true);
   rkw_v(_wx2001199, x407, true);
@@ -21581,7 +21633,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* 
   auto x438 = static_cast<const ::risc0::FpExt>(::risc0::FpExt(r29_x731));
   const uint32_t efl_arg4_128_0 = EF_LDCR(arg4, 128u, 0u);
   const uint32_t efl_arg4_131_0 = EF_LDCR(arg4, 131u, 0u);
-  auto x443 = RK_LD4(arg0, 92u, 93u, 94u, 95u);
+  auto x443 = RK_LD4L(arg0, 92u, 93u, 94u, 95u);
   auto x79 = ::risc0::Fp::fromRaw(efl_arg4_117_0);
   auto x78 = ::risc0::Fp::fromRaw(efl_arg4_121_0);
   RkW _wx2001207 = rkw_ee(x443, x435);
@@ -21605,13 +21657,13 @@ __device__ EF_NOINLINE FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* 
   auto x453 = x450 * x452;
   auto x83 = ::risc0::Fp::fromRaw(efl_arg4_130_0);
   auto x84 = ::risc0::Fp::fromRaw(efl_arg4_127_0);
-  auto x456 = RK_LD4(arg0, 96u, 97u, 98u, 99u);
+  auto x456 = RK_LD4L(arg0, 96u, 97u, 98u, 99u);
   RkW _wx459 = rkw_ee(x456, x453);
   rkw_ef(_wx459, x84, x452, true);
   rkw_ef(_wx459, x83, x450, true);
   auto x459 = rkw_fin(_wx459);
   RkAcc x460 = rk_link_nf_k(x448, x459, 8u);
-  auto x461 = RK_LD4(arg0, 104u, 105u, 106u, 107u);
+  auto x461 = RK_LD4L(arg0, 104u, 105u, 106u, 107u);
   FpExt x462 = rk_fin(rk_link_k(x460, x461, 9u));
   auto x85 = ::risc0::Fp::fromRaw(efl_arg4_6_0);
   RkW _cx463 = _cx253;
@@ -21837,7 +21889,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* 
   auto x619 = x616 * x618;
   auto x108 = ::risc0::Fp::fromRaw(efl_arg4_143_0);
   auto x109 = ::risc0::Fp::fromRaw(efl_arg4_140_0);
-  auto x622 = RK_LD4(arg0, 152u, 153u, 154u, 155u);
+  auto x622 = RK_LD4L(arg0, 152u, 153u, 154u, 155u);
   RkW _wx625 = rkw_ee(x622, x619);
   rkw_ef(_wx625, x109, x618, true);
   const uint32_t efl_rkBA_60_0 = EF_LDCR(rkBA, 60u, 0u);
@@ -22230,7 +22282,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* 
   auto x901 = x83 * x231;
   auto x902 = x901 + x196;
   // remat_lu: store dropped
-  auto x907 = RK_LD4(arg0, 156u, 157u, 158u, 159u);
+  auto x907 = RK_LD4L(arg0, 156u, 157u, 158u, 159u);
   const uint32_t efl_arg4_132_0 = EF_LDCR(arg4, 132u, 0u);
   RkW _wx2001347 = rkw_ee(x907, x898);
   rkw_ef(_wx2001347, x80, x450, true);
@@ -22250,7 +22302,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* 
   auto x917 = x914 * x916;
   auto x920 = x101 * x231;
   auto x921 = x920 + x196;
-  auto x926 = RK_LD4(arg0, 160u, 161u, 162u, 163u);
+  auto x926 = RK_LD4L(arg0, 160u, 161u, 162u, 163u);
   auto x140 = ::risc0::Fp::fromRaw(efl_arg4_133_0);
   RkW _wx2001355 = rkw_ee(x926, x917);
   rkw_ef(_wx2001355, x82, x916, true);
@@ -22271,7 +22323,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* 
   auto x141 = ::risc0::Fp::fromRaw(efl_arg4_142_0);
   auto x939 = x141 * x231;
   auto x940 = x939 + x196;
-  auto x945 = RK_LD4(arg0, 168u, 169u, 170u, 171u);
+  auto x945 = RK_LD4L(arg0, 168u, 169u, 170u, 171u);
   RkW _wx2001363 = rkw_ee(x945, x936);
   rkw_ef(_wx2001363, x102, x935, true);
   rkw_ef(_wx2001363, x104, x933, true);
@@ -22291,7 +22343,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* 
   auto x144 = ::risc0::Fp::fromRaw(efl_arg4_148_0);
   auto x956 = x144 * x231;
   auto x957 = x956 + x196;
-  auto x962 = RK_LD4(arg0, 208u, 209u, 210u, 211u);
+  auto x962 = RK_LD4L(arg0, 208u, 209u, 210u, 211u);
   auto x143 = ::risc0::Fp::fromRaw(efl_arg4_145_0);
   RkW _wx2001371 = rkw_ee(x962, x953);
   rkw_ef(_wx2001371, x108, x952, true);
@@ -22394,7 +22446,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* 
   auto x167 = ::risc0::Fp::fromRaw(efl_arg5_87_0);
   auto x1022 = x167 + x1021;
   auto x1023 = x1022 - x244;
-  RK_ST4(arg0, 296u, 297u, 298u, 299u, x1023);
+  RK_ST4L(arg0, 296u, 297u, 298u, 299u, x1023);
   auto x2001389 = x1023 * x1008;
   const uint32_t efl_arg4_168_0 = EF_LDCR(arg4, 168u, 0u);
   const uint32_t efl_arg4_170_0 = EF_LDCR(arg4, 170u, 0u);
@@ -22440,7 +22492,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* 
   auto x1047 = x177 + x1046;
   // remat_lu: store dropped
   auto x1048 = x1047 - x1022;
-  RK_ST4(arg0, 304u, 305u, 306u, 307u, x1048);
+  RK_ST4L(arg0, 304u, 305u, 306u, 307u, x1048);
   auto x2001397 = x1048 * x1033;
   auto x171 = ::risc0::Fp::fromRaw(efl_arg4_167_0);
   auto x2001398 = x171 * x1032;
@@ -22555,14 +22607,14 @@ __device__ EF_NOINLINE FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* 
   auto x1131 = x703 * x131;
   auto x132 = ::risc0::Fp::fromRaw(efl_arg4_61_0);
   auto x1134 = x1130 * x132;
-  RK_ST4(arg0, 312u, 313u, 314u, 315u, x1134);
+  RK_ST4L(arg0, 312u, 313u, 314u, 315u, x1134);
   auto x1136 = x1131 * x730;
-  RK_ST4(arg0, 316u, 317u, 318u, 319u, x1136);
+  RK_ST4L(arg0, 316u, 317u, 318u, 319u, x1136);
   RkW _wx2001439 = rkw_ee(x346, x1130);
   rkw_ef(_wx2001439, x127, x714, true);
   auto x2001439 = rkw_fin(_wx2001439);
   auto x2001440 = x2001439 * x730;
-  RK_ST4(arg0, 320u, 321u, 322u, 323u, x2001440);
+  RK_ST4L(arg0, 320u, 321u, 322u, 323u, x2001440);
   auto x1139 = rv32im_v2_0(cycle, steps, arg0, x1129.elems[0], x1129.elems[1], x1129.elems[2], x1129.elems[3], x1085.elems[0], x1085.elems[1], x1085.elems[2], x1085.elems[3], arg3.elems[0], arg3.elems[1], arg3.elems[2], arg3.elems[3]);
   return x1139;
 }
@@ -22591,7 +22643,7 @@ __device__ FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg0, Fp arg
 __device__ FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3);
 __device__ FpExt poly_fp(uint32_t cycle, uint32_t steps, Fp** args);
 
-__device__ EF_NOINLINE FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3, Fp arg7_e0, Fp arg7_e1, Fp arg7_e2, Fp arg7_e3, Fp arg8_e0, Fp arg8_e1, Fp arg8_e2, Fp arg8_e3, Fp arg9_e0, Fp arg9_e1, Fp arg9_e2, Fp arg9_e3, Fp arg10_e0, Fp arg10_e1, Fp arg10_e2, Fp arg10_e3, Fp arg11_e0, Fp arg11_e1, Fp arg11_e2, Fp arg11_e3, Fp arg12_e0, Fp arg12_e1, Fp arg12_e2, Fp arg12_e3, Fp arg14_e0, Fp arg14_e1, Fp arg14_e2, Fp arg14_e3) {
+__device__ EF_CHAIN FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3, Fp arg7_e0, Fp arg7_e1, Fp arg7_e2, Fp arg7_e3, Fp arg8_e0, Fp arg8_e1, Fp arg8_e2, Fp arg8_e3, Fp arg9_e0, Fp arg9_e1, Fp arg9_e2, Fp arg9_e3, Fp arg10_e0, Fp arg10_e1, Fp arg10_e2, Fp arg10_e3, Fp arg11_e0, Fp arg11_e1, Fp arg11_e2, Fp arg11_e3, Fp arg12_e0, Fp arg12_e1, Fp arg12_e2, Fp arg12_e3, Fp arg14_e0, Fp arg14_e1, Fp arg14_e2, Fp arg14_e3) {
   FpExt* arg13 = reinterpret_cast<FpExt*>(arg0);
   Fp* arg15 = EF_GPTR(0);
   Fp* arg16 = EF_GPTR(1);
@@ -22611,7 +22663,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* ar
   FpExt arg11(arg11_e0, arg11_e1, arg11_e2, arg11_e3);
   FpExt arg12(arg12_e0, arg12_e1, arg12_e2, arg12_e3);
   FpExt arg14(arg14_e0, arg14_e1, arg14_e2, arg14_e3);
-  size_t mask = steps - 1; const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = (uint32_t)cycle;
+  size_t mask = steps - 1; uint32_t rk_c_o = (uint32_t)cycle; EF_OPQ(rk_c_o, 18); const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = rk_c_o;
   const uint32_t efl_arg15_166_0 = EF_LDCR(arg15, 166u, 0u);
   const uint32_t efl_arg15_160_0 = EF_LDCR(arg15, 160u, 0u);
   const uint32_t efl_arg15_72_0 = EF_LDCR(arg15, 72u, 0u);
@@ -22625,7 +22677,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_v4i efd_208[4] = {}; FpExt efb_208 = arg1; const int efq_208_0 = ef_wq(efw, 32u); ef_wst(efw, 0u, x155);), RkAcc x156 = rk_link_nf_k(arg1, x155, 32u);)
   auto x157 = (::risc0::Fp::fromRaw(efl_arg15_160_0) - (::risc0::Fp::fromRaw(efl_arg15_72_0) + (::risc0::Fp::fromRaw(efl_arg15_74_0) * Fp(256u))));
   EF_W((ef_wst(efw, 1u, x157);), RkAcc x158 = rk_link_k(x156, x157, 33u);)
-  auto x159 = RK_LD1(arg0, 7u);
+  auto x159 = RK_LD1M(arg0, 7u);
   EF_W((ef_wst(efw, 2u, x159);), RkAcc x160 = rk_link_nf_k(x158, x159, 34u);)
   auto x161 = (::risc0::Fp::fromRaw(efl_arg15_78_0) - ((::risc0::Fp::fromRaw(efl_arg15_80_0) * Fp(1006632961u)) + (::risc0::Fp::fromRaw(efl_arg15_166_0) * Fp(128u))));
   EF_W((ef_wst(efw, 3u, x161);), RkAcc x162 = rk_link_k(x160, x161, 35u);)
@@ -22636,7 +22688,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((const int efq_208_4 = ef_wq(efw, 36u); ef_wst(efw, 4u, x163);), RkAcc x164 = rk_link_nf_k(x162, x163, 36u);)
   auto x165 = (::risc0::Fp::fromRaw(efl_arg15_37_0) - Fp(1u));
   EF_W((ef_wst(efw, 5u, x165);), RkAcc x166 = rk_link_k(x164, x165, 37u);)
-  auto x167 = RK_LD1(arg0, 8u);
+  auto x167 = RK_LD1M(arg0, 8u);
   EF_W((ef_wst(efw, 6u, x167);), RkAcc x168 = rk_link_nf_k(x166, x167, 38u);)
   auto x169 = (::risc0::Fp::fromRaw(efl_arg15_39_0) - Fp(1u));
   EF_W((ef_wst(efw, 7u, x169); ef_wblk(efw, efd_208, 0u, efq_208_0);), RkAcc x170 = rk_link_k(x168, x169, 39u);)
@@ -22650,7 +22702,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 9u, x173);), RkAcc x174 = rk_link_k(x172, x173, 41u);)
   auto x175 = (::risc0::Fp::fromRaw(efl_arg15_169_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg15_169_0)));
   EF_W((ef_wst(efw, 10u, x175);), RkAcc x176 = rk_link_nf_k(x174, x175, 42u);)
-  auto x177 = RK_LD1(arg0, 9u);
+  auto x177 = RK_LD1M(arg0, 9u);
   EF_W((ef_wst(efw, 11u, x177); ef_wblk(efw, efd_208, 4u, efq_208_4);), RkAcc x178 = rk_link_k(x176, x177, 43u);)
   const uint32_t efl_arg15_43_0 = EF_LDCR(arg15, 43u, 0u);
   const uint32_t efl_arg15_85_0 = EF_LDCR(arg15, 85u, 0u);
@@ -22666,7 +22718,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg15_173_0 = EF_LDCR(arg15, 173u, 0u);
   const uint32_t efl_arg15_45_0 = EF_LDCR(arg15, 45u, 0u);
   const uint32_t efl_arg15_174_0 = EF_LDCR(arg15, 174u, 0u);
-  auto x187 = RK_LD1(arg0, 10u);
+  auto x187 = RK_LD1M(arg0, 10u);
   EF_W((const int efq_208_16 = ef_wq(efw, 48u); ef_wst(efw, 16u, x187);), RkAcc x188 = rk_link_nf_k(x186, x187, 48u);)
   auto x189 = (::risc0::Fp::fromRaw(efl_arg15_43_0) - Fp(1u));
   EF_W((ef_wst(efw, 17u, x189);), RkAcc x190 = rk_link_k(x188, x189, 49u);)
@@ -22677,7 +22729,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg15_175_0 = EF_LDCR(arg15, 175u, 0u);
   auto x195 = (::risc0::Fp::fromRaw(efl_arg15_173_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg15_173_0)));
   EF_W((const int efq_208_20 = ef_wq(efw, 52u); ef_wst(efw, 20u, x195);), RkAcc x196 = rk_link_nf_k(x194, x195, 52u);)
-  auto x197 = RK_LD1(arg0, 11u);
+  auto x197 = RK_LD1M(arg0, 11u);
   EF_W((ef_wst(efw, 21u, x197);), RkAcc x198 = rk_link_k(x196, x197, 53u);)
   auto x199 = (::risc0::Fp::fromRaw(efl_arg15_45_0) - Fp(1u));
   EF_W((ef_wst(efw, 22u, x199);), RkAcc x200 = rk_link_nf_k(x198, x199, 54u);)
@@ -22689,11 +22741,11 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg15_177_0 = EF_LDCR(arg15, 177u, 0u);
   auto x203 = (::risc0::Fp::fromRaw(efl_arg15_175_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg15_175_0)));
   EF_W((const int efq_208_24 = ef_wq(efw, 56u); ef_wst(efw, 0u, x203);), RkAcc x204 = rk_link_nf_k(x202, x203, 56u);)
-  auto x205 = RK_LD1(arg0, 12u);
+  auto x205 = RK_LD1M(arg0, 12u);
   EF_W((ef_wst(efw, 1u, x205);), RkAcc x206 = rk_link_k(x204, x205, 57u);)
-  auto x207 = RK_LD1(arg0, 13u);
+  auto x207 = RK_LD1M(arg0, 13u);
   EF_W((ef_wst(efw, 2u, x207);), RkAcc x208 = rk_link_nf_k(x206, x207, 58u);)
-  auto x209 = RK_LD1(arg0, 14u);
+  auto x209 = RK_LD1M(arg0, 14u);
   EF_W((ef_wst(efw, 3u, x209); ef_wblk(efw, efd_208, 20u, efq_208_20);), RkAcc x210 = rk_link_k(x208, x209, 59u);)
   const uint32_t efl_arg15_47_0 = EF_LDCR(arg15, 47u, 0u);
   const uint32_t efl_arg15_49_0 = EF_LDCR(arg15, 49u, 0u);
@@ -22713,7 +22765,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg15_52_0 = EF_LDCR(arg15, 52u, 0u);
   auto x219 = (::risc0::Fp::fromRaw(efl_arg15_47_0) - Fp(1u));
   EF_W((const int efq_208_32 = ef_wq(efw, 64u); ef_wst(efw, 8u, x219);), RkAcc x220 = rk_link_nf_k(x218, x219, 64u);)
-  auto x221 = RK_LD1(arg0, 15u);
+  auto x221 = RK_LD1M(arg0, 15u);
   EF_W((ef_wst(efw, 9u, x221);), RkAcc x222 = rk_link_k(x220, x221, 65u);)
   auto x223 = (::risc0::Fp::fromRaw(efl_arg15_49_0) - Fp(1u));
   EF_W((ef_wst(efw, 10u, x223);), RkAcc x224 = rk_link_nf_k(x222, x223, 66u);)
@@ -22761,7 +22813,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((efd_208[0] = efd_208[1] = efd_208[2] = efd_208[3] = ef_v4i{}; const int efq_208_48 = ef_wq(efw, 80u); ef_wst(efw, 0u, x251);), RkAcc x252 = rk_link_nf_k(x250, x251, 80u);)
   auto x253 = (::risc0::Fp::fromRaw(efl_arg15_184_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg15_184_0)));
   EF_W((ef_wst(efw, 1u, x253);), RkAcc x254 = rk_link_k(x252, x253, 81u);)
-  auto x255 = RK_LD1(arg0, 16u);
+  auto x255 = RK_LD1M(arg0, 16u);
   EF_W((ef_wst(efw, 2u, x255);), RkAcc x256 = rk_link_nf_k(x254, x255, 82u);)
   auto x257 = (::risc0::Fp::fromRaw(efl_arg15_59_0) - Fp(1u));
   EF_W((ef_wst(efw, 3u, x257);), RkAcc x258 = rk_link_k(x256, x257, 83u);)
@@ -22770,7 +22822,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg15_102_0 = EF_LDCR(arg15, 102u, 0u);
   auto x259 = (::risc0::Fp::fromRaw(efl_arg15_185_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg15_185_0)));
   EF_W((const int efq_208_52 = ef_wq4(efw, 84u, 85u, 84u, 84u, 2u); ef_wst(efw, 4u, x259);), RkAcc x260 = rk_link_nf_k(x258, x259, 84u);)
-  auto x261 = RK_LD1(arg0, 17u);
+  auto x261 = RK_LD1M(arg0, 17u);
   EF_W((ef_wst(efw, 5u, x261); ef_wblk(efw, efd_208, 0u, efq_208_48); ef_wblk(efw, efd_208, 4u, efq_208_52); FpExt x262 = ef_wfin(efw, efd_208, 0u, efb_208);), FpExt x262 = rk_fin(rk_link_k(x260, x261, 85u));)
   auto x28 = ::risc0::Fp::fromRaw(efl_arg15_182_0);
   RkW _cx263 = rk_cl0(x262, x28 * arg2, 86u); FpExt x263 = rkw_fin(_cx263);
@@ -22778,14 +22830,14 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* ar
   RkW _cx264 = _cx263; rk_cl_acc(_cx264, x29 * arg3, 92u); FpExt x264 = rkw_fin(_cx264);
   const uint32_t efl_arg15_152_0 = EF_LDCR(arg15, 152u, 0u);
   const uint32_t efl_arg15_153_0 = EF_LDCR(arg15, 153u, 0u);
-  auto x265 = RK_LD1(arg0, 18u);
+  auto x265 = RK_LD1M(arg0, 18u);
   RkW _cx266 = _cx264; rk_cl_acc(_cx266, x265 * arg4, 101u); FpExt x266 = rkw_fin(_cx266);
   auto x30 = ::risc0::Fp::fromRaw(efl_arg15_24_0);
   RkW _cx267 = rk_cl0(arg5, x30 * x266, 310u); FpExt x267 = rkw_fin(_cx267);
   auto x268 = ((::risc0::Fp::fromRaw(efl_arg15_101_0) * Fp(4u)) + ::risc0::Fp::fromRaw(efl_arg15_102_0));
   constexpr Fp x27(4);
   auto x269 = x268 - x27;
-  auto x270 = RK_LD1(arg0, 0u);
+  auto x270 = RK_LD1M(arg0, 0u);
   const uint32_t efl_arg15_29_0 = EF_LDCR(arg15, 29u, 0u);
   const uint32_t efl_arg15_31_0 = EF_LDCR(arg15, 31u, 0u);
   constexpr Fp x26(1);
@@ -22902,7 +22954,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* ar
   auto x341 = (::risc0::Fp::fromRaw(efl_arg15_62_0) * ::risc0::Fp::fromRaw(efl_arg15_72_0));
   auto x41 = ::risc0::Fp::fromRaw(efl_arg15_30_0);
   auto x342 = x41 + x341;
-  auto x343 = RK_LD1(arg0, 1u);
+  auto x343 = RK_LD1M(arg0, 1u);
   auto x344 = x342 + x343;
   auto x345 = (::risc0::Fp::fromRaw(efl_arg15_35_0) - Fp(1u));
   EF_W((ef_wst(efw, 1u, x345);), RkAcc x346 = rk_link_k(x340, x345, 26u);)
@@ -22938,7 +22990,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* ar
   // lincombF: fused into a lazy Fp linear combination
   auto x367 = (::risc0::Fp::fromRaw(efl_arg15_66_0) * ::risc0::Fp::fromRaw(efl_arg15_72_0));
   // lincombF: fused into a lazy Fp linear combination
-  auto x369 = RK_LD1(arg0, 5u);
+  auto x369 = RK_LD1M(arg0, 5u);
   // lincombF: fused into a lazy Fp linear combination
   EF_W((ef_wst(efw, 6u, x165);), RkAcc x371 = rk_link_nf_k(x359, x165, 31u);)
   EF_W((ef_wst(efw, 7u, x181); ef_wblk(efw, efd_209, 0u, efq_209_24);), RkAcc x372 = rk_link_k(x371, x181, 32u);)
@@ -22977,7 +23029,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* ar
   // lincombF: fused into a lazy Fp linear combination
   auto x398 = (::risc0::Fp::fromRaw(efl_arg15_68_0) * ::risc0::Fp::fromRaw(efl_arg15_74_0));
   // lincombF: fused into a lazy Fp linear combination
-  auto x400 = RK_LD1(arg0, 6u);
+  auto x400 = RK_LD1M(arg0, 6u);
   // lincombF: fused into a lazy Fp linear combination
   EF_W((ef_wst(efw, 11u, x169); ef_wblk(efw, efd_209, 4u, efq_209_28);), RkAcc x402 = rk_link_k(x384, x169, 36u);)
   const uint32_t efl_arg15_86_0 = EF_LDCR(arg15, 86u, 0u);
@@ -23275,7 +23327,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* ar
   auto x862 = x26 - x854;
   constexpr Fp x13(64);
   // lincombF: fused into a lazy Fp linear combination
-  auto x864 = RK_LD1(arg0, 4u);
+  auto x864 = RK_LD1M(arg0, 4u);
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   auto x95 = ::risc0::Fp::fromRaw(efl_arg15_188_0);
@@ -23297,7 +23349,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* ar
   auto x873 = ((::risc0::Fp::fromRaw(efl_arg15_0_0) * Fp(2u)) + Fp(1u));
   auto x98 = ::risc0::Fp::fromRaw(efl_arg15_195_0);
   auto x874 = x98 - x873;
-  RK_ST1(arg0, 0u, x874);
+  RK_ST1M(arg0, 0u, x874);
   EF_W((ef_wst(efw, 7u, x874); ef_wblk(efw, efd_220, 0u, efq_220_0);), RkAcc x875 = rk_link_k(x872, x874, 397u);)
   auto x99 = ::risc0::Fp::fromRaw(efl_arg15_189_0);
   auto x877 = x99 - x95;
@@ -23411,7 +23463,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* ar
   auto x112 = ::risc0::Fp::fromRaw(efl_arg15_58_0);
   auto x925 = x112 - x26;
   EF_W((const int efq_221_4 = ef_wq(efw, 4u); ef_wst(efw, 4u, x925);), RkAcc x926 = rk_link_nf_k(x924, x925, 4u);)
-  auto x927 = RK_LD1(arg0, 3u);
+  auto x927 = RK_LD1M(arg0, 3u);
   auto x928 = x78 - x927;
   EF_W((ef_wst(efw, 5u, x928);), RkAcc x929 = rk_link_k(x926, x928, 5u);)
   auto x113 = ::risc0::Fp::fromRaw(efl_arg15_60_0);
@@ -23595,17 +23647,17 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* ar
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx1083 = rkw1_ff0(x67, x1, false); rkw1_ff(_wx1083, x126, x21, false); rkw1_v(_wx1083, x69, false); auto x1083 = rkw1_fin(_wx1083);
-  RK_ST1(arg0, 1u, x1083);
+  RK_ST1M(arg0, 1u, x1083);
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx1087 = rkw1_ff0(x125, x1, false); rkw1_ff(_wx1087, x64, x21, false); rkw1_v(_wx1087, x130, false); auto x1087 = rkw1_fin(_wx1087);
-  RK_ST1(arg0, 5u, x1087);
+  RK_ST1M(arg0, 5u, x1087);
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx1091 = rkw1_ff0(x127, x1, false); rkw1_ff(_wx1091, x72, x21, false); rkw1_v(_wx1091, x128, false); auto x1091 = rkw1_fin(_wx1091);
-  RK_ST1(arg0, 6u, x1091);
+  RK_ST1M(arg0, 6u, x1091);
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
@@ -23618,11 +23670,11 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* ar
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx1102 = rkw1_ff0(x129, x0, false); rkw1_ff(_wx1102, x1097, x6, false); auto x1102 = rkw1_fin(_wx1102);
-  RK_ST1(arg0, 7u, x1102);
+  RK_ST1M(arg0, 7u, x1102);
   auto x1103 = x1102 + x1087;
   auto x1104 = x129 * x24;
   auto x1105 = x864 + x1083;
-  RK_ST1(arg0, 8u, x1105);
+  RK_ST1M(arg0, 8u, x1105);
   auto x1106 = x1105 - x53;
   EF_W((ef_v4i efd_222[4] = {}; const int efq_222_0 = ef_wq(efw, 40u); ef_wst(efw, 0u, x1106);), RkAcc x1107 = rk_link_nf_k(x1079, x1106, 40u);)
   auto x1108 = x55 - x12;
@@ -23632,7 +23684,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 2u, x1110);), RkAcc x1111 = rk_link_nf_k(x1109, x1110, 42u);)
   auto x133 = ::risc0::Fp::fromRaw(efl_arg15_81_0);
   auto x1112 = x133 - x911;
-  RK_ST1(arg0, 9u, x1112);
+  RK_ST1M(arg0, 9u, x1112);
   EF_W((ef_wst(efw, 3u, x1112);), RkAcc x1113 = rk_link_k(x1111, x1112, 43u);)
   auto x134 = ::risc0::Fp::fromRaw(efl_arg15_75_0);
   auto x1115 = x134 - x53;
@@ -23646,7 +23698,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 6u, x1119);), RkAcc x1120 = rk_link_nf_k(x1118, x1119, 47u);)
   auto x137 = ::risc0::Fp::fromRaw(efl_arg15_77_0);
   auto x1121 = x171 - x137;
-  RK_ST1(arg0, 10u, x1121);
+  RK_ST1M(arg0, 10u, x1121);
   auto x1122 = x49 - x26;
   const uint32_t efl_arg15_89_0 = EF_LDCR(arg15, 89u, 0u);
   const uint32_t efl_arg15_88_0 = EF_LDCR(arg15, 88u, 0u);
@@ -23696,7 +23748,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* ar
   // lincombF: fused into a lazy Fp linear combination
   auto x145 = ::risc0::Fp::fromRaw(efl_arg15_93_0);
   // lincombF: fused into a lazy Fp linear combination
-  auto x1152 = RK_LD1(arg0, 2u);
+  auto x1152 = RK_LD1M(arg0, 2u);
   auto x1153 = x1152 - x143;
   auto x146 = ::risc0::Fp::fromRaw(efl_arg15_95_0);
   auto x1154 = x146 - x26;
@@ -23744,7 +23796,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* ar
   auto x1185 = rv32im_v2_15(cycle, steps, arg0, x1182.elems[0], x1182.elems[1], x1182.elems[2], x1182.elems[3], arg7.elems[0], arg7.elems[1], arg7.elems[2], arg7.elems[3], arg11.elems[0], arg11.elems[1], arg11.elems[2], arg11.elems[3], x910.elems[0], x910.elems[1], x910.elems[2], x910.elems[3], x1079.elems[0], x1079.elems[1], x1079.elems[2], x1079.elems[3], arg12.elems[0], arg12.elems[1], arg12.elems[2], arg12.elems[3], arg14.elems[0], arg14.elems[1], arg14.elems[2], arg14.elems[3]);
   return x1185;
 }
-__device__ EF_NOINLINE FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3, Fp arg7_e0, Fp arg7_e1, Fp arg7_e2, Fp arg7_e3, Fp arg8_e0, Fp arg8_e1, Fp arg8_e2, Fp arg8_e3) {
+__device__ EF_CHAIN FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3, Fp arg7_e0, Fp arg7_e1, Fp arg7_e2, Fp arg7_e3, Fp arg8_e0, Fp arg8_e1, Fp arg8_e2, Fp arg8_e3) {
   FpExt* arg2 = reinterpret_cast<FpExt*>(arg0);
   Fp* arg9 = EF_GPTR(0);
   Fp* arg10 = EF_GPTR(1);
@@ -23758,7 +23810,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* ar
   FpExt arg6(arg6_e0, arg6_e1, arg6_e2, arg6_e3);
   FpExt arg7(arg7_e0, arg7_e1, arg7_e2, arg7_e3);
   FpExt arg8(arg8_e0, arg8_e1, arg8_e2, arg8_e3);
-  size_t mask = steps - 1; const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = (uint32_t)cycle;
+  size_t mask = steps - 1; uint32_t rk_c_o = (uint32_t)cycle; EF_OPQ(rk_c_o, 19); const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = rk_c_o;
   const uint32_t efl_arg9_30_4 = EF_LDCR(arg9, 30u, 4u);
   const uint32_t efl_arg9_114_0 = EF_LDCR(arg9, 114u, 0u);
   const uint32_t efl_arg9_116_0 = EF_LDCR(arg9, 116u, 0u);
@@ -23768,12 +23820,12 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg9_119_0 = EF_LDCR(arg9, 119u, 0u);
   const uint32_t efl_arg9_115_0 = EF_LDCR(arg9, 115u, 0u);
   const uint32_t efl_arg9_150_0 = EF_LDCR(arg9, 150u, 0u);
-  auto x211 = RK_LD1(arg0, 18u);
+  auto x211 = RK_LD1M(arg0, 18u);
   EF_W((ef_v4i efd_223[4] = {}; RkAcc efs_223 = rk_acc(arg1); FpExt efb_223 = FpExt(); const int efq_223_0 = ef_wq4(efw, 47u, 49u, 50u, 51u, 4u); ef_wst(efw, 0u, x211);), RkAcc x212 = rk_link_nf_k(arg1, x211, 47u);)
   auto x214 = (::risc0::Fp::fromRaw(efl_arg9_30_4) + Fp(5u));
   auto x16 = ::risc0::Fp::fromRaw(efl_arg9_114_0);
   auto x215 = x16 - x214;
-  RK_ST1(arg0, 19u, x215);
+  RK_ST1M(arg0, 19u, x215);
   EF_W((ef_wst(efw, 1u, x215);), RkAcc x216 = rk_link_k(x212, x215, 49u);)
   auto x217 = (::risc0::Fp::fromRaw(efl_arg9_116_0) - ::risc0::Fp::fromRaw(efl_arg9_120_0));
   const uint32_t efl_arg9_151_0 = EF_LDCR(arg9, 151u, 0u);
@@ -23790,7 +23842,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((const int efq_223_4 = ef_wq(efw, 52u); ef_wst(efw, 4u, x223);), RkAcc x224 = rk_link_nf_k(x220, x223, 52u);)
   auto x19 = ::risc0::Fp::fromRaw(efl_arg9_151_0);
   auto x225 = x19 - x222;
-  RK_ST1(arg0, 20u, x225);
+  RK_ST1M(arg0, 20u, x225);
   EF_W((ef_wst(efw, 5u, x225);), RkAcc x226 = rk_link_k(x224, x225, 53u);)
   constexpr Fp x13(65536);
   auto x20 = ::risc0::Fp::fromRaw(efl_arg9_121_0);
@@ -23815,7 +23867,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* ar
   auto x234 = (::risc0::Fp::fromRaw(efl_arg9_0_0) * Fp(2u));
   auto x24 = ::risc0::Fp::fromRaw(efl_arg9_128_0);
   auto x235 = x24 - x234;
-  RK_ST1(arg0, 21u, x235);
+  RK_ST1M(arg0, 21u, x235);
   const uint32_t efl_arg9_126_0 = EF_LDCR(arg9, 126u, 0u);
   const uint32_t efl_arg9_130_0 = EF_LDCR(arg9, 130u, 0u);
   const uint32_t efl_arg9_124_0 = EF_LDCR(arg9, 124u, 0u);
@@ -23863,7 +23915,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg9_139_0 = EF_LDCR(arg9, 139u, 0u);
   const uint32_t efl_arg9_133_0 = EF_LDCR(arg9, 133u, 0u);
   auto x257 = x35 - x234;
-  RK_ST1(arg0, 22u, x257);
+  RK_ST1M(arg0, 22u, x257);
   EF_W((const int efq_223_16 = ef_wq4(efw, 65u, 67u, 68u, 69u, 4u); ef_wst(efw, 16u, x257);), RkAcc x258 = rk_link_nf_k(x256, x257, 65u);)
   auto x36 = ::risc0::Fp::fromRaw(efl_arg9_132_0);
   auto x260 = x36 - x252;
@@ -23890,7 +23942,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((const int efq_223_20 = ef_wq(efw, 70u); ef_wst(efw, 20u, x268);), RkAcc x269 = rk_link_nf_k(x265, x268, 70u);)
   auto x43 = ::risc0::Fp::fromRaw(efl_arg9_155_0);
   auto x270 = x43 - x267;
-  RK_ST1(arg0, 23u, x270);
+  RK_ST1M(arg0, 23u, x270);
   EF_W((ef_wst(efw, 21u, x270);), RkAcc x271 = rk_link_k(x269, x270, 71u);)
   const uint32_t efl_arg9_31_0 = EF_LDCR(arg9, 31u, 0u);
   const uint32_t efl_arg9_32_4 = EF_LDCR(arg9, 32u, 4u);
@@ -24048,7 +24100,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* ar
   auto x69 = ::risc0::Fp::fromRaw(efl_arg9_63_0);
   auto x346 = x345 - x69;
   EF_W((const int efq_223_56 = ef_wq4(efw, 106u, 108u, 109u, 110u, 4u); ef_wst(efw, 8u, x346);), RkAcc x347 = rk_link_nf_k(x344, x346, 106u);)
-  auto x348 = RK_LD4(arg2, 5u, 7u, 8u, 9u);
+  auto x348 = RK_LD4M(arg2, 5u, 7u, 8u, 9u);
   const uint32_t efl_arg9_161_0 = EF_LDCR(arg9, 161u, 0u);
   const uint32_t efl_arg9_162_0 = EF_LDCR(arg9, 162u, 0u);
   const uint32_t efl_arg9_164_0 = EF_LDCR(arg9, 164u, 0u);
@@ -24146,7 +24198,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg9_201_0 = EF_LDCR(arg9, 201u, 0u);
   auto x100 = ::risc0::Fp::fromRaw(efl_arg9_64_4);
   auto x382 = x100 + x381;
-  RK_ST4(arg2, 24u, 25u, 27u, 28u, x382);
+  RK_ST4M(arg2, 24u, 25u, 27u, 28u, x382);
   auto x101 = ::risc0::Fp::fromRaw(efl_arg9_36_4);
   auto x383 = x49 + x101;
   auto x384 = (::risc0::Fp::fromRaw(efl_arg9_199_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_199_0)));
@@ -24299,7 +24351,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* ar
   RkAcc x481 = rk_link_nf_k(arg4, x480, 0u);
   auto x482 = (::risc0::Fp::fromRaw(efl_arg9_82_0) - Fp(1u));
   RkAcc x483 = rk_link_k(x481, x482, 1u);
-  auto x484 = RK_LD1(arg0, 10u);
+  auto x484 = RK_LD1M(arg0, 10u);
   RkAcc x485 = rk_link_nf_k(x483, x484, 2u);
   auto x124 = ::risc0::Fp::fromRaw(efl_arg9_78_0);
   auto x487 = x124 - x399;
@@ -24310,7 +24362,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* ar
   FpExt x492 = rk_fin(rk_link_k(x490, x491, 6u));
   auto x493 = (::risc0::Fp::fromRaw(efl_arg9_142_0) - Fp(1u));
   RkAcc x494 = rk_link_nf_k(x492, x493, 7u);
-  auto x495 = RK_LD1(arg0, 11u);
+  auto x495 = RK_LD1M(arg0, 11u);
   FpExt x496 = rk_fin(rk_link_k(x494, x495, 8u));
   RkW _cx497 = _cx461; rk_cl_acc(_cx497, x114 * x496, 29u); FpExt x497 = rkw_fin(_cx497);
   auto x125 = ::risc0::Fp::fromRaw(efl_arg9_142_0);
@@ -24354,7 +24406,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg9_144_0 = EF_LDCR(arg9, 144u, 0u);
   auto x523 = (::risc0::Fp::fromRaw(efl_arg9_91_0) - Fp(1u));
   RkAcc x524 = rk_link_k(x522, x523, 1u);
-  auto x525 = RK_LD1(arg0, 12u);
+  auto x525 = RK_LD1M(arg0, 12u);
   RkAcc x526 = rk_link_nf_k(x524, x525, 2u);
   auto x132 = ::risc0::Fp::fromRaw(efl_arg9_87_0);
   auto x528 = x132 - x400;
@@ -24365,7 +24417,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* ar
   FpExt x533 = rk_fin(rk_link_k(x531, x532, 6u));
   auto x534 = (::risc0::Fp::fromRaw(efl_arg9_144_0) - Fp(1u));
   RkAcc x535 = rk_link_nf_k(x533, x534, 7u);
-  auto x536 = RK_LD1(arg0, 13u);
+  auto x536 = RK_LD1M(arg0, 13u);
   FpExt x537 = rk_fin(rk_link_k(x535, x536, 8u));
   RkW _cx538 = _cx502; rk_cl_acc(_cx538, x114 * x537, 53u); FpExt x538 = rkw_fin(_cx538);
   auto x133 = ::risc0::Fp::fromRaw(efl_arg9_144_0);
@@ -24410,7 +24462,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg9_146_0 = EF_LDCR(arg9, 146u, 0u);
   auto x564 = (::risc0::Fp::fromRaw(efl_arg9_100_0) - Fp(1u));
   RkAcc x565 = rk_link_k(x563, x564, 1u);
-  auto x566 = RK_LD1(arg0, 14u);
+  auto x566 = RK_LD1M(arg0, 14u);
   RkAcc x567 = rk_link_nf_k(x565, x566, 2u);
   auto x140 = ::risc0::Fp::fromRaw(efl_arg9_96_0);
   auto x569 = x140 - x401;
@@ -24421,7 +24473,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* ar
   FpExt x574 = rk_fin(rk_link_k(x572, x573, 6u));
   auto x575 = (::risc0::Fp::fromRaw(efl_arg9_146_0) - Fp(1u));
   RkAcc x576 = rk_link_nf_k(x574, x575, 7u);
-  auto x577 = RK_LD1(arg0, 15u);
+  auto x577 = RK_LD1M(arg0, 15u);
   FpExt x578 = rk_fin(rk_link_k(x576, x577, 8u));
   RkW _cx579 = _cx543; rk_cl_acc(_cx579, x114 * x578, 77u); FpExt x579 = rkw_fin(_cx579);
   auto x141 = ::risc0::Fp::fromRaw(efl_arg9_146_0);
@@ -24465,7 +24517,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* ar
   const uint32_t efl_arg9_108_0 = EF_LDCR(arg9, 108u, 0u);
   const uint32_t efl_arg9_148_0 = EF_LDCR(arg9, 148u, 0u);
   RkAcc x606 = rk_link_k(x604, x605, 1u);
-  auto x607 = RK_LD1(arg0, 16u);
+  auto x607 = RK_LD1M(arg0, 16u);
   RkAcc x608 = rk_link_nf_k(x606, x607, 2u);
   auto x148 = ::risc0::Fp::fromRaw(efl_arg9_105_0);
   auto x610 = x148 - x402;
@@ -24476,7 +24528,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* ar
   FpExt x615 = rk_fin(rk_link_k(x613, x614, 6u));
   auto x616 = (::risc0::Fp::fromRaw(efl_arg9_148_0) - Fp(1u));
   RkAcc x617 = rk_link_nf_k(x615, x616, 7u);
-  auto x618 = RK_LD1(arg0, 17u);
+  auto x618 = RK_LD1M(arg0, 17u);
   FpExt x619 = rk_fin(rk_link_k(x617, x618, 8u));
   RkW _cx620 = _cx584; rk_cl_acc(_cx620, x114 * x619, 101u); FpExt x620 = rkw_fin(_cx620);
   auto x149 = ::risc0::Fp::fromRaw(efl_arg9_148_0);
@@ -24862,9 +24914,9 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* ar
   EF_W((ef_wst(efw, 9u, x969);), RkAcc x970 = rk_link_k(x968, x969, 221u);)
   auto x971 = x911 - x69;
   EF_W((ef_wst(efw, 10u, x971); ef_wblk(efw, efd_266, 4u, efq_266_28); ef_wblk(efw, efd_266, 8u, efq_266_32);), RkAcc x972 = rk_link_nf_k(x970, x971, 222u);)
-  auto x973 = RK_LD4(arg2, 0u, 1u, 3u, 4u);
+  auto x973 = RK_LD4M(arg2, 0u, 1u, 3u, 4u);
   auto x974 = x973 - x819;
-  RK_ST4(arg2, 29u, 30u, 31u, 32u, x974);
+  RK_ST4M(arg2, 29u, 30u, 31u, 32u, x974);
   EF_W((efs_266 = rk_link_k(efs_266, x974, 223u); FpExt x975 = ef_wfin(efw, efd_266, 0u, rk_fin(efs_266));), FpExt x975 = rk_fin(rk_link_k(x972, x974, 223u));)
   RkW _cx976 = rk_cl0(x398, x103 * x975, 5u); FpExt x976 = rkw_fin(_cx976);
   auto x977 = x2002583 * x13;
@@ -25081,17 +25133,17 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* ar
   auto x1133 = x417 + x1113;
   auto x1134 = x416 + x1114;
   auto x1135 = x418 + x1115;
-  RK_ST1(arg0, 33u, x1135);
+  RK_ST1M(arg0, 33u, x1135);
   auto x1136 = x414 + x1116;
-  RK_ST1(arg0, 34u, x1136);
+  RK_ST1M(arg0, 34u, x1136);
   auto x1137 = x429 + x1113;
-  RK_ST1(arg0, 35u, x1137);
+  RK_ST1M(arg0, 35u, x1137);
   auto x1138 = x428 + x1114;
-  RK_ST1(arg0, 36u, x1138);
+  RK_ST1M(arg0, 36u, x1138);
   auto x1139 = x430 + x1115;
-  RK_ST1(arg0, 37u, x1139);
+  RK_ST1M(arg0, 37u, x1139);
   auto x1140 = x426 + x1116;
-  RK_ST1(arg0, 38u, x1140);
+  RK_ST1M(arg0, 38u, x1140);
   auto x1141 = x1117 - x178;
   auto x1143 = x1118 - x179;
   auto x1145 = x1119 - x180;
@@ -25163,7 +25215,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* ar
   auto x1177 = rv32im_v2_11(cycle, steps, arg0, x1176.elems[0], x1176.elems[1], x1176.elems[2], x1176.elems[3], x1048.elems[0], x1048.elems[1], x1048.elems[2], x1048.elems[3], x376.elems[0], x376.elems[1], x376.elems[2], x376.elems[3], arg6.elems[0], arg6.elems[1], arg6.elems[2], arg6.elems[3], arg5.elems[0], arg5.elems[1], arg5.elems[2], arg5.elems[3], arg4.elems[0], arg4.elems[1], arg4.elems[2], arg4.elems[3], arg7.elems[0], arg7.elems[1], arg7.elems[2], arg7.elems[3], arg8.elems[0], arg8.elems[1], arg8.elems[2], arg8.elems[3]);
   return x1177;
 }
-__device__ EF_NOINLINE FpExt rv32im_v2_8(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3, Fp arg7_e0, Fp arg7_e1, Fp arg7_e2, Fp arg7_e3, Fp arg8_e0, Fp arg8_e1, Fp arg8_e2, Fp arg8_e3) {
+__device__ EF_CHAIN FpExt rv32im_v2_8(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3, Fp arg7_e0, Fp arg7_e1, Fp arg7_e2, Fp arg7_e3, Fp arg8_e0, Fp arg8_e1, Fp arg8_e2, Fp arg8_e3) {
   FpExt* arg2 = reinterpret_cast<FpExt*>(arg0);
   Fp* arg9 = EF_GPTR(0);
   Fp* arg10 = EF_GPTR(1);
@@ -25176,10 +25228,10 @@ __device__ EF_NOINLINE FpExt rv32im_v2_8(uint32_t cycle, uint32_t steps, Fp* arg
   FpExt arg6(arg6_e0, arg6_e1, arg6_e2, arg6_e3);
   FpExt arg7(arg7_e0, arg7_e1, arg7_e2, arg7_e3);
   FpExt arg8(arg8_e0, arg8_e1, arg8_e2, arg8_e3);
-  size_t mask = steps - 1; const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = (uint32_t)cycle;
+  size_t mask = steps - 1; uint32_t rk_c_o = (uint32_t)cycle; EF_OPQ(rk_c_o, 20); const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = rk_c_o;
   const uint32_t efl_arg9_91_0 = EF_LDCR(arg9, 91u, 0u);
   const uint32_t efl_arg9_90_0 = EF_LDCR(arg9, 90u, 0u);
-  auto x59 = RK_LD1(arg0, 29u);
+  auto x59 = RK_LD1M(arg0, 29u);
   auto x60 = ef_lmul(x59, x59);
   auto x61 = x60 * x59;
   auto x35 = ::risc0::Fp::fromRaw(efl_arg9_91_0);
@@ -25190,51 +25242,51 @@ __device__ EF_NOINLINE FpExt rv32im_v2_8(uint32_t cycle, uint32_t steps, Fp* arg
   auto x36 = ::risc0::Fp::fromRaw(efl_arg9_90_0);
   auto x66 = x65 - x36;
   EF_W((ef_wst(efw, 1u, x66);), RkAcc x67 = rk_link_k(x63, x66, 19u);)
-  auto x68 = RK_LD1(arg0, 5u);
+  auto x68 = RK_LD1M(arg0, 5u);
   auto x69 = x36 + x68;
-  auto x70 = RK_LD1(arg0, 7u);
+  auto x70 = RK_LD1M(arg0, 7u);
   auto x71 = x69 + x70;
-  auto x72 = RK_LD1(arg0, 8u);
+  auto x72 = RK_LD1M(arg0, 8u);
   auto x73 = x71 + x72;
-  auto x74 = RK_LD1(arg0, 9u);
+  auto x74 = RK_LD1M(arg0, 9u);
   auto x75 = x73 + x74;
-  auto x76 = RK_LD1(arg0, 10u);
+  auto x76 = RK_LD1M(arg0, 10u);
   auto x77 = x75 + x76;
-  auto x78 = RK_LD1(arg0, 11u);
+  auto x78 = RK_LD1M(arg0, 11u);
   auto x79 = x77 + x78;
-  auto x80 = RK_LD1(arg0, 12u);
+  auto x80 = RK_LD1M(arg0, 12u);
   auto x81 = x79 + x80;
-  auto x82 = RK_LD1(arg0, 13u);
+  auto x82 = RK_LD1M(arg0, 13u);
   auto x83 = x81 + x82;
-  auto x84 = RK_LD1(arg0, 14u);
+  auto x84 = RK_LD1M(arg0, 14u);
   auto x85 = x83 + x84;
-  auto x86 = RK_LD1(arg0, 15u);
+  auto x86 = RK_LD1M(arg0, 15u);
   auto x87 = x85 + x86;
-  auto x88 = RK_LD1(arg0, 16u);
+  auto x88 = RK_LD1M(arg0, 16u);
   auto x89 = x87 + x88;
-  auto x90 = RK_LD1(arg0, 17u);
+  auto x90 = RK_LD1M(arg0, 17u);
   auto x91 = x89 + x90;
-  auto x92 = RK_LD1(arg0, 18u);
+  auto x92 = RK_LD1M(arg0, 18u);
   auto x93 = x91 + x92;
-  auto x94 = RK_LD1(arg0, 19u);
+  auto x94 = RK_LD1M(arg0, 19u);
   auto x95 = x93 + x94;
-  auto x96 = RK_LD1(arg0, 20u);
+  auto x96 = RK_LD1M(arg0, 20u);
   auto x97 = x95 + x96;
-  auto x98 = RK_LD1(arg0, 21u);
+  auto x98 = RK_LD1M(arg0, 21u);
   auto x99 = x97 + x98;
-  auto x100 = RK_LD1(arg0, 22u);
+  auto x100 = RK_LD1M(arg0, 22u);
   auto x101 = x99 + x100;
-  auto x102 = RK_LD1(arg0, 23u);
+  auto x102 = RK_LD1M(arg0, 23u);
   auto x103 = x101 + x102;
-  auto x104 = RK_LD1(arg0, 24u);
+  auto x104 = RK_LD1M(arg0, 24u);
   auto x105 = x103 + x104;
-  auto x106 = RK_LD1(arg0, 25u);
+  auto x106 = RK_LD1M(arg0, 25u);
   auto x107 = x105 + x106;
-  auto x108 = RK_LD1(arg0, 26u);
+  auto x108 = RK_LD1M(arg0, 26u);
   auto x109 = x107 + x108;
-  auto x110 = RK_LD1(arg0, 27u);
+  auto x110 = RK_LD1M(arg0, 27u);
   auto x111 = x109 + x110;
-  auto x112 = RK_LD1(arg0, 28u);
+  auto x112 = RK_LD1M(arg0, 28u);
   auto x113 = x111 + x112;
   constexpr Fp x34(1083257840);
   auto x114 = x36 * x34;
@@ -26114,75 +26166,75 @@ __device__ EF_NOINLINE FpExt rv32im_v2_8(uint32_t cycle, uint32_t steps, Fp* arg
   auto x915 = x913 + x914;
   auto x916 = x837 * x33;
   auto x917 = x913 + x916;
-  RK_ST1(arg0, 5u, x917);
+  RK_ST1M(arg0, 5u, x917);
   auto x918 = x839 * x32;
   auto x919 = x913 + x918;
-  RK_ST1(arg0, 7u, x919);
+  RK_ST1M(arg0, 7u, x919);
   auto x920 = x841 * x31;
   auto x921 = x913 + x920;
-  RK_ST1(arg0, 8u, x921);
+  RK_ST1M(arg0, 8u, x921);
   auto x922 = x843 * x30;
   auto x923 = x913 + x922;
-  RK_ST1(arg0, 9u, x923);
+  RK_ST1M(arg0, 9u, x923);
   auto x924 = x845 * x29;
   auto x925 = x913 + x924;
-  RK_ST1(arg0, 10u, x925);
+  RK_ST1M(arg0, 10u, x925);
   auto x926 = x847 * x28;
   auto x927 = x913 + x926;
-  RK_ST1(arg0, 11u, x927);
+  RK_ST1M(arg0, 11u, x927);
   auto x928 = x849 * x27;
   auto x929 = x913 + x928;
-  RK_ST1(arg0, 12u, x929);
+  RK_ST1M(arg0, 12u, x929);
   auto x930 = x851 * x26;
   auto x931 = x913 + x930;
-  RK_ST1(arg0, 13u, x931);
+  RK_ST1M(arg0, 13u, x931);
   auto x932 = x853 * x25;
   auto x933 = x913 + x932;
-  RK_ST1(arg0, 14u, x933);
+  RK_ST1M(arg0, 14u, x933);
   auto x934 = x855 * x24;
   auto x935 = x913 + x934;
-  RK_ST1(arg0, 15u, x935);
+  RK_ST1M(arg0, 15u, x935);
   auto x936 = x857 * x23;
   auto x937 = x913 + x936;
-  RK_ST1(arg0, 16u, x937);
+  RK_ST1M(arg0, 16u, x937);
   auto x938 = x859 * x22;
   auto x939 = x913 + x938;
-  RK_ST1(arg0, 17u, x939);
+  RK_ST1M(arg0, 17u, x939);
   auto x940 = x861 * x21;
   auto x941 = x913 + x940;
-  RK_ST1(arg0, 18u, x941);
+  RK_ST1M(arg0, 18u, x941);
   auto x942 = x863 * x20;
   auto x943 = x913 + x942;
-  RK_ST1(arg0, 19u, x943);
+  RK_ST1M(arg0, 19u, x943);
   auto x944 = x865 * x19;
   auto x945 = x913 + x944;
-  RK_ST1(arg0, 20u, x945);
+  RK_ST1M(arg0, 20u, x945);
   auto x946 = x867 * x18;
   auto x947 = x913 + x946;
-  RK_ST1(arg0, 21u, x947);
+  RK_ST1M(arg0, 21u, x947);
   auto x948 = x869 * x17;
   auto x949 = x913 + x948;
-  RK_ST1(arg0, 22u, x949);
+  RK_ST1M(arg0, 22u, x949);
   auto x950 = x871 * x16;
   auto x951 = x913 + x950;
-  RK_ST1(arg0, 23u, x951);
+  RK_ST1M(arg0, 23u, x951);
   auto x952 = x873 * x15;
   auto x953 = x913 + x952;
-  RK_ST1(arg0, 24u, x953);
+  RK_ST1M(arg0, 24u, x953);
   auto x954 = x875 * x14;
   auto x955 = x913 + x954;
-  RK_ST1(arg0, 25u, x955);
+  RK_ST1M(arg0, 25u, x955);
   auto x956 = x877 * x13;
   auto x957 = x913 + x956;
-  RK_ST1(arg0, 26u, x957);
+  RK_ST1M(arg0, 26u, x957);
   const uint32_t efl_arg9_113_0 = EF_LDCR(arg9, 113u, 0u);
   const uint32_t efl_arg9_112_0 = EF_LDCR(arg9, 112u, 0u);
   auto x958 = x879 * x12;
   auto x959 = x913 + x958;
-  RK_ST1(arg0, 27u, x959);
+  RK_ST1M(arg0, 27u, x959);
   auto x960 = x881 * x11;
   auto x961 = x913 + x960;
-  RK_ST1(arg0, 28u, x961);
+  RK_ST1M(arg0, 28u, x961);
   constexpr Fp x0(1810596765);
   auto x962 = x915 + x0;
   auto x963 = ef_lmul(x962, x962);
@@ -26213,11 +26265,11 @@ __device__ EF_NOINLINE FpExt rv32im_v2_8(uint32_t cycle, uint32_t steps, Fp* arg
   auto x986 = x985 + x947;
   auto x987 = x986 + x949;
   auto x988 = x987 + x951;
-  RK_ST1(arg0, 29u, x988);
+  RK_ST1M(arg0, 29u, x988);
   auto x989 = rv32im_v2_7(cycle, steps, arg0, x970.elems[0], x970.elems[1], x970.elems[2], x970.elems[3], arg3.elems[0], arg3.elems[1], arg3.elems[2], arg3.elems[3], arg4.elems[0], arg4.elems[1], arg4.elems[2], arg4.elems[3], arg5.elems[0], arg5.elems[1], arg5.elems[2], arg5.elems[3], arg6.elems[0], arg6.elems[1], arg6.elems[2], arg6.elems[3], arg7.elems[0], arg7.elems[1], arg7.elems[2], arg7.elems[3], arg8.elems[0], arg8.elems[1], arg8.elems[2], arg8.elems[3]);
   return x989;
 }
-__device__ EF_NOINLINE FpExt rv32im_v2_4(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3, Fp arg7_e0, Fp arg7_e1, Fp arg7_e2, Fp arg7_e3) {
+__device__ EF_CHAIN FpExt rv32im_v2_4(uint32_t cycle, uint32_t steps, Fp* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3, Fp arg4_e0, Fp arg4_e1, Fp arg4_e2, Fp arg4_e3, Fp arg5_e0, Fp arg5_e1, Fp arg5_e2, Fp arg5_e3, Fp arg6_e0, Fp arg6_e1, Fp arg6_e2, Fp arg6_e3, Fp arg7_e0, Fp arg7_e1, Fp arg7_e2, Fp arg7_e3) {
   FpExt* arg8 = reinterpret_cast<FpExt*>(arg0);
   Fp* arg9 = EF_GPTR(0);
   Fp* arg10 = EF_GPTR(1);
@@ -26230,7 +26282,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_4(uint32_t cycle, uint32_t steps, Fp* arg
   FpExt arg5(arg5_e0, arg5_e1, arg5_e2, arg5_e3);
   FpExt arg6(arg6_e0, arg6_e1, arg6_e2, arg6_e3);
   FpExt arg7(arg7_e0, arg7_e1, arg7_e2, arg7_e3);
-  size_t mask = steps - 1; const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = (uint32_t)cycle;
+  size_t mask = steps - 1; uint32_t rk_c_o = (uint32_t)cycle; EF_OPQ(rk_c_o, 21); const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = rk_c_o;
   const uint32_t efl_arg9_108_8 = EF_LDCR(arg9, 108u, 8u);
   const uint32_t efl_arg9_110_8 = EF_LDCR(arg9, 110u, 8u);
   const uint32_t efl_arg9_109_8 = EF_LDCR(arg9, 109u, 8u);
@@ -26290,72 +26342,72 @@ __device__ EF_NOINLINE FpExt rv32im_v2_4(uint32_t cycle, uint32_t steps, Fp* arg
   auto x303 = ef_lmul(x35, x26);
   auto x304 = x303 * x37;
   auto x305 = x302 - x304;
-  auto x306 = RK_LD1(arg0, 33u);
-  auto x308 = RK_LD1(arg0, 34u);
-  auto x310 = RK_LD1(arg0, 35u);
-  auto x312 = RK_LD1(arg0, 36u);
-  auto x314 = RK_LD1(arg0, 37u);
-  auto x316 = RK_LD1(arg0, 38u);
-  auto x318 = RK_LD1(arg0, 39u);
-  auto x320 = RK_LD1(arg0, 40u);
-  auto x322 = RK_LD1(arg0, 41u);
-  auto x324 = RK_LD1(arg0, 42u);
-  auto x326 = RK_LD1(arg0, 43u);
-  auto x328 = RK_LD1(arg0, 44u);
-  auto x330 = RK_LD1(arg0, 45u);
-  auto x332 = RK_LD1(arg0, 46u);
-  auto x334 = RK_LD1(arg0, 47u);
-  auto x336 = RK_LD1(arg0, 0u);
+  auto x306 = RK_LD1M(arg0, 33u);
+  auto x308 = RK_LD1M(arg0, 34u);
+  auto x310 = RK_LD1M(arg0, 35u);
+  auto x312 = RK_LD1M(arg0, 36u);
+  auto x314 = RK_LD1M(arg0, 37u);
+  auto x316 = RK_LD1M(arg0, 38u);
+  auto x318 = RK_LD1M(arg0, 39u);
+  auto x320 = RK_LD1M(arg0, 40u);
+  auto x322 = RK_LD1M(arg0, 41u);
+  auto x324 = RK_LD1M(arg0, 42u);
+  auto x326 = RK_LD1M(arg0, 43u);
+  auto x328 = RK_LD1M(arg0, 44u);
+  auto x330 = RK_LD1M(arg0, 45u);
+  auto x332 = RK_LD1M(arg0, 46u);
+  auto x334 = RK_LD1M(arg0, 47u);
+  auto x336 = RK_LD1M(arg0, 0u);
   const uint32_t efl_arg9_104_60 = EF_LDCR(arg9, 104u, 60u);
   const uint32_t efl_arg9_115_60 = EF_LDCR(arg9, 115u, 60u);
   const uint32_t efl_arg9_105_60 = EF_LDCR(arg9, 105u, 60u);
   const uint32_t efl_arg9_116_60 = EF_LDCR(arg9, 116u, 60u);
   const uint32_t efl_arg9_106_60 = EF_LDCR(arg9, 106u, 60u);
   const uint32_t efl_arg9_117_60 = EF_LDCR(arg9, 117u, 60u);
-  auto x352 = RK_LD1(arg0, 49u);
-  auto x354 = RK_LD1(arg0, 50u);
-  auto x356 = RK_LD1(arg0, 51u);
-  auto x358 = RK_LD1(arg0, 54u);
-  auto x360 = RK_LD1(arg0, 55u);
-  auto x362 = RK_LD1(arg0, 56u);
-  auto x364 = RK_LD1(arg0, 57u);
-  auto x366 = RK_LD1(arg0, 58u);
-  auto x368 = RK_LD1(arg0, 59u);
-  auto x370 = RK_LD1(arg0, 60u);
-  auto x372 = RK_LD1(arg0, 61u);
-  auto x374 = RK_LD1(arg0, 62u);
+  auto x352 = RK_LD1M(arg0, 49u);
+  auto x354 = RK_LD1M(arg0, 50u);
+  auto x356 = RK_LD1M(arg0, 51u);
+  auto x358 = RK_LD1M(arg0, 54u);
+  auto x360 = RK_LD1M(arg0, 55u);
+  auto x362 = RK_LD1M(arg0, 56u);
+  auto x364 = RK_LD1M(arg0, 57u);
+  auto x366 = RK_LD1M(arg0, 58u);
+  auto x368 = RK_LD1M(arg0, 59u);
+  auto x370 = RK_LD1M(arg0, 60u);
+  auto x372 = RK_LD1M(arg0, 61u);
+  auto x374 = RK_LD1M(arg0, 62u);
   auto x376 = ((::risc0::Fp::fromRaw(efl_arg9_104_60) + ::risc0::Fp::fromRaw(efl_arg9_115_60)) - ((::risc0::Fp::fromRaw(efl_arg9_104_60) * Fp(2u)) * ::risc0::Fp::fromRaw(efl_arg9_115_60)));
   auto x378 = ((::risc0::Fp::fromRaw(efl_arg9_105_60) + ::risc0::Fp::fromRaw(efl_arg9_116_60)) - ((::risc0::Fp::fromRaw(efl_arg9_105_60) * Fp(2u)) * ::risc0::Fp::fromRaw(efl_arg9_116_60)));
   auto x380 = ((::risc0::Fp::fromRaw(efl_arg9_106_60) + ::risc0::Fp::fromRaw(efl_arg9_117_60)) - ((::risc0::Fp::fromRaw(efl_arg9_106_60) * Fp(2u)) * ::risc0::Fp::fromRaw(efl_arg9_117_60)));
-  auto x382 = RK_LD1(arg0, 48u);
-  auto x398 = RK_LD1(arg0, 64u);
-  auto x400 = RK_LD1(arg0, 65u);
-  auto x402 = RK_LD1(arg0, 66u);
-  auto x404 = RK_LD1(arg0, 67u);
-  auto x406 = RK_LD1(arg0, 68u);
-  auto x408 = RK_LD1(arg0, 69u);
-  auto x410 = RK_LD1(arg0, 70u);
-  auto x412 = RK_LD1(arg0, 71u);
+  auto x382 = RK_LD1M(arg0, 48u);
+  auto x398 = RK_LD1M(arg0, 64u);
+  auto x400 = RK_LD1M(arg0, 65u);
+  auto x402 = RK_LD1M(arg0, 66u);
+  auto x404 = RK_LD1M(arg0, 67u);
+  auto x406 = RK_LD1M(arg0, 68u);
+  auto x408 = RK_LD1M(arg0, 69u);
+  auto x410 = RK_LD1M(arg0, 70u);
+  auto x412 = RK_LD1M(arg0, 71u);
   const uint32_t efl_arg9_107_8 = EF_LDCR(arg9, 107u, 8u);
   const uint32_t efl_arg9_193_0 = EF_LDCR(arg9, 193u, 0u);
-  auto x414 = RK_LD1(arg0, 72u);
-  auto x416 = RK_LD1(arg0, 73u);
-  auto x418 = RK_LD1(arg0, 74u);
-  auto x420 = RK_LD1(arg0, 75u);
-  auto x422 = RK_LD1(arg0, 76u);
-  auto x424 = RK_LD1(arg0, 77u);
-  auto x426 = RK_LD1(arg0, 78u);
-  auto x428 = RK_LD1(arg0, 63u);
+  auto x414 = RK_LD1M(arg0, 72u);
+  auto x416 = RK_LD1M(arg0, 73u);
+  auto x418 = RK_LD1M(arg0, 74u);
+  auto x420 = RK_LD1M(arg0, 75u);
+  auto x422 = RK_LD1M(arg0, 76u);
+  auto x424 = RK_LD1M(arg0, 77u);
+  auto x426 = RK_LD1M(arg0, 78u);
+  auto x428 = RK_LD1M(arg0, 63u);
   const uint32_t efl_arg9_194_0 = EF_LDCR(arg9, 194u, 0u);
   const uint32_t efl_arg9_195_0 = EF_LDCR(arg9, 195u, 0u);
   const uint32_t efl_arg9_196_0 = EF_LDCR(arg9, 196u, 0u);
-  auto x444 = RK_LD1(arg0, 80u);
-  auto x446 = RK_LD1(arg0, 81u);
-  auto x448 = RK_LD1(arg0, 82u);
-  auto x450 = RK_LD1(arg0, 83u);
-  auto x452 = RK_LD1(arg0, 84u);
+  auto x444 = RK_LD1M(arg0, 80u);
+  auto x446 = RK_LD1M(arg0, 81u);
+  auto x448 = RK_LD1M(arg0, 82u);
+  auto x450 = RK_LD1M(arg0, 83u);
+  auto x452 = RK_LD1M(arg0, 84u);
   auto x454 = ((::risc0::Fp::fromRaw(efl_arg9_107_8) + ::risc0::Fp::fromRaw(efl_arg9_109_8)) - ((::risc0::Fp::fromRaw(efl_arg9_107_8) * Fp(2u)) * ::risc0::Fp::fromRaw(efl_arg9_109_8)));
-  auto x465 = RK_LD1(arg0, 79u);
+  auto x465 = RK_LD1M(arg0, 79u);
   auto x607 = (::risc0::Fp::fromRaw(efl_arg9_193_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_193_0)));
   const uint32_t efl_arg9_197_0 = EF_LDCR(arg9, 197u, 0u);
   const uint32_t efl_arg9_198_0 = EF_LDCR(arg9, 198u, 0u);
@@ -26365,8 +26417,8 @@ __device__ EF_NOINLINE FpExt rv32im_v2_4(uint32_t cycle, uint32_t steps, Fp* arg
   EF_W((ef_wst(efw, 1u, x609);), RkAcc x610 = rk_link_k(x608, x609, 14u);)
   auto x611 = (::risc0::Fp::fromRaw(efl_arg9_195_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_195_0)));
   EF_W((ef_wst(efw, 2u, x611);), RkAcc x612 = rk_link_nf_k(x610, x611, 15u);)
-  auto x613 = RK_LD1(arg0, 27u);
-  auto x615 = RK_LD1(arg0, 26u);
+  auto x613 = RK_LD1M(arg0, 27u);
+  auto x615 = RK_LD1M(arg0, 26u);
   auto x617 = (::risc0::Fp::fromRaw(efl_arg9_196_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_196_0)));
   const uint32_t efl_arg9_101_0 = EF_LDCR(arg9, 101u, 0u);
   const uint32_t efl_arg9_102_0 = EF_LDCR(arg9, 102u, 0u);
@@ -26377,7 +26429,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_4(uint32_t cycle, uint32_t steps, Fp* arg
   EF_W((const int efq_270_4 = ef_wq(efw, 17u); ef_wst(efw, 4u, x619);), RkAcc x620 = rk_link_nf_k(x618, x619, 17u);)
   auto x621 = (::risc0::Fp::fromRaw(efl_arg9_198_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_198_0)));
   EF_W((ef_wst(efw, 5u, x621);), RkAcc x622 = rk_link_k(x620, x621, 18u);)
-  auto x623 = RK_LD1(arg0, 28u);
+  auto x623 = RK_LD1M(arg0, 28u);
   auto x625 = (::risc0::Fp::fromRaw(efl_arg9_100_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_100_0)));
   EF_W((ef_wst(efw, 6u, x625);), RkAcc x626 = rk_link_nf_k(x622, x625, 19u);)
   const uint32_t efl_arg9_105_0 = EF_LDCR(arg9, 105u, 0u);
@@ -26472,7 +26524,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_4(uint32_t cycle, uint32_t steps, Fp* arg
   EF_W((const int efq_270_36 = ef_wq(efw, 49u); ef_wst(efw, 12u, x685);), RkAcc x686 = rk_link_nf_k(x684, x685, 49u);)
   auto x687 = (::risc0::Fp::fromRaw(efl_arg9_131_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_131_0)));
   EF_W((ef_wst(efw, 13u, x687);), RkAcc x688 = rk_link_k(x686, x687, 50u);)
-  auto x689 = RK_LD1(arg0, 18u);
+  auto x689 = RK_LD1M(arg0, 18u);
   auto x2002640 = x334 + x426;
   const uint32_t efl_arg9_114_28 = EF_LDCR(arg9, 114u, 28u);
   const uint32_t efl_arg9_113_64 = EF_LDCR(arg9, 113u, 64u);
@@ -26632,7 +26684,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_4(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx2002719 = rkw1_ff0(x2002698, x26, true); rkw1_v(_wx2002719, x689, false); rkw1_v(_wx2002719, x613, false); rkw1_v(_wx2002719, x336, true); rkw1_v(_wx2002719, x428, true); rkw1_v(_wx2002719, x53, true); rkw1_v(_wx2002719, x85, true); rkw1_ff(_wx2002719, x2002694, x25, true); rkw1_ff(_wx2002719, x2002690, x24, true); rkw1_ff(_wx2002719, x2002686, x23, true); rkw1_ff(_wx2002719, x2002682, x22, true); rkw1_ff(_wx2002719, x2002678, x21, true); rkw1_ff(_wx2002719, x2002674, x20, true); rkw1_ff(_wx2002719, x2002670, x19, true); rkw1_ff(_wx2002719, x2002666, x18, true); rkw1_ff(_wx2002719, x2002662, x17, true); rkw1_ff(_wx2002719, x2002658, x16, true); rkw1_ff(_wx2002719, x2002654, x15, true); rkw1_ff(_wx2002719, x2002650, x14, true); rkw1_ff(_wx2002719, x2002646, x13, true); rkw1_ff(_wx2002719, x2002642, x12, true); auto x2002719 = rkw1_fin(_wx2002719);
   EF_W((ef_wst(efw, 14u, x2002719);), RkAcc x691 = rk_link_nf_k(x688, x2002719, 51u);)
-  auto x692 = RK_LD1(arg0, 19u);
+  auto x692 = RK_LD1M(arg0, 19u);
   auto x2002720 = x380 + x305;
   const uint32_t efl_arg9_130_28 = EF_LDCR(arg9, 130u, 28u);
   const uint32_t efl_arg9_129_64 = EF_LDCR(arg9, 129u, 64u);
@@ -26787,13 +26839,13 @@ __device__ EF_NOINLINE FpExt rv32im_v2_4(uint32_t cycle, uint32_t steps, Fp* arg
   EF_W((ef_wst(efw, 17u, x697);), RkAcc x698 = rk_link_k(x696, x697, 54u);)
   auto x699 = (::risc0::Fp::fromRaw(efl_arg9_201_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_201_0)));
   EF_W((ef_wst(efw, 18u, x699);), RkAcc x700 = rk_link_nf_k(x698, x699, 55u);)
-  auto x701 = RK_LD1(arg0, 20u);
+  auto x701 = RK_LD1M(arg0, 20u);
   const uint32_t efl_arg9_204_0 = EF_LDCR(arg9, 204u, 0u);
   const uint32_t efl_arg9_37_0 = EF_LDCR(arg9, 37u, 0u);
-  auto x702 = RK_LD1(arg0, 30u);
+  auto x702 = RK_LD1M(arg0, 30u);
   auto x703 = x701 - x702;
-  auto x704 = RK_LD1(arg0, 21u);
-  auto x705 = RK_LD1(arg0, 29u);
+  auto x704 = RK_LD1M(arg0, 21u);
+  auto x705 = RK_LD1M(arg0, 29u);
   auto x706 = x704 + x705;
   auto x707 = (::risc0::Fp::fromRaw(efl_arg9_202_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_202_0)));
   EF_W((ef_wst(efw, 19u, x707); ef_wblk(efw, efd_270, 12u, efq_270_36);), RkAcc x708 = rk_link_k(x700, x707, 56u);)
@@ -26803,9 +26855,9 @@ __device__ EF_NOINLINE FpExt rv32im_v2_4(uint32_t cycle, uint32_t steps, Fp* arg
   EF_W((const int efq_270_44 = ef_wq(efw, 57u); ef_wst(efw, 20u, x709);), RkAcc x710 = rk_link_nf_k(x708, x709, 57u);)
   auto x711 = (::risc0::Fp::fromRaw(efl_arg9_204_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_204_0)));
   EF_W((ef_wst(efw, 21u, x711);), RkAcc x712 = rk_link_k(x710, x711, 58u);)
-  auto x713 = RK_LD1(arg0, 31u);
+  auto x713 = RK_LD1M(arg0, 31u);
   auto x714 = x706 - x713;
-  auto x715 = RK_LD1(arg0, 9u);
+  auto x715 = RK_LD1M(arg0, 9u);
   EF_W((ef_wst(efw, 22u, x715);), RkAcc x716 = rk_link_nf_k(x712, x715, 59u);)
   auto x717 = (::risc0::Fp::fromRaw(efl_arg9_37_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_37_0)));
   const uint32_t efl_arg9_42_0 = EF_LDCR(arg9, 42u, 0u);
@@ -26813,9 +26865,9 @@ __device__ EF_NOINLINE FpExt rv32im_v2_4(uint32_t cycle, uint32_t steps, Fp* arg
   const uint32_t efl_arg9_44_0 = EF_LDCR(arg9, 44u, 0u);
   const uint32_t efl_arg9_45_0 = EF_LDCR(arg9, 45u, 0u);
   EF_W((ef_wst(efw, 23u, x717); ef_wblk(efw, efd_270, 16u, efq_270_40); ef_wblk(efw, efd_270, 20u, efq_270_44); efb_270 = ef_wfin(efw, efd_270, 0u, efb_270);), RkAcc x718 = rk_link_k(x716, x717, 60u);)
-  auto x719 = RK_LD1(arg0, 10u);
+  auto x719 = RK_LD1M(arg0, 10u);
   EF_W((efd_270[0] = efd_270[1] = efd_270[2] = efd_270[3] = ef_v4i{}; const int efq_270_48 = ef_wq(efw, 61u); ef_wst(efw, 0u, x719);), RkAcc x720 = rk_link_nf_k(x718, x719, 61u);)
-  auto x721 = RK_LD1(arg0, 11u);
+  auto x721 = RK_LD1M(arg0, 11u);
   EF_W((ef_wst(efw, 1u, x721);), RkAcc x722 = rk_link_k(x720, x721, 62u);)
   auto x723 = (::risc0::Fp::fromRaw(efl_arg9_40_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_40_0)));
   EF_W((ef_wst(efw, 2u, x723);), RkAcc x724 = rk_link_nf_k(x722, x723, 63u);)
@@ -26897,11 +26949,11 @@ __device__ EF_NOINLINE FpExt rv32im_v2_4(uint32_t cycle, uint32_t steps, Fp* arg
   EF_W((const int efq_270_76 = ef_wq(efw, 89u); ef_wst(efw, 4u, x775);), RkAcc x776 = rk_link_nf_k(x774, x775, 89u);)
   auto x777 = (::risc0::Fp::fromRaw(efl_arg9_67_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_67_0)));
   EF_W((ef_wst(efw, 5u, x777);), RkAcc x778 = rk_link_k(x776, x777, 90u);)
-  auto x779 = RK_LD1(arg0, 7u);
+  auto x779 = RK_LD1M(arg0, 7u);
   auto x780 = x779 - x703;
   EF_W((ef_wst(efw, 6u, x780);), RkAcc x781 = rk_link_nf_k(x778, x780, 91u);)
   const uint32_t efl_arg9_207_0 = EF_LDCR(arg9, 207u, 0u);
-  auto x782 = RK_LD1(arg0, 8u);
+  auto x782 = RK_LD1M(arg0, 8u);
   auto x783 = x782 - x714;
   EF_W((ef_wst(efw, 7u, x783); ef_wblk(efw, efd_270, 0u, efq_270_72);), RkAcc x784 = rk_link_k(x781, x783, 92u);)
   auto x785 = (::risc0::Fp::fromRaw(efl_arg9_205_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_205_0)));
@@ -26924,9 +26976,9 @@ __device__ EF_NOINLINE FpExt rv32im_v2_4(uint32_t cycle, uint32_t steps, Fp* arg
   RkW1 _wx796 = rkw1_ff0(x103, x25, false); rkw1_ff(_wx796, x102, x26, false); rkw1_v(_wx796, x104, false); auto x796 = rkw1_fin(_wx796);
   constexpr Fp x10(65536);
   auto x797 = x796 * x10;
-  auto x798 = RK_LD1(arg0, 24u);
+  auto x798 = RK_LD1M(arg0, 24u);
   auto x799 = x798 - x797;
-  auto x800 = RK_LD1(arg0, 25u);
+  auto x800 = RK_LD1M(arg0, 25u);
   const uint32_t efl_arg9_210_0 = EF_LDCR(arg9, 210u, 0u);
   auto x801 = x800 + x796;
   auto x105 = ::risc0::Fp::fromRaw(efl_arg9_208_0);
@@ -27044,10 +27096,10 @@ __device__ EF_NOINLINE FpExt rv32im_v2_4(uint32_t cycle, uint32_t steps, Fp* arg
   EF_W((const int efq_270_116 = ef_wq(efw, 129u); ef_wst(efw, 20u, x877);), RkAcc x878 = rk_link_nf_k(x876, x877, 129u);)
   auto x879 = (::risc0::Fp::fromRaw(efl_arg9_99_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_99_0)));
   EF_W((ef_wst(efw, 21u, x879);), RkAcc x880 = rk_link_k(x878, x879, 130u);)
-  auto x881 = RK_LD1(arg0, 14u);
+  auto x881 = RK_LD1M(arg0, 14u);
   auto x882 = x881 - x799;
   EF_W((ef_wst(efw, 22u, x882);), RkAcc x883 = rk_link_nf_k(x880, x882, 131u);)
-  auto x884 = RK_LD1(arg0, 15u);
+  auto x884 = RK_LD1M(arg0, 15u);
   auto x885 = x884 - x816;
   const uint32_t efl_arg9_29_4 = EF_LDCR(arg9, 29u, 4u);
   const uint32_t efl_arg9_29_0 = EF_LDCR(arg9, 29u, 0u);
@@ -27083,7 +27135,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_4(uint32_t cycle, uint32_t steps, Fp* arg
   const uint32_t efl_arg9_159_0 = EF_LDCR(arg9, 159u, 0u);
   auto x899 = (::risc0::Fp::fromRaw(efl_arg9_33_4) - ::risc0::Fp::fromRaw(efl_arg9_33_0));
   EF_W((const int efq_270_124 = ef_wq(efw, 137u); ef_wst(efw, 4u, x899);), RkAcc x900 = rk_link_nf_k(x898, x899, 137u);)
-  auto x901 = RK_LD1(arg0, 5u);
+  auto x901 = RK_LD1M(arg0, 5u);
   EF_W((ef_wst(efw, 5u, x901);), RkAcc x902 = rk_link_k(x900, x901, 138u);)
   auto x109 = ::risc0::Fp::fromRaw(efl_arg9_35_0);
   RkW1 _wx903 = rkw1_ff0(x108, x9, false); rkw1_ff(_wx903, x888, x8, false); rkw1_v(_wx903, x109, true); auto x903 = rkw1_fin(_wx903);
@@ -27265,9 +27317,9 @@ __device__ EF_NOINLINE FpExt rv32im_v2_4(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
-  auto x993 = RK_LD1(arg0, 22u);
+  auto x993 = RK_LD1M(arg0, 22u);
   // lincombF: fused into a lazy Fp linear combination
-  auto x995 = RK_LD1(arg0, 23u);
+  auto x995 = RK_LD1M(arg0, 23u);
   // lincombF: fused into a lazy Fp linear combination
   EF_W((ef_wst(efw, 3u, x611);), RkAcc x997 = rk_link_k(x926, x611, 8u);)
   EF_W((const int efq_271_4 = ef_wq(efw, 9u); ef_wst(efw, 4u, x617);), RkAcc x998 = rk_link_nf_k(x997, x617, 9u);)
@@ -27453,9 +27505,9 @@ __device__ EF_NOINLINE FpExt rv32im_v2_4(uint32_t cycle, uint32_t steps, Fp* arg
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
-  auto x1112 = RK_LD1(arg0, 52u);
+  auto x1112 = RK_LD1M(arg0, 52u);
   // lincombF: fused into a lazy Fp linear combination
-  auto x1114 = RK_LD1(arg0, 53u);
+  auto x1114 = RK_LD1M(arg0, 53u);
   // lincombF: fused into a lazy Fp linear combination
   EF_W((ef_wst(efw, 19u, x699); ef_wblk(efw, efd_271, 12u, efq_271_36);), RkAcc x1116 = rk_link_k(x1051, x699, 48u);)
   EF_W((const int efq_271_44 = ef_wq(efw, 49u); ef_wst(efw, 20u, x707);), RkAcc x1117 = rk_link_nf_k(x1116, x707, 49u);)
@@ -27540,18 +27592,18 @@ __device__ EF_NOINLINE FpExt rv32im_v2_4(uint32_t cycle, uint32_t steps, Fp* arg
   auto x200 = ::risc0::Fp::fromRaw(efl_arg9_138_0);
   auto x1185 = x200 - x1184;
   EF_W((const int efq_271_92 = ef_wq4(efw, 97u, 99u, 100u, 101u, 4u); ef_wst(efw, 20u, x1185);), RkAcc x1186 = rk_link_nf_k(x1183, x1185, 97u);)
-  auto x1188 = RK_LD1(arg0, 3u);
+  auto x1188 = RK_LD1M(arg0, 3u);
   auto x201 = ::risc0::Fp::fromRaw(efl_arg9_133_0);
   auto x1189 = x201 - x1188;
   const uint32_t efl_arg9_147_0 = EF_LDCR(arg9, 147u, 0u);
   EF_W((ef_wst(efw, 21u, x1189);), RkAcc x1190 = rk_link_k(x1186, x1189, 99u);)
   auto x1191 = (::risc0::Fp::fromRaw(efl_arg9_177_0) - Fp(1u));
   EF_W((ef_wst(efw, 22u, x1191);), RkAcc x1192 = rk_link_nf_k(x1190, x1191, 100u);)
-  auto x1193 = RK_LD1(arg0, 1u);
+  auto x1193 = RK_LD1M(arg0, 1u);
   EF_W((ef_wst(efw, 23u, x1193); ef_wblk(efw, efd_271, 16u, efq_271_88); ef_wblk(efw, efd_271, 20u, efq_271_92); efb_271 = ef_wfin(efw, efd_271, 0u, efb_271);), RkAcc x1194 = rk_link_k(x1192, x1193, 101u);)
-  auto x1195 = RK_LD1(arg0, 12u);
+  auto x1195 = RK_LD1M(arg0, 12u);
   EF_W((efd_271[0] = efd_271[1] = efd_271[2] = efd_271[3] = ef_v4i{}; const int efq_271_96 = ef_wq(efw, 102u); ef_wst(efw, 0u, x1195);), RkAcc x1196 = rk_link_nf_k(x1194, x1195, 102u);)
-  auto x1197 = RK_LD1(arg0, 13u);
+  auto x1197 = RK_LD1M(arg0, 13u);
   const uint32_t efl_arg9_142_0 = EF_LDCR(arg9, 142u, 0u);
   const uint32_t efl_arg9_180_0 = EF_LDCR(arg9, 180u, 0u);
   const uint32_t efl_arg9_143_0 = EF_LDCR(arg9, 143u, 0u);
@@ -27563,7 +27615,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_4(uint32_t cycle, uint32_t steps, Fp* arg
   auto x202 = ::risc0::Fp::fromRaw(efl_arg9_147_0);
   auto x1203 = x202 - x1184;
   EF_W((const int efq_271_100 = ef_wq4(efw, 106u, 108u, 109u, 110u, 4u); ef_wst(efw, 4u, x1203);), RkAcc x1204 = rk_link_nf_k(x1202, x1203, 106u);)
-  auto x1206 = RK_LD1(arg0, 4u);
+  auto x1206 = RK_LD1M(arg0, 4u);
   auto x203 = ::risc0::Fp::fromRaw(efl_arg9_142_0);
   auto x1207 = x203 - x1206;
   EF_W((ef_wst(efw, 5u, x1207);), RkAcc x1208 = rk_link_k(x1204, x1207, 108u);)
@@ -27572,9 +27624,9 @@ __device__ EF_NOINLINE FpExt rv32im_v2_4(uint32_t cycle, uint32_t steps, Fp* arg
   auto x1211 = (::risc0::Fp::fromRaw(efl_arg9_180_0) - ((::risc0::Fp::fromRaw(efl_arg9_147_0) - Fp(1u)) - ::risc0::Fp::fromRaw(efl_arg9_143_0)));
   EF_W((ef_wst(efw, 7u, x1211); ef_wblk(efw, efd_271, 0u, efq_271_96);), RkAcc x1212 = rk_link_k(x1210, x1211, 110u);)
   const uint32_t efl_arg9_25_0 = EF_LDCR(arg9, 25u, 0u);
-  auto x1213 = RK_LD1(arg0, 16u);
+  auto x1213 = RK_LD1M(arg0, 16u);
   EF_W((const int efq_271_104 = ef_wq(efw, 111u); ef_wst(efw, 8u, x1213);), RkAcc x1214 = rk_link_nf_k(x1212, x1213, 111u);)
-  auto x1215 = RK_LD1(arg0, 17u);
+  auto x1215 = RK_LD1M(arg0, 17u);
   EF_W((ef_wst(efw, 9u, x1215);), RkAcc x1216 = rk_link_k(x1214, x1215, 112u);)
   EF_W((ef_wst(efw, 10u, x112);), RkAcc x1217 = rk_link_nf_k(x1216, x112, 113u);)
   EF_W((ef_wst(efw, 11u, x113); ef_wblk(efw, efd_271, 4u, efq_271_100);), RkAcc x1218 = rk_link_k(x1217, x113, 114u);)
@@ -27862,7 +27914,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_4(uint32_t cycle, uint32_t steps, Fp* arg
   auto x1407 = rv32im_v2_3(cycle, steps, arg0, x1406.elems[0], x1406.elems[1], x1406.elems[2], x1406.elems[3], arg6.elems[0], arg6.elems[1], arg6.elems[2], arg6.elems[3], x1383.elems[0], x1383.elems[1], x1383.elems[2], x1383.elems[3], arg7.elems[0], arg7.elems[1], arg7.elems[2], arg7.elems[3], x1247.elems[0], x1247.elems[1], x1247.elems[2], x1247.elems[3]);
   return x1407;
 }
-__device__ EF_NOINLINE FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3) {
+__device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg0, Fp arg1_e0, Fp arg1_e1, Fp arg1_e2, Fp arg1_e3, Fp arg2_e0, Fp arg2_e1, Fp arg2_e2, Fp arg2_e3, Fp arg3_e0, Fp arg3_e1, Fp arg3_e2, Fp arg3_e3) {
   Fp* arg4 = EF_GPTR(0);
   Fp* rkBD = EF_GPTR(0);
   Fp* rkBA = EF_GPTR(1);
@@ -27871,13 +27923,13 @@ __device__ EF_NOINLINE FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* 
   FpExt arg2(arg2_e0, arg2_e1, arg2_e2, arg2_e3);
   FpExt arg3(arg3_e0, arg3_e1, arg3_e2, arg3_e3);
   size_t mask = steps - 1;
-  const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = (uint32_t)cycle;
+  uint32_t rk_c_o = (uint32_t)cycle; EF_OPQ(rk_c_o, 22); const uint32_t rk_s = EF_UNI32((uint32_t)steps), rk_m = rk_s - 1u, rk_c = rk_c_o;
   const uint32_t efl_rkBD_66_0 = EF_LDCR(rkBD, 66u, 0u);
   const uint32_t efl_rkBD_68_0 = EF_LDCR(rkBD, 68u, 0u);
-  auto x142 = RK_LD4(arg0, 320u, 321u, 322u, 323u);
-  auto x143 = RK_LD4(arg0, 316u, 317u, 318u, 319u);
+  auto x142 = RK_LD4L(arg0, 320u, 321u, 322u, 323u);
+  auto x143 = RK_LD4L(arg0, 316u, 317u, 318u, 319u);
   auto x144 = x142 - x143;
-  auto x145 = RK_LD4(arg0, 312u, 313u, 314u, 315u);
+  auto x145 = RK_LD4L(arg0, 312u, 313u, 314u, 315u);
   auto x146 = x144 - x145;
   RkAcc x147 = rk_link_nf_k(arg1, x146, 3u);
   FpExt r57_x343 = EF_PM(608);
@@ -27904,7 +27956,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* 
   const uint32_t efl_arg4_69_0 = EF_LDCR(arg4, 69u, 0u);
   const uint32_t efl_arg4_72_0 = EF_LDCR(arg4, 72u, 0u);
   auto x153 = static_cast<const ::risc0::FpExt>(::risc0::FpExt(r59_x630));
-  auto x158 = RK_LD4(arg0, 60u, 61u, 62u, 63u);
+  auto x158 = RK_LD4L(arg0, 60u, 61u, 62u, 63u);
   auto x1 = ::risc0::Fp::fromRaw(efl_arg4_65_0);
   auto x0 = ::risc0::Fp::fromRaw(efl_arg4_67_0);
   RkW _wx2001445 = rkw_ee(x158, x150);
@@ -27935,7 +27987,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* 
   const uint32_t efl_arg4_78_0 = EF_LDCR(arg4, 78u, 0u);
   auto x174 = x7 * x168;
   auto x175 = x174 + x166;
-  auto x180 = RK_LD4(arg0, 80u, 81u, 82u, 83u);
+  auto x180 = RK_LD4L(arg0, 80u, 81u, 82u, 83u);
   auto x6 = ::risc0::Fp::fromRaw(efl_arg4_71_0);
   auto x5 = ::risc0::Fp::fromRaw(efl_arg4_73_0);
   RkW _wx2001453 = rkw_ee(x180, x171);
@@ -27965,7 +28017,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* 
   auto r62_x1133 = r62_x231 * r62_x628;
   auto r62_x1134 = r62_x1133 + r62_x349;
   auto x193 = static_cast<const ::risc0::FpExt>(::risc0::FpExt(r62_x1134));
-  auto x198 = RK_LD4(arg0, 84u, 85u, 86u, 87u);
+  auto x198 = RK_LD4L(arg0, 84u, 85u, 86u, 87u);
   auto x12 = ::risc0::Fp::fromRaw(efl_arg4_77_0);
   auto x11 = ::risc0::Fp::fromRaw(efl_arg4_79_0);
   RkW _wx2001461 = rkw_ee(x198, x190);
@@ -28001,7 +28053,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* 
   auto x210 = x16 * x209;
   auto x211 = x210 + x166;
   const uint32_t efl_rkBD_138_0 = EF_LDCR(rkBD, 138u, 0u);
-  auto x216 = RK_LD4(arg0, 92u, 93u, 94u, 95u);
+  auto x216 = RK_LD4L(arg0, 92u, 93u, 94u, 95u);
   auto x3000054 = ::risc0::Fp::fromRaw(efl_arg4_83_0);
   auto x14 = ::risc0::Fp::fromRaw(efl_arg4_85_0);
   RkW _wx2001469 = rkw_ee(x216, x206);
@@ -28033,14 +28085,14 @@ __device__ EF_NOINLINE FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* 
   auto x224 = x222 * x223;
   auto x18 = ::risc0::Fp::fromRaw(efl_arg4_140_0);
   auto x19 = ::risc0::Fp::fromRaw(efl_arg4_137_0);
-  auto x227 = RK_LD4(arg0, 96u, 97u, 98u, 99u);
+  auto x227 = RK_LD4L(arg0, 96u, 97u, 98u, 99u);
   RkW _wx230 = rkw_ee(x227, x224);
   rkw_ef(_wx230, x19, x223, true);
   rkw_ef(_wx230, x18, x222, true);
   auto x230 = rkw_fin(_wx230);
   const uint32_t efl_arg4_195_0 = EF_LDCR(arg4, 195u, 0u);
   RkAcc x231 = rk_link_k(x221, x230, 8u);
-  auto x232 = RK_LD4(arg0, 104u, 105u, 106u, 107u);
+  auto x232 = RK_LD4L(arg0, 104u, 105u, 106u, 107u);
   FpExt x233 = rk_fin(rk_link_k(x231, x232, 9u));
   auto x20 = ::risc0::Fp::fromRaw(efl_arg4_9_0);
   RkW _cx234 = rk_cl0(arg2, x20 * x233, 453u);
@@ -28075,7 +28127,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* 
   auto x248 = static_cast<const ::risc0::FpExt>(::risc0::FpExt(r73_x291));
   auto x249 = x247 + x248;
   auto x250 = x249 + x166;
-  auto x255 = RK_LD4(arg0, 4u, 5u, 6u, 7u);
+  auto x255 = RK_LD4L(arg0, 4u, 5u, 6u, 7u);
   auto x24 = ::risc0::Fp::fromRaw(efl_arg4_192_0);
   auto x23 = ::risc0::Fp::fromRaw(efl_arg4_194_0);
   RkW _wx2001477 = rkw_ee(x255, x239);
@@ -28115,7 +28167,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* 
   rkw_ef(_wx288, x14, x267, false);
   rkw_v(_wx288, x166, false);
   auto x288 = rkw_fin(_wx288);
-  auto x293 = RK_LD4(arg0, 8u, 9u, 10u, 11u);
+  auto x293 = RK_LD4L(arg0, 8u, 9u, 10u, 11u);
   RkW _wx2001485 = rkw_ee(x293, x279);
   rkw_ef(_wx2001485, x5, x278, true);
   rkw_ef(_wx2001485, x12, x270, true);
@@ -28166,7 +28218,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* 
   rkw_ef(_wx324, x38, x267, false);
   rkw_v(_wx324, x166, false);
   auto x324 = rkw_fin(_wx324);
-  auto x329 = RK_LD4(arg0, 20u, 21u, 22u, 23u);
+  auto x329 = RK_LD4L(arg0, 20u, 21u, 22u, 23u);
   auto x34 = ::risc0::Fp::fromRaw(efl_arg4_86_0);
   auto x33 = ::risc0::Fp::fromRaw(efl_arg4_91_0);
   RkW _wx2001493 = rkw_ee(x329, x314);
@@ -28221,7 +28273,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* 
   rkw_ef(_wx359, x51, x267, false);
   rkw_v(_wx359, x166, false);
   auto x359 = rkw_fin(_wx359);
-  auto x364 = RK_LD4(arg0, 40u, 41u, 42u, 43u);
+  auto x364 = RK_LD4L(arg0, 40u, 41u, 42u, 43u);
   auto x3000055 = ::risc0::Fp::fromRaw(efl_arg4_100_0);
   const uint32_t efl_arg4_115_0 = EF_LDCR(arg4, 115u, 0u);
   const uint32_t efl_rkBD_114_0 = EF_LDCR(rkBD, 114u, 0u);
@@ -28439,7 +28491,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* 
   const uint32_t efl_arg4_160_0 = EF_LDCR(arg4, 160u, 0u);
   const uint32_t efl_arg4_163_0 = EF_LDCR(arg4, 163u, 0u);
   auto x499 = x498 + x166;
-  auto x504 = RK_LD4(arg0, 152u, 153u, 154u, 155u);
+  auto x504 = RK_LD4L(arg0, 152u, 153u, 154u, 155u);
   auto x93 = ::risc0::Fp::fromRaw(efl_arg4_157_0);
   auto x92 = ::risc0::Fp::fromRaw(efl_arg4_158_0);
   RkW _wx2001549 = rkw_ee(x504, x495);
@@ -28468,7 +28520,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* 
   const uint32_t efl_arg4_164_0 = EF_LDCR(arg4, 164u, 0u);
   const uint32_t efl_arg4_167_0 = EF_LDCR(arg4, 167u, 0u);
   auto x517 = static_cast<const ::risc0::FpExt>(::risc0::FpExt(r83_x646));
-  auto x522 = RK_LD4(arg0, 156u, 157u, 158u, 159u);
+  auto x522 = RK_LD4L(arg0, 156u, 157u, 158u, 159u);
   auto x97 = ::risc0::Fp::fromRaw(efl_arg4_161_0);
   auto x96 = ::risc0::Fp::fromRaw(efl_arg4_162_0);
   RkW _wx2001557 = rkw_ee(x522, x514);
@@ -28491,7 +28543,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* 
   auto x532 = x529 * x531;
   auto x535 = x41 * x168;
   auto x536 = x535 + x166;
-  auto x541 = RK_LD4(arg0, 160u, 161u, 162u, 163u);
+  auto x541 = RK_LD4L(arg0, 160u, 161u, 162u, 163u);
   auto x101 = ::risc0::Fp::fromRaw(efl_arg4_165_0);
   auto x100 = ::risc0::Fp::fromRaw(efl_arg4_166_0);
   const uint32_t efl_rkBD_103_0 = EF_LDCR(rkBD, 103u, 0u);
@@ -28524,7 +28576,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* 
   auto x552 = x50 * x168;
   auto x553 = x552 + x166;
   const uint32_t efl_arg4_175_0 = EF_LDCR(arg4, 175u, 0u);
-  auto x558 = RK_LD4(arg0, 168u, 169u, 170u, 171u);
+  auto x558 = RK_LD4L(arg0, 168u, 169u, 170u, 171u);
   auto x104 = ::risc0::Fp::fromRaw(efl_arg4_169_0);
   auto x103 = ::risc0::Fp::fromRaw(efl_arg4_170_0);
   RkW _wx2001573 = rkw_ee(x558, x549);
@@ -28553,7 +28605,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* 
   auto r89_x879 = r89_x878 + r89_x196;
   auto x571 = static_cast<const ::risc0::FpExt>(::risc0::FpExt(r89_x879));
   const uint32_t efl_arg4_179_0 = EF_LDCR(arg4, 179u, 0u);
-  auto x576 = RK_LD4(arg0, 208u, 209u, 210u, 211u);
+  auto x576 = RK_LD4L(arg0, 208u, 209u, 210u, 211u);
   auto x108 = ::risc0::Fp::fromRaw(efl_arg4_173_0);
   auto x107 = ::risc0::Fp::fromRaw(efl_arg4_174_0);
   RkW _wx2001581 = rkw_ee(x576, x568);
@@ -28576,7 +28628,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* 
   auto x586 = x583 * x585;
   auto x589 = x64 * x168;
   auto x590 = x589 + x166;
-  auto x595 = RK_LD4(arg0, 212u, 213u, 214u, 215u);
+  auto x595 = RK_LD4L(arg0, 212u, 213u, 214u, 215u);
   auto x112 = ::risc0::Fp::fromRaw(efl_arg4_177_0);
   auto x111 = ::risc0::Fp::fromRaw(efl_arg4_178_0);
   RkW _wx2001589 = rkw_ee(x595, x586);
@@ -28603,7 +28655,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* 
   const uint32_t efl_arg4_184_0 = EF_LDCR(arg4, 184u, 0u);
   auto x603 = static_cast<const ::risc0::FpExt>(::risc0::FpExt(r92_x902));
   auto x604 = x603 * x602;
-  auto x611 = RK_LD4(arg0, 216u, 217u, 218u, 219u);
+  auto x611 = RK_LD4L(arg0, 216u, 217u, 218u, 219u);
   auto x116 = ::risc0::Fp::fromRaw(efl_arg4_181_0);
   auto x115 = ::risc0::Fp::fromRaw(efl_arg4_182_0);
   RkW _wx2001597 = rkw_ee(x611, x604);
@@ -28629,7 +28681,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* 
   auto x121 = ::risc0::Fp::fromRaw(efl_arg4_189_0);
   auto x624 = x121 * x209;
   auto x625 = x624 + x166;
-  auto x630 = RK_LD4(arg0, 296u, 297u, 298u, 299u);
+  auto x630 = RK_LD4L(arg0, 296u, 297u, 298u, 299u);
   const uint32_t efl_arg4_191_0 = EF_LDCR(arg4, 191u, 0u);
   auto x120 = ::risc0::Fp::fromRaw(efl_arg4_185_0);
   auto x119 = ::risc0::Fp::fromRaw(efl_arg4_186_0);
@@ -28648,7 +28700,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* 
   auto x123 = ::risc0::Fp::fromRaw(efl_arg4_191_0);
   auto x636 = x123 * x209;
   auto x637 = x636 + x166;
-  auto x638 = RK_LD4(arg0, 304u, 305u, 306u, 307u);
+  auto x638 = RK_LD4L(arg0, 304u, 305u, 306u, 307u);
   auto x639 = x638 * x637;
   const uint32_t efl_rkBA_100_0 = EF_LDCR(rkBA, 100u, 0u);
   const uint32_t efl_rkBA_99_0 = EF_LDCR(rkBA, 99u, 0u);

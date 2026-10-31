@@ -54,7 +54,10 @@ wmma_hip.py then moves the poly_mix chains onto the matrix units for gfx12
 (RDNA4) devices only; other targets keep the scalar statements. hoist_hip.py
 issues the trace loads one window of statements ahead of their uses, and
 args_hip.py narrows the chain-function calls (32-bit cycle/steps, the kernel
-pointers read from a device table instead of passed in VGPRs).
+pointers read from a device table instead of passed in VGPRs); inline_hip.py
+then inlines the chain functions into the kernel (no callee-saved register
+saves at every call) and smem_hip.py moves each phase's hottest slab words to
+LDS on gfx11.
 
 The results are committed, so the GPU builds need no Python. Re-run this after
 changing the generated circuit (kernels/cxx/rust_poly_fp_*.cpp) or any of the
@@ -71,6 +74,8 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import args_hip  # noqa: E402
 import hoist_hip  # noqa: E402
+import inline_hip  # noqa: E402
+import smem_hip  # noqa: E402
 import to_hip  # noqa: E402
 import wmma_hip  # noqa: E402
 
@@ -86,6 +91,11 @@ WMMA_EXPECT = ('wmma_hip: 136 of 282 chains, 4672 of 4948 Fp links on the matrix
 HOIST_EXPECT = 'hoist_hip: 22 functions, 3844 trace loads issued one window ahead (window 8)'
 # args_hip.py (last): 32-bit cycle/steps; the kernel pointers from ef_ptrs instead of call arguments.
 ARGS_EXPECT = 'args_hip: 32-bit cycle/steps, 101 signatures and 20 calls without 95 pointer arguments'
+# inline_hip.py (last): the chain functions inlined into ef_eval_split, one opaque row index each.
+INLINE_EXPECT = 'inline_hip: 21 chain functions inlined, 22 opaque row indices'
+# smem_hip.py (last): on gfx11 each phase's 32 most accessed slab words in LDS.
+SMEM_EXPECT = ('smem_hip: 22 functions; gfx11 LDS words: main 32 of 85 (539 of 751 accesses), LogUp 32 of 104 '
+               '(96 of 268)')
 NS = 'namespace risc0::circuit::rv32im_v2 {'
 
 # mksub.py cut points: function, body lines, cut line, live values passed to the tail (+ input
@@ -150,13 +160,18 @@ HIP_POST_HEADER = '''//
 // multiply. On gfx12 (RDNA4) the poly_mix chains run on the matrix units
 // (wmma_hip.py: int8 WMMAs over LDS-staged constraint values, bit-exact; other
 // targets compile the scalar chains), then the trace loads issued one window of
-// statements ahead (hoist_hip.py) and narrower chain-function calls (args_hip.py).
-// At po2 20 with 64-wide waves and EF_MINB 4 (build.rs): 161 ms on an RX 7900 XTX
-// (gfx1100) and 169 ms on an RX 9070 XT (gfx1201; 200 ms with the scalar chains),
-// against 217 and 236 ms before the uniform addressing, hoist_hip, args_hip and
-// the shift-add / v_min reductions, and 326 and 454 ms for the first ROCm kernel
-// (the generator's output before its CUDA post-passes). The rematerialisation
-// relies on data, accum and mix being read-only for the whole kernel.
+// statements ahead (hoist_hip.py), narrower chain-function calls (args_hip.py),
+// every chain function inlined into the kernel (inline_hip.py), with the trace
+// loads through per-32-column buffer resources (to_hip.py) and, on gfx11, the
+// hottest slab words in LDS (smem_hip.py). At po2 20 with 64-wide waves and EF_MINB
+// 4 (build.rs): ~139 ms on an RX 7900 XTX (gfx1100) and ~137 ms on an RX 9070 XT
+// (gfx1201), against ~156 and 141 ms inlined with global loads and the scratch
+// slab, 160 and 169 ms with the chain functions called (callee-saved register
+// saves around every call), 217 and 236 ms
+// before the uniform addressing, hoist_hip, args_hip and the shift-add / v_min
+// reductions, and 326 and 454 ms for the first ROCm kernel (the generator's output
+// before its CUDA post-passes). The rematerialisation relies on data, accum and
+// mix being read-only for the whole kernel.
 '''
 HEADER_END = '// kernel happens to tolerate them.\n'
 
@@ -240,6 +255,14 @@ def main():
     hip = args_hip.convert(hip, stats=astats)
     if astats != [ARGS_EXPECT]:
         sys.exit('regen: EXPECT failed: args_hip.py printed\n  %s\nnot\n  %s' % (astats, ARGS_EXPECT))
+    istats = []
+    hip = inline_hip.convert(hip, stats=istats)
+    if istats != [INLINE_EXPECT]:
+        sys.exit('regen: EXPECT failed: inline_hip.py printed\n  %s\nnot\n  %s' % (istats, INLINE_EXPECT))
+    sstats = []
+    hip = smem_hip.convert(hip, stats=sstats)
+    if sstats != [SMEM_EXPECT]:
+        sys.exit('regen: EXPECT failed: smem_hip.py printed\n  %s\nnot\n  %s' % (sstats, SMEM_EXPECT))
     for path, text, post in ((OUT, new, POST_HEADER), (OUT_HIP, hip, HIP_POST_HEADER)):
         assert text.count(HEADER_END) == 1
         text = text.replace(HEADER_END, HEADER_END + post)
