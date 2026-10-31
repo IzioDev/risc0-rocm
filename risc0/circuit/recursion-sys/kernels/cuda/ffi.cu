@@ -364,9 +364,81 @@ static const uint32_t* recSortPairs(cudaStream_t stream, uint32_t n, int endBit)
   return vals.Current();
 }
 
-// The cycles [0, n) in chain order.
-static const uint32_t* recSortedCycles(cudaStream_t stream, ExecContext* ctx, uint32_t n,
-                                       const LaunchConfig& cfg) {
+// Permutations kept across proofs (RISC0_HIP_REC_PERMKEEP=0: made in every proof). Both sorts'
+// keys are functions of the program: recAccumKeys reads only ctrl, and recExecKeys reads ctrl and
+// the cycles' isParSafe flags, which the preflight derives from the code alone (and the host
+// chains, which mark their heads 2, are the program's long chains). A program's ctrl buffer is
+// cached on its proving thread (PROVER_CACHE, prove/mod.rs), so its device address names the
+// program in the proofs of that thread. Any permutation of [0, n) gives the same witness (exec:
+// each cycle's thread runs its chain if it is a head, accum and verifyWom: independent rows), so
+// the key only guards the grouping, never the result. Saves a recExecKeys and a recAccumKeys with
+// their radix sorts per lift/join after a program's first proof: ~0.4 ms (RX 7900 XTX) and ~0.55
+// ms (RX 9070 XT) of serial GPU time.
+struct RecKeptPerm {
+  uint32_t* buf = nullptr;
+  const Fp* ctrl = nullptr;
+  uint32_t steps = 0, n = 0, tag = 0;
+  uint64_t used = 0;
+};
+constexpr int kRecKeptPerms = 8;
+struct RecKeptPerms {
+  RecKeptPerm e[kRecKeptPerms];
+  uint64_t clock = 0;
+#ifndef _WIN32
+  // Freed at thread exit, like g_recSort.
+  ~RecKeptPerms() {
+    for (auto& x : e)
+      cudaFree(x.buf);
+  }
+#endif
+};
+static thread_local RecKeptPerms g_recKept;
+
+static bool recPermKeep() {
+  static const bool on = [] {
+    const char* e = std::getenv("RISC0_HIP_REC_PERMKEEP");
+    return !(e && e[0] == '0');
+  }();
+  return on;
+}
+
+// The kept permutation for the key, or nullptr.
+static const uint32_t* recKeptFind(const Fp* ctrl, uint32_t steps, uint32_t n, uint32_t tag) {
+  RecKeptPerms& k = g_recKept;
+  for (auto& x : k.e) {
+    if (x.buf && x.ctrl == ctrl && x.steps == steps && x.n == n && x.tag == tag) {
+      x.used = ++k.clock;
+      return x.buf;
+    }
+  }
+  return nullptr;
+}
+
+// Keeps a copy of the n-entry device permutation `perm` (stream-ordered after its sort) under the
+// key, in place of the least recently used one; returns the copy.
+static const uint32_t* recKeptStore(cudaStream_t stream, const Fp* ctrl, uint32_t steps, uint32_t n,
+                                    uint32_t tag, const uint32_t* perm) {
+  RecKeptPerms& k = g_recKept;
+  RecKeptPerm* v = &k.e[0];
+  for (auto& x : k.e)
+    v = x.used < v->used ? &x : v;
+  // cudaFree waits for the device: nothing still reads the evicted permutation.
+  if (v->buf) CUDA_OK(cudaFree(v->buf));
+  *v = RecKeptPerm{};
+  CUDA_OK(cudaMalloc(&v->buf, size_t(n) * sizeof(uint32_t)));
+  CUDA_OK(cudaMemcpyAsync(v->buf, perm, size_t(n) * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
+  v->ctrl = ctrl;
+  v->steps = steps;
+  v->n = n;
+  v->tag = tag;
+  v->used = ++k.clock;
+  return v->buf;
+}
+
+// The cycles [0, n) in chain order. `ctrl` and `steps`: the host copies of ctx's (the kept
+// permutation's key).
+static const uint32_t* recSortedCycles(cudaStream_t stream, ExecContext* ctx, const Fp* ctrl,
+                                       uint32_t steps, uint32_t n, const LaunchConfig& cfg) {
   static const int winEnv = [] {
     const char* e = std::getenv("RISC0_HIP_REC_EXECWIN");
     return e ? int(std::strtoul(e, nullptr, 10)) : -1;
@@ -384,9 +456,15 @@ static const uint32_t* recSortedCycles(cudaStream_t stream, ExecContext* ctx, ui
     while (endBit < 32 && (uint64_t(n - 1) >> win) >> (endBit - 22) != 0)
       endBit++;
   }
+  uint32_t tag = 1 + win; // 0: recAccumPerm's
+  if (recPermKeep()) {
+    if (const uint32_t* kept = recKeptFind(ctrl, steps, n, tag))
+      return kept;
+  }
   uint32_t* k = recSortKeys(n);
   recExecKeys<<<cfg.grid, cfg.block, 0, stream>>>(ctx, k, k + 2 * g_recSort.cap, win);
-  return recSortPairs(stream, n, int(endBit));
+  const uint32_t* perm = recSortPairs(stream, n, int(endBit));
+  return recPermKeep() ? recKeptStore(stream, ctrl, steps, n, tag, perm) : perm;
 }
 
 // Rows of the one-step-per-row kernels (parStepComputeAccumInl / parStepVerifyAccumInl,
@@ -444,6 +522,11 @@ static bool recPermCacheOn() {
 // `fresh`: make it again (the witgen's call); else reuse a matching one.
 static const uint32_t* recAccumPerm(cudaStream_t stream, const Fp* ctrl, uint32_t steps, uint32_t n,
                                     bool fresh = false) {
+  if (recPermKeep()) {
+    if (const uint32_t* kept = recKeptFind(ctrl, steps, n, 0))
+      return kept;
+    return recKeptStore(stream, ctrl, steps, n, 0, recAccumPermSort(stream, ctrl, steps, n));
+  }
   if (!recPermCacheOn())
     return recAccumPermSort(stream, ctrl, steps, n);
   RecPermCache& c = g_recPerm;
@@ -969,6 +1052,7 @@ struct StageClaim {
 };
 #endif
 
+
 struct HostExecContext {
   ExecContext* ctx;
   RecStream stream;
@@ -1119,7 +1203,7 @@ struct HostExecContext {
         // The sort's kernels go on `stream` before the hop scope opens, so the hopped
         // kernel (which waits only for work recorded before the scope) sees the permutation.
         const uint32_t* perm =
-            (recSort() && numCycles > 1) ? recSortedCycles(stream, ctx, numCycles, cfg) : nullptr;
+            (recSort() && numCycles > 1) ? recSortedCycles(stream, ctx, ctrlBuf, steps, numCycles, cfg) : nullptr;
         // ~4-5 ms per lift/join (~2^18 cycles): on a side hardware queue (hip_hop.h).
         risc0_hip_hop::Scope s(stream, risc0_hip_hop::want(risc0_hip_hop::kRecStep, size_t(cfg.grid.x) * cfg.block.x, 16));
         if (perm)
@@ -1691,6 +1775,100 @@ const char* risc0_circuit_recursion_hip_stage(const PreflightTrace* trace, const
   } catch (const std::exception& err) {
     // Not staged: let no copy queued above outlive the call (they read the caller's buffers).
     if (s && s->stream) cudaStreamSynchronize(s->stream);
+    return strdup(err.what());
+  }
+  return nullptr;
+}
+
+// Witness buffer passes for the recursion witgen (prove/witgen.rs, HIP; RISC0_HIP_REC_INIT=0 keeps
+// the generic HAL passes). A buffer is column-major with 2^logRows rows per column, and the
+// witgen writes only rows below `live` (its cycle count). The generic path fills the whole buffer
+// with INVALID, uploads the ZK noise (one random element repeated: `vec![x; n]`) and copies it
+// into the last rows of every column with eltwise_copy_fp_region (one thread per column walking
+// its rows: ~125 us for the data group on an RX 7900 XTX, plus the host-side upload), then
+// zeroizes the whole buffer. Equivalent result here: rows >= live start as zero instead of
+// INVALID (nothing writes them before the zeroize would have), the noise is a fill kernel, and
+// the zeroize only reads rows < live. All on the risc0 persistent stream, like the HAL passes.
+__global__ void recInitRows(uint32_t* buf, uint32_t logRows, uint32_t live, uint64_t total) {
+  uint64_t i = (uint64_t(blockIdx.x) * blockDim.x + threadIdx.x) * 4;
+  if (i >= total) return;
+  uint32_t row = uint32_t(i & ((uint64_t(1) << logRows) - 1));
+  constexpr uint32_t kInv = 0xffffffffu; // Fp::INVALID
+  if (row + 4 <= live) {
+    *reinterpret_cast<uint4*>(buf + i) = make_uint4(kInv, kInv, kInv, kInv);
+  } else if (row >= live) {
+    *reinterpret_cast<uint4*>(buf + i) = make_uint4(0, 0, 0, 0);
+  } else {
+    for (uint32_t k = 0; k < 4; k++)
+      buf[i + k] = row + k < live ? kInv : 0;
+  }
+}
+
+__global__ void recFillTail(uint32_t* buf, uint32_t value, uint32_t logRows, uint32_t zk, uint32_t cols) {
+  uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= zk * cols) return;
+  uint32_t col = t / zk, r = t % zk;
+  buf[(size_t(col) << logRows) + (size_t(1) << logRows) - zk + r] = value;
+}
+
+__global__ void recZeroizeRows(uint32_t* buf, uint32_t logRows, uint32_t live) {
+  uint32_t row = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+  if (row >= live) return;
+  uint32_t* p = buf + (size_t(blockIdx.y) << logRows) + row;
+  constexpr uint32_t kInv = 0xffffffffu;
+  if (row + 4 <= live) {
+    uint4 v = *reinterpret_cast<const uint4*>(p);
+    if (v.x == kInv || v.y == kInv || v.z == kInv || v.w == kInv) {
+      v.x = v.x == kInv ? 0 : v.x;
+      v.y = v.y == kInv ? 0 : v.y;
+      v.z = v.z == kInv ? 0 : v.z;
+      v.w = v.w == kInv ? 0 : v.w;
+      *reinterpret_cast<uint4*>(p) = v;
+    }
+  } else {
+    for (uint32_t k = 0; row + k < live; k++)
+      if (p[k] == kInv) p[k] = 0;
+  }
+}
+
+const char* risc0_circuit_recursion_hip_init_rows(uint32_t* buf, uint32_t logRows, uint32_t live,
+                                                  uint32_t cols) {
+  try {
+    uint64_t total = uint64_t(cols) << logRows;
+    if (logRows < 2) throw std::runtime_error("recursion init_rows: rows < 4");
+    uint64_t threads = total / 4;
+    recInitRows<<<uint32_t((threads + 255) / 256), 256, 0, getPersistentStream()>>>(buf, logRows, live, total);
+    CUDA_OK(cudaGetLastError());
+  } catch (const std::exception& err) {
+    return strdup(err.what());
+  }
+  return nullptr;
+}
+
+const char* risc0_circuit_recursion_hip_fill_tail(uint32_t* buf, uint32_t value, uint32_t logRows,
+                                                  uint32_t zk, uint32_t cols) {
+  try {
+    if (zk > (1u << logRows)) throw std::runtime_error("recursion fill_tail: zk > rows");
+    uint32_t n = zk * cols;
+    if (n) {
+      recFillTail<<<(n + 255) / 256, 256, 0, getPersistentStream()>>>(buf, value, logRows, zk, cols);
+      CUDA_OK(cudaGetLastError());
+    }
+  } catch (const std::exception& err) {
+    return strdup(err.what());
+  }
+  return nullptr;
+}
+
+const char* risc0_circuit_recursion_hip_zeroize_rows(uint32_t* buf, uint32_t logRows, uint32_t live,
+                                                     uint32_t cols) {
+  try {
+    if (live && cols) {
+      dim3 grid((live / 4 + 255) / 256 + 1, cols);
+      recZeroizeRows<<<grid, 256, 0, getPersistentStream()>>>(buf, logRows, live);
+      CUDA_OK(cudaGetLastError());
+    }
+  } catch (const std::exception& err) {
     return strdup(err.what());
   }
   return nullptr;

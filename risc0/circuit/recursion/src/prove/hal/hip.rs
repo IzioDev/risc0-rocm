@@ -18,7 +18,9 @@ use anyhow::{bail, Result};
 use risc0_circuit_recursion_sys::{
     risc0_circuit_recursion_cuda_accum, risc0_circuit_recursion_cuda_eval_check,
     risc0_circuit_recursion_cuda_witgen, risc0_circuit_recursion_cuda_witgen_chains,
-    RawAccumBuffers, RawExecBuffers, RawHostChains, RawPreflightTrace, StepMode,
+    risc0_circuit_recursion_hip_fill_tail, risc0_circuit_recursion_hip_init_rows,
+    risc0_circuit_recursion_hip_zeroize_rows, RawAccumBuffers, RawExecBuffers, RawHostChains,
+    RawPreflightTrace, StepMode,
 };
 use risc0_sys::ffi_wrap;
 use risc0_zkp::{
@@ -132,6 +134,60 @@ impl<CH: HipHash> CircuitWitnessGenerator<HipHal<CH>> for HipCircuitHal<CH> {
             )
         })
     }
+
+    // RISC0_HIP_REC_INIT=0: the generic HAL passes (fill, noise upload + region copy, zeroize).
+    fn has_row_passes(&self) -> bool {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var("RISC0_HIP_REC_INIT").as_deref() != Ok("0"));
+        *ON
+    }
+
+    fn init_rows(&self, buf: &HipBuffer<BabyBearElem>, rows: usize, live: usize) -> Result<()> {
+        let (log_rows, cols) = row_shape(buf, rows)?;
+        let p = buf.as_device_ptr().as_ptr() as *mut u32;
+        ffi_wrap(|| unsafe {
+            risc0_circuit_recursion_hip_init_rows(p, log_rows, live.min(rows) as u32, cols)
+        })
+    }
+
+    fn fill_tail(
+        &self,
+        buf: &HipBuffer<BabyBearElem>,
+        rows: usize,
+        zk: usize,
+        value: BabyBearElem,
+    ) -> Result<()> {
+        let (log_rows, cols) = row_shape(buf, rows)?;
+        if zk > rows {
+            bail!("fill_tail: {zk} rows of {rows}");
+        }
+        let p = buf.as_device_ptr().as_ptr() as *mut u32;
+        ffi_wrap(|| unsafe {
+            risc0_circuit_recursion_hip_fill_tail(
+                p,
+                value.as_u32_montgomery(),
+                log_rows,
+                zk as u32,
+                cols,
+            )
+        })
+    }
+
+    fn zeroize_rows(&self, buf: &HipBuffer<BabyBearElem>, rows: usize, live: usize) -> Result<()> {
+        let (log_rows, cols) = row_shape(buf, rows)?;
+        let p = buf.as_device_ptr().as_ptr() as *mut u32;
+        ffi_wrap(|| unsafe {
+            risc0_circuit_recursion_hip_zeroize_rows(p, log_rows, live.min(rows) as u32, cols)
+        })
+    }
+}
+
+/// (log2 rows, columns) of a column-major buffer of `rows` (a power of two, >= 4) rows per column.
+fn row_shape(buf: &HipBuffer<BabyBearElem>, rows: usize) -> Result<(u32, u32)> {
+    if !rows.is_power_of_two() || rows < 4 || buf.size() % rows != 0 {
+        bail!("row passes: {} elements in rows of {rows}", buf.size());
+    }
+    Ok((rows.trailing_zeros(), (buf.size() / rows) as u32))
 }
 
 impl<CH: HipHash> CircuitAccumulator<HipHal<CH>> for HipCircuitHal<CH> {

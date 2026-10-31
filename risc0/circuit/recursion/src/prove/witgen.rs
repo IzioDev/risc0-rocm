@@ -170,6 +170,11 @@ pub(crate) static HOST_CHAINS_CHECK: AtomicBool = AtomicBool::new(false);
 /// How many witnesses the check compared.
 pub(crate) static HOST_CHAINS_CHECKED: AtomicUsize = AtomicUsize::new(0);
 
+// RISC0_HIP_REC_ZCHECK=1: check each row-pass witness against the generic passes (validation).
+static ROW_PASS_CHECK: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("RISC0_HIP_REC_ZCHECK").as_deref() == Ok("1"));
+static ROW_PASS_CHECKED: AtomicUsize = AtomicUsize::new(0);
+
 /// Execute the chains of at least `HOST_CHAIN_MIN_LEN` cycles on the host. `None` if there are
 /// none, or if that fails (e.g. a chain writes a global): the device witgen then runs every
 /// chain itself, as without host chains.
@@ -315,18 +320,29 @@ where
             hal.copy_from_elem("ctrl", &ctrl_data)
         };
 
-        let data = hal.alloc_elem_init(
-            "data",
-            total_cycles * CIRCUIT.data_size(),
-            BabyBearElem::INVALID,
-        );
+        let work_cycles = zkr.code_rows() as u32;
+        // The HAL's row passes (HIP): rows >= work_cycles start as zero, the noise is a fill and
+        // the zeroize reads only rows < work_cycles (see `CircuitWitnessGenerator::init_rows`).
+        // Not with a host-generated witness, whose upload writes the whole buffer.
+        let row_passes =
+            circuit_hal.has_row_passes() && preflight.host_witness.lock().unwrap().is_none();
+        let init_data = |name: &'static str| -> Result<H::Buffer<H::Elem>> {
+            let size = total_cycles * CIRCUIT.data_size();
+            if row_passes {
+                let buf = hal.alloc_elem(name, size);
+                circuit_hal.init_rows(&buf, total_cycles, work_cycles as usize)?;
+                Ok(buf)
+            } else {
+                Ok(hal.alloc_elem_init(name, size, BabyBearElem::INVALID))
+            }
+        };
+        let data = init_data("data")?;
         let accum = hal.alloc_elem_init(
             "accum",
             total_cycles * CIRCUIT.accum_size(),
             BabyBearElem::INVALID,
         );
 
-        let work_cycles = zkr.code_rows() as u32;
         #[cfg(any(feature = "cuda", feature = "rocm"))]
         let pinned_guard = preflight.pinned.lock().unwrap();
         #[cfg(any(feature = "cuda", feature = "rocm"))]
@@ -412,11 +428,7 @@ where
                 )
                 .context("witness generation failure")?;
             if chains.is_some() && HOST_CHAINS_CHECK.load(Ordering::Relaxed) {
-                let ref_data = hal.alloc_elem_init(
-                    "data_ref",
-                    total_cycles * CIRCUIT.data_size(),
-                    BabyBearElem::INVALID,
-                );
+                let ref_data = init_data("data_ref")?;
                 let ref_global = hal.copy_from_elem(
                     "global_ref",
                     &vec![BabyBearElem::INVALID; CircuitImpl::OUTPUT_SIZE],
@@ -444,28 +456,94 @@ where
                 }
                 HOST_CHAINS_CHECKED.fetch_add(1, Ordering::Relaxed);
             }
+            if row_passes && *ROW_PASS_CHECK {
+                // Validation (RISC0_HIP_REC_ZCHECK=1): the witness from the row passes equals the
+                // generic one (all INVALID at the start, zeroized after) up to the noise.
+                let t0 = std::time::Instant::now();
+                let ref_data = hal.alloc_elem_init(
+                    "data_ref",
+                    total_cycles * CIRCUIT.data_size(),
+                    BabyBearElem::INVALID,
+                );
+                let ref_global = hal.copy_from_elem(
+                    "global_ref",
+                    &vec![BabyBearElem::INVALID; CircuitImpl::OUTPUT_SIZE],
+                );
+                circuit_hal
+                    .generate_witness(
+                        StepMode::Parallel,
+                        total_cycles as u32,
+                        &raw_trace,
+                        &ctrl,
+                        &ref_data,
+                        &ref_global,
+                    )
+                    .context("witness generation failure (row pass check)")?;
+                let (a, b) = (data.to_vec(), ref_data.to_vec());
+                // Raw words: INVALID is 0xffffffff, zero is 0 (Montgomery form).
+                let inv = BabyBearElem::INVALID.as_u32_montgomery();
+                let zero = |x: u32| if x == inv { 0 } else { x };
+                for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                    let (x, y) = (x.as_u32_montgomery(), y.as_u32_montgomery());
+                    let row = i % total_cycles;
+                    let got = if row < work_cycles as usize {
+                        zero(x)
+                    } else {
+                        x
+                    };
+                    if got != zero(y) {
+                        anyhow::bail!(
+                            "row pass witness mismatch at col {} row {row} ({x:#x} vs {y:#x})",
+                            i / total_cycles
+                        );
+                    }
+                }
+                if let Some(i) = first_mismatch(&global.to_vec(), &ref_global.to_vec()) {
+                    anyhow::bail!("row pass global mismatch at {i}");
+                }
+                let n = ROW_PASS_CHECKED.fetch_add(1, Ordering::Relaxed) + 1;
+                eprintln!(
+                    "[rec_zcheck] row passes == generic witness #{n} ({} rows, {work_cycles} live, {:.1} ms)",
+                    total_cycles,
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
+            }
         }
 
         // Add random noise to end of the data columns
         scope!("noise", {
             use risc0_zkp::ZK_CYCLES;
             let mut rng = rand::rng();
-            let noise = vec![BabyBearElem::random(&mut rng); ZK_CYCLES * CIRCUIT.data_size()];
-            hal.eltwise_copy_elem_slice(
-                &data,
-                &noise,
-                CIRCUIT.data_size(),      // from_rows
-                ZK_CYCLES,                // from_cols
-                0,                        // from_offset
-                ZK_CYCLES,                // from_stride
-                total_cycles - ZK_CYCLES, // into_offset
-                total_cycles,             // into_stride
-            );
+            if row_passes {
+                // The same noise: `vec![x; n]` repeats one random element.
+                circuit_hal.fill_tail(
+                    &data,
+                    total_cycles,
+                    ZK_CYCLES,
+                    BabyBearElem::random(&mut rng),
+                )?;
+            } else {
+                let noise = vec![BabyBearElem::random(&mut rng); ZK_CYCLES * CIRCUIT.data_size()];
+                hal.eltwise_copy_elem_slice(
+                    &data,
+                    &noise,
+                    CIRCUIT.data_size(),      // from_rows
+                    ZK_CYCLES,                // from_cols
+                    0,                        // from_offset
+                    ZK_CYCLES,                // from_stride
+                    total_cycles - ZK_CYCLES, // into_offset
+                    total_cycles,             // into_stride
+                );
+            }
         });
 
         // Zero out 'invalid' entries in data and output.
         scope!("zeroize", {
-            hal.eltwise_zeroize_elem(&data);
+            if row_passes {
+                circuit_hal.zeroize_rows(&data, total_cycles, work_cycles as usize)?;
+            } else {
+                hal.eltwise_zeroize_elem(&data);
+            }
             hal.eltwise_zeroize_elem(&global);
         });
 
@@ -479,7 +557,7 @@ where
         })
     }
 
-    pub fn accum<C: CircuitAccumulator<H>>(
+    pub fn accum<C: CircuitAccumulator<H> + CircuitWitnessGenerator<H>>(
         &self,
         hal: &H,
         circuit_hal: &C,
@@ -494,17 +572,27 @@ where
             use risc0_zkp::ZK_CYCLES;
             let mut rng = rand::rng();
             let total_cycles = self.total_cycles as usize;
-            let noise = vec![BabyBearElem::random(&mut rng); ZK_CYCLES * CIRCUIT.accum_size()];
-            hal.eltwise_copy_elem_slice(
-                &self.accum,
-                &noise,
-                CIRCUIT.accum_size(),     // from_rows
-                ZK_CYCLES,                // from_cols
-                0,                        // from_offset
-                ZK_CYCLES,                // from_stride
-                total_cycles - ZK_CYCLES, // into_offset
-                total_cycles,             // into_stride
-            );
+            if circuit_hal.has_row_passes() {
+                // The same noise: `vec![x; n]` repeats one random element.
+                circuit_hal.fill_tail(
+                    &self.accum,
+                    total_cycles,
+                    ZK_CYCLES,
+                    BabyBearElem::random(&mut rng),
+                )?;
+            } else {
+                let noise = vec![BabyBearElem::random(&mut rng); ZK_CYCLES * CIRCUIT.accum_size()];
+                hal.eltwise_copy_elem_slice(
+                    &self.accum,
+                    &noise,
+                    CIRCUIT.accum_size(),     // from_rows
+                    ZK_CYCLES,                // from_cols
+                    0,                        // from_offset
+                    ZK_CYCLES,                // from_stride
+                    total_cycles - ZK_CYCLES, // into_offset
+                    total_cycles,             // into_stride
+                );
+            }
         });
 
         circuit_hal.accumulate(

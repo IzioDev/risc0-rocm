@@ -215,6 +215,12 @@ impl Prover {
         s
     }
 
+    /// Build this program's host ctrl into the process-wide cache (host work only, for any
+    /// thread), so its first proof's ctrl upload (or [Self::prewarm]) skips it.
+    pub fn prewarm_host(&self) {
+        let _ = witgen::host_ctrl_for(&self.program);
+    }
+
     /// On this thread's cached prover, upload and commit this program's ctrl (the first
     /// proof of each program otherwise pays it on the GPU thread).
     pub fn prewarm(&self) -> Result<()> {

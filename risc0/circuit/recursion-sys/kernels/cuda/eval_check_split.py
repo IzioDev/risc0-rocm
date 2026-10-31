@@ -180,9 +180,23 @@ __constant__ FpExt poly_mix[158];
 // RDNA: 128-thread blocks (per po2 18 call: 21.1 vs 23.2 ms on gfx1100, 29.5 vs 32.1 ms on gfx1201),
 // and at most 216 VGPRs: 7 waves per SIMD instead of 5 or 6, for a few spills, with build.rs's
 // iterative-maxocc scheduler (per call, all six parts: 20.9 -> 16.5 ms on gfx1100, 28.8 -> 18.5 ms
-// on gfx1201; 192 and 232 VGPRs were slower on both).
+// on gfx1201; 192 and 232 VGPRs were slower on both). Per part (medians of 6-8 interleaved harness
+// runs at po2 18, us): gfx1201 parts 1 and 4 with 192 VGPRs (8 waves per SIMD): 3214 -> 3140 and
+// 2676 -> 2625, the full call 16.51 -> 16.37 ms; the other parts and every gfx1100 part were no
+// faster with 192, 240 or no bound.
 constexpr uint32_t kBlock = 128;
-#define EC_PART_BOUNDS __launch_bounds__(kBlock, 1) __attribute__((amdgpu_num_vgpr(216)))
+#define EC_PART_VGPR(n) __launch_bounds__(kBlock, 1) __attribute__((amdgpu_num_vgpr(n)))
+#if defined(__gfx1201__)
+#define EC_PART_BOUNDS_1 EC_PART_VGPR(192)
+#define EC_PART_BOUNDS_4 EC_PART_VGPR(192)
+#else
+#define EC_PART_BOUNDS_1 EC_PART_VGPR(216)
+#define EC_PART_BOUNDS_4 EC_PART_VGPR(216)
+#endif
+#define EC_PART_BOUNDS_0 EC_PART_VGPR(216)
+#define EC_PART_BOUNDS_2 EC_PART_VGPR(216)
+#define EC_PART_BOUNDS_3 EC_PART_VGPR(216)
+#define EC_PART_BOUNDS_5 EC_PART_VGPR(216)
 #else
 constexpr uint32_t kBlock = 256;
 #define EC_PART_BOUNDS __launch_bounds__(kBlock, 1)
@@ -191,9 +205,9 @@ constexpr uint32_t kBlock = 256;
 namespace risc0::circuit::recursion::cuda {
 ''' + '\n' + '\n'.join(out) + '\n' + '''
 template <int P>
-EC_PART_BOUNDS __global__ void ec_part(Fp* check, const Fp* ctrl, const Fp* data, const Fp* accum,
-                                       const Fp* mix, const Fp* out, const Fp rou, uint32_t po2,
-                                       uint32_t domain) {
+__device__ __forceinline__ void ec_part_body(Fp* check, const Fp* ctrl, const Fp* data, const Fp* accum,
+                                             const Fp* mix, const Fp* out, const Fp rou, uint32_t po2,
+                                             uint32_t domain) {
   uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x;
   if (cycle >= domain) return;
   FpExt tot = poly_fp_part(P, cycle, domain, ctrl, out, data, mix, accum);
@@ -212,6 +226,29 @@ EC_PART_BOUNDS __global__ void ec_part(Fp* check, const Fp* ctrl, const Fp* data
   check[domain * 2 + cycle] = tot[2];
   check[domain * 3 + cycle] = tot[3];
 }
+
+#ifdef __HIPCC__
+// One kernel per part, each with its own register bound (explicit specializations: an attribute's
+// argument cannot depend on P).
+template <int P>
+__global__ void ec_part(Fp* check, const Fp* ctrl, const Fp* data, const Fp* accum, const Fp* mix,
+                        const Fp* out, const Fp rou, uint32_t po2, uint32_t domain);
+#define EC_PART_KERNEL(P) template <> EC_PART_BOUNDS_##P __global__ void ec_part<P>(Fp* check, const Fp* ctrl, const Fp* data, const Fp* accum, const Fp* mix, const Fp* out, const Fp rou, uint32_t po2, uint32_t domain) { ec_part_body<P>(check, ctrl, data, accum, mix, out, rou, po2, domain); }
+EC_PART_KERNEL(0)
+EC_PART_KERNEL(1)
+EC_PART_KERNEL(2)
+EC_PART_KERNEL(3)
+EC_PART_KERNEL(4)
+EC_PART_KERNEL(5)
+static_assert(kNumParts == 6, "one EC_PART_KERNEL per part");
+#else
+template <int P>
+EC_PART_BOUNDS __global__ void ec_part(Fp* check, const Fp* ctrl, const Fp* data, const Fp* accum,
+                                       const Fp* mix, const Fp* out, const Fp rou, uint32_t po2,
+                                       uint32_t domain) {
+  ec_part_body<P>(check, ctrl, data, accum, mix, out, rou, po2, domain);
+}
+#endif
 
 template <int P>
 static void launch_parts(cudaStream_t stream, uint32_t grid, uint32_t block, Fp* check, const Fp* ctrl,

@@ -202,4 +202,29 @@ extern "C" {
     pub fn risc0_circuit_recursion_hip_unstage(
         wom: *const std::ffi::c_void,
     ) -> *const std::os::raw::c_char;
+
+    // Witness buffer passes on the risc0 persistent stream (column-major, 2^log_rows rows per
+    // column; see recInitRows in ffi.cu): INVALID in rows [0, live) and zero after; `value` in the
+    // last `zk` rows of every column; INVALID -> zero in rows [0, live).
+    pub fn risc0_circuit_recursion_hip_init_rows(
+        buf: *mut u32,
+        log_rows: u32,
+        live: u32,
+        cols: u32,
+    ) -> *const std::os::raw::c_char;
+
+    pub fn risc0_circuit_recursion_hip_fill_tail(
+        buf: *mut u32,
+        value: u32,
+        log_rows: u32,
+        zk: u32,
+        cols: u32,
+    ) -> *const std::os::raw::c_char;
+
+    pub fn risc0_circuit_recursion_hip_zeroize_rows(
+        buf: *mut u32,
+        log_rows: u32,
+        live: u32,
+        cols: u32,
+    ) -> *const std::os::raw::c_char;
 }

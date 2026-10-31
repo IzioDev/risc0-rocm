@@ -1838,6 +1838,37 @@ impl ProverServer for ProverImpl {
                 } else {
                     None
                 };
+            // ROCm: the programs' first use, off the GPU's critical path. A background thread
+            // loads the join program and the other segment po2s' lift programs and builds their
+            // host ctrl (else ~15 ms of program load on this thread before the first join and
+            // before the last lift, and ~15 ms of host ctrl in each one's first witgen), and this
+            // thread uploads and commits lift0's program's ctrl while the first preparations run
+            // (the GPU idles until lift0's is done). RISC0_REC_WARM=0: off.
+            #[cfg(feature = "rocm")]
+            if std::env::var("RISC0_REC_WARM").as_deref() != Ok("0") {
+                let mut po2s: Vec<usize> = Vec::new();
+                for seg in segments.iter() {
+                    if let Ok(p) = RecursionProverJob::lift_po2(seg) {
+                        if !po2s.contains(&p) {
+                            po2s.push(p);
+                        }
+                    }
+                }
+                let rest: Vec<usize> = po2s.iter().skip(1).copied().collect();
+                let opts = recursion_opts.clone();
+                let _ = std::thread::Builder::new()
+                    .name("rec-preload".into())
+                    .spawn(move || {
+                        if let Err(e) = RecursionProverJob::preload(&rest, &opts) {
+                            tracing::debug!("recursion preload: {e}");
+                        }
+                    });
+                if let Some(&p) = po2s.first() {
+                    if let Err(e) = RecursionProverJob::prewarm_lift(p, &recursion_opts) {
+                        tracing::debug!("recursion prewarm: {e}");
+                    }
+                }
+            }
             let mut acc = finish_lift(h0, 0)?;
             let mut cur = finish_lift(h1, 1)?;
             if *VERBOSE {
