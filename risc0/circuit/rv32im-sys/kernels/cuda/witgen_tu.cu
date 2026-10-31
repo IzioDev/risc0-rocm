@@ -3,11 +3,20 @@
 // (not -dc).
 #define RISC0_ROWS_POW2 1
 #include "witgen.h"
+#ifdef __HIPCC__
+#include <hip/hip_runtime.h>
+#else
 #include <cuda_runtime.h>
+#endif
 #undef INVOKE_EXTERN
 #define INVOKE_EXTERN(ctx, name, ...) externW_##name(ctx, ##__VA_ARGS__)
 #define externW_log extern_log
 #define externW_assert extern_assert
+// The call graph's attribute: noinline (on ROCm build.rs may define it empty: inlined at the
+// compiler's discretion).
+#ifndef WITGEN_TU_FNATTR
+#define WITGEN_TU_FNATTR __noinline__
+#endif
 namespace risc0::circuit::rv32im_v2::cuda {
 struct ExecBuffers {
   Buffer global;
@@ -166,479 +175,479 @@ static __device__ ::cuda::std::array<Val, 16> externW_bigIntExtern(ExecContext& 
 }
 
 
-static __device__ __noinline__ NondetRegStruct back_NondetReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetRegStruct back_NondetReg_W(ExecContext& ctx,
                                           Index distance0,
                                           BoundLayout<NondetRegLayout> layout1);
-static __device__ __noinline__ NondetRegStruct exec_NondetReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetRegStruct exec_NondetReg_W(ExecContext& ctx,
                                           Val arg0,
                                           BoundLayout<NondetRegLayout> layout1);
-static __device__ __noinline__ NondetExtRegStruct back_NondetExtReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetExtRegStruct back_NondetExtReg_W(ExecContext& ctx,
                                                 Index distance0,
                                                 BoundLayout<NondetExtRegLayout> layout1);
-static __device__ __noinline__ NondetExtRegStruct exec_NondetExtReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetExtRegStruct exec_NondetExtReg_W(ExecContext& ctx,
                                                 ExtVal arg0,
                                                 BoundLayout<NondetExtRegLayout> layout1);
-static __device__ __noinline__ NondetRegStruct back_Reg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetRegStruct back_Reg_W(ExecContext& ctx,
                                     Index distance0,
                                     BoundLayout<NondetRegLayout> layout1);
-static __device__ __noinline__ NondetRegStruct exec_Reg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetRegStruct exec_Reg_W(ExecContext& ctx,
                                     Val arg0,
                                     BoundLayout<NondetRegLayout> layout1);
-static __device__ __noinline__ NondetExtRegStruct back_ExtReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetExtRegStruct back_ExtReg_W(ExecContext& ctx,
                                           Index distance0,
                                           BoundLayout<NondetExtRegLayout> layout1);
-static __device__ __noinline__ NondetExtRegStruct exec_ExtReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetExtRegStruct exec_ExtReg_W(ExecContext& ctx,
                                           ExtVal arg0,
                                           BoundLayout<NondetExtRegLayout> layout1);
-static __device__ __noinline__ NondetRegStruct back_NondetBitReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetRegStruct back_NondetBitReg_W(ExecContext& ctx,
                                              Index distance0,
                                              BoundLayout<NondetRegLayout> layout1);
-static __device__ __noinline__ NondetRegStruct exec_NondetBitReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetRegStruct exec_NondetBitReg_W(ExecContext& ctx,
                                              Val arg0,
                                              BoundLayout<NondetRegLayout> layout1);
-static __device__ __noinline__ NondetRegStruct back_BitReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetRegStruct back_BitReg_W(ExecContext& ctx,
                                        Index distance0,
                                        BoundLayout<NondetRegLayout> layout1);
-static __device__ __noinline__ NondetRegStruct exec_BitReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetRegStruct exec_BitReg_W(ExecContext& ctx,
                                        Val arg0,
                                        BoundLayout<NondetRegLayout> layout1);
-static __device__ __noinline__ NondetRegStruct exec_NondetTwitReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetRegStruct exec_NondetTwitReg_W(ExecContext& ctx,
                                               Val arg0,
                                               BoundLayout<NondetRegLayout> layout1);
-static __device__ __noinline__ NondetFakeTwitRegStruct
+static __device__ WITGEN_TU_FNATTR NondetFakeTwitRegStruct
 exec_NondetFakeTwitReg_W(ExecContext& ctx, Val arg0, BoundLayout<NondetFakeTwitRegLayout> layout1);
-static __device__ __noinline__ FakeTwitRegStruct exec_FakeTwitReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR FakeTwitRegStruct exec_FakeTwitReg_W(ExecContext& ctx,
                                               Val arg0,
                                               BoundLayout<NondetFakeTwitRegLayout> layout1);
-static __device__ __noinline__ NondetRegStruct exec_IsZero_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetRegStruct exec_IsZero_W(ExecContext& ctx,
                                        Val arg0,
                                        BoundLayout<IsZeroLayout> layout1);
-static __device__ __noinline__ ArgU8Struct exec_ArgU8_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ArgU8Struct exec_ArgU8_W(ExecContext& ctx,
                                   Val arg0,
                                   Val arg1_0,
                                   BoundLayout<ArgU8Layout> layout2);
-static __device__ __noinline__ NondetRegStruct exec_NondetU8Reg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetRegStruct exec_NondetU8Reg_W(ExecContext& ctx,
                                             Val arg0,
                                             BoundLayout<NondetU8RegLayout> layout1);
-static __device__ __noinline__ U8RegStruct exec_U8Reg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR U8RegStruct exec_U8Reg_W(ExecContext& ctx,
                                   Val arg0,
                                   BoundLayout<NondetU8RegLayout> layout1);
-static __device__ __noinline__ ArgU16Struct exec_ArgU16_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ArgU16Struct exec_ArgU16_W(ExecContext& ctx,
                                     Val arg0,
                                     Val arg1_0,
                                     BoundLayout<ArgU16Layout> layout2);
-static __device__ __noinline__ NondetU16RegStruct exec_NondetU16Reg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetU16RegStruct exec_NondetU16Reg_W(ExecContext& ctx,
                                                 Val arg0,
                                                 BoundLayout<NondetU16RegLayout> layout1);
-static __device__ __noinline__ NondetU16RegStruct exec_U16Reg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetU16RegStruct exec_U16Reg_W(ExecContext& ctx,
                                           Val arg0,
                                           BoundLayout<NondetU16RegLayout> layout1);
-static __device__ __noinline__ ToBits_5_Struct exec_ToBits_5__W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ToBits_5_Struct exec_ToBits_5__W(ExecContext& ctx,
                                           Val arg0,
                                           BoundLayout<ToBits_5_Layout> layout1);
-static __device__ __noinline__ ValU32Struct exec_DynPo2_W(ExecContext& ctx, Val arg0, BoundLayout<DynPo2Layout> layout1);
-static __device__ __noinline__ NormalizeU32Struct exec_NormalizeU32_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_DynPo2_W(ExecContext& ctx, Val arg0, BoundLayout<DynPo2Layout> layout1);
+static __device__ WITGEN_TU_FNATTR NormalizeU32Struct exec_NormalizeU32_W(ExecContext& ctx,
                                                 DenormedValU32Struct arg0,
                                                 BoundLayout<NormalizeU32Layout> layout1);
-static __device__ __noinline__ AddrDecomposeStruct exec_AddrDecompose_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR AddrDecomposeStruct exec_AddrDecompose_W(ExecContext& ctx,
                                                   ValU32Struct arg0,
                                                   Val arg1_0,
                                                   BoundLayout<AddrDecomposeLayout> layout2);
-static __device__ __noinline__ AddrDecomposeBitsStruct exec_AddrDecomposeBits_W(
+static __device__ WITGEN_TU_FNATTR AddrDecomposeBitsStruct exec_AddrDecomposeBits_W(
     ExecContext& ctx, ValU32Struct arg0, Val arg1_0, BoundLayout<AddrDecomposeBitsLayout> layout2);
-static __device__ __noinline__ CmpEqualStruct exec_CmpEqual_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR CmpEqualStruct exec_CmpEqual_W(ExecContext& ctx,
                                         ValU32Struct arg0,
                                         ValU32Struct arg1_0,
                                         BoundLayout<CmpEqualLayout> layout2);
-static __device__ __noinline__ CmpLessThanUnsignedStruct
+static __device__ WITGEN_TU_FNATTR CmpLessThanUnsignedStruct
 exec_CmpLessThanUnsigned_W(ExecContext& ctx,
                          ValU32Struct arg0,
                          ValU32Struct arg1_0,
                          BoundLayout<CmpLessThanUnsignedLayout> layout2);
-static __device__ __noinline__ NondetRegStruct exec_GetSignU32_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetRegStruct exec_GetSignU32_W(ExecContext& ctx,
                                            ValU32Struct arg0,
                                            BoundLayout<GetSignU32Layout> layout1);
-static __device__ __noinline__ CmpLessThanStruct exec_CmpLessThan_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR CmpLessThanStruct exec_CmpLessThan_W(ExecContext& ctx,
                                               ValU32Struct arg0,
                                               ValU32Struct arg1_0,
                                               BoundLayout<CmpLessThanLayout> layout2);
-static __device__ __noinline__ ToBits_16_Struct exec_ToBits_16__W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ToBits_16_Struct exec_ToBits_16__W(ExecContext& ctx,
                                             Val arg0,
                                             BoundLayout<ToBits_16_Layout> layout1);
-static __device__ __noinline__ FromBits_16_Struct exec_BitwiseAndU16_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR FromBits_16_Struct exec_BitwiseAndU16_W(ExecContext& ctx,
                                                  Val arg0,
                                                  Val arg1_0,
                                                  BoundLayout<BitwiseAndU16Layout> layout2);
-static __device__ __noinline__ ValU32Struct exec_BitwiseAnd_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_BitwiseAnd_W(ExecContext& ctx,
                                         ValU32Struct arg0,
                                         ValU32Struct arg1_0,
                                         BoundLayout<BitwiseAndLayout> layout2);
-static __device__ __noinline__ ValU32Struct exec_BitwiseOr_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_BitwiseOr_W(ExecContext& ctx,
                                        ValU32Struct arg0,
                                        ValU32Struct arg1_0,
                                        BoundLayout<BitwiseOrLayout> layout2);
-static __device__ __noinline__ ValU32Struct exec_BitwiseXor_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_BitwiseXor_W(ExecContext& ctx,
                                         ValU32Struct arg0,
                                         ValU32Struct arg1_0,
                                         BoundLayout<BitwiseXorLayout> layout2);
-static __device__ __noinline__ DecoderStruct exec_Decoder_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR DecoderStruct exec_Decoder_W(ExecContext& ctx,
                                       ValU32Struct arg0,
                                       BoundLayout<DecoderLayout> layout1);
-static __device__ __noinline__ MemoryArgStruct exec_MemoryArg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MemoryArgStruct exec_MemoryArg_W(ExecContext& ctx,
                                           Val arg0,
                                           Val arg1_0,
                                           Val arg2_0,
                                           ValU32Struct arg3,
                                           BoundLayout<MemoryArgLayout> layout4);
-static __device__ __noinline__ CycleArgStruct exec_CycleArg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR CycleArgStruct exec_CycleArg_W(ExecContext& ctx,
                                         Val arg0,
                                         Val arg1_0,
                                         BoundLayout<CycleArgLayout> layout2);
-static __device__ __noinline__ IsCycleStruct exec_IsCycle_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR IsCycleStruct exec_IsCycle_W(ExecContext& ctx,
                                       Val arg0,
                                       BoundLayout<IsCycleLayout> layout1);
-static __device__ __noinline__ MemoryIOStruct exec_MemoryIO_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MemoryIOStruct exec_MemoryIO_W(ExecContext& ctx,
                                         Val arg0,
                                         Val arg1_0,
                                         BoundLayout<MemoryIOLayout> layout2);
-static __device__ __noinline__ IsForwardStruct exec_IsForward_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR IsForwardStruct exec_IsForward_W(ExecContext& ctx,
                                           MemoryIOStruct arg0,
                                           BoundLayout<IsForwardLayout> layout1);
-static __device__ __noinline__ GetDataStruct exec_MemoryRead_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR GetDataStruct exec_MemoryRead_W(ExecContext& ctx,
                                          NondetRegStruct arg0,
                                          Val arg1_0,
                                          BoundLayout<MemoryReadLayout> layout2);
-static __device__ __noinline__ MemoryWriteStruct exec_MemoryWrite_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MemoryWriteStruct exec_MemoryWrite_W(ExecContext& ctx,
                                               NondetRegStruct arg0,
                                               Val arg1_0,
                                               ValU32Struct arg2_0,
                                               BoundLayout<MemoryWriteLayout> layout3);
-static __device__ __noinline__ MemoryWriteUnconstrainedStruct
+static __device__ WITGEN_TU_FNATTR MemoryWriteUnconstrainedStruct
 exec_MemoryWriteUnconstrained_W(ExecContext& ctx,
                               NondetRegStruct arg0,
                               Val arg1_0,
                               BoundLayout<MemoryWriteUnconstrainedLayout> layout2);
-static __device__ __noinline__ GetDataStruct exec_MemoryPageIn_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR GetDataStruct exec_MemoryPageIn_W(ExecContext& ctx,
                                            NondetRegStruct arg0,
                                            Val arg1_0,
                                            BoundLayout<MemoryPageInLayout> layout2);
-static __device__ __noinline__ GetDataStruct exec_MemoryPageOut_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR GetDataStruct exec_MemoryPageOut_W(ExecContext& ctx,
                                             NondetRegStruct arg0,
                                             Val arg1_0,
                                             BoundLayout<MemoryPageOutLayout> layout2);
-static __device__ __noinline__ OneHot_3_Struct exec_OneHot_3__W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR OneHot_3_Struct exec_OneHot_3__W(ExecContext& ctx,
                                           Val arg0,
                                           BoundLayout<OneHot_3_Layout> layout1);
-static __device__ __noinline__ GetDataStruct exec_MemoryGet_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR GetDataStruct exec_MemoryGet_W(ExecContext& ctx,
                                         NondetRegStruct arg0,
                                         Val arg1_0,
                                         OneHot_3_Struct arg2_0,
                                         BoundLayout<MemoryGetLayout> layout3);
-static __device__ __noinline__ OneHot_8_Struct exec_OneHot_8__W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR OneHot_8_Struct exec_OneHot_8__W(ExecContext& ctx,
                                           Val arg0,
                                           BoundLayout<OneHot_8_Layout> layout1);
-static __device__ __noinline__ InstInputStruct exec_InstInput_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstInputStruct exec_InstInput_W(ExecContext& ctx,
                                           Val arg0,
                                           Val arg1_0,
                                           ValU32Struct arg2_0,
                                           Val arg3,
                                           Val arg4,
                                           BoundLayout<InstInputLayout> layout5);
-static __device__ __noinline__ DoCycleTableStruct exec_DoCycleTable_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR DoCycleTableStruct exec_DoCycleTable_W(ExecContext& ctx,
                                                 NondetRegStruct arg0,
                                                 BoundLayout<DoCycleTableLayout> layout1);
-static __device__ __noinline__ DecoderStruct exec_DecodeInst_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR DecoderStruct exec_DecodeInst_W(ExecContext& ctx,
                                          NondetRegStruct arg0,
                                          InstInputStruct arg1_0,
                                          BoundLayout<DecodeInstLayout> layout2);
-static __device__ __noinline__ GetDataStruct exec_ReadReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR GetDataStruct exec_ReadReg_W(ExecContext& ctx,
                                       NondetRegStruct arg0,
                                       InstInputStruct arg1_0,
                                       Val arg2_0,
                                       BoundLayout<ReadRegLayout> layout3);
-static __device__ __noinline__ ReadSourceRegsStruct exec_ReadSourceRegs_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ReadSourceRegsStruct exec_ReadSourceRegs_W(ExecContext& ctx,
                                                     NondetRegStruct arg0,
                                                     InstInputStruct arg1_0,
                                                     DecoderStruct arg2_0,
                                                     BoundLayout<ReadSourceRegsLayout> layout3);
-static __device__ __noinline__ WriteRdStruct exec_WriteRd_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR WriteRdStruct exec_WriteRd_W(ExecContext& ctx,
                                       NondetRegStruct arg0,
                                       InstInputStruct arg1_0,
                                       DecoderStruct arg2_0,
                                       Val arg3,
                                       ValU32Struct arg4,
                                       BoundLayout<WriteRdLayout> layout5);
-static __device__ __noinline__ ExpandU32Struct exec_ExpandU32_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ExpandU32Struct exec_ExpandU32_W(ExecContext& ctx,
                                           ValU32Struct arg0,
                                           Val arg1_0,
                                           BoundLayout<ExpandU32Layout> layout2);
-static __device__ __noinline__ SplitTotalStruct exec_SplitTotal_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR SplitTotalStruct exec_SplitTotal_W(ExecContext& ctx,
                                             Val arg0,
                                             BoundLayout<SplitTotalLayout> layout1);
-static __device__ __noinline__ MultiplyAccumulateStruct
+static __device__ WITGEN_TU_FNATTR MultiplyAccumulateStruct
 exec_MultiplyAccumulate_W(ExecContext& ctx,
                         ValU32Struct arg0,
                         ValU32Struct arg1_0,
                         ValU32Struct arg2_0,
                         MultiplySettingsStruct arg3,
                         BoundLayout<MultiplyAccumulateLayout> layout4);
-static __device__ __noinline__ DivInputStruct exec_DivInput_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR DivInputStruct exec_DivInput_W(ExecContext& ctx,
                                         NondetRegStruct arg0,
                                         InstInputStruct arg1_0,
                                         BoundLayout<DivInputLayout> layout2);
-static __device__ __noinline__ DivideReturnStruct exec_DoDiv_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR DivideReturnStruct exec_DoDiv_W(ExecContext& ctx,
                                          ValU32Struct arg0,
                                          ValU32Struct arg1_0,
                                          Val arg2_0,
                                          Val arg3,
                                          BoundLayout<DoDivLayout> layout4);
-static __device__ __noinline__ ValU32Struct exec_OpSRL_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpSRL_W(ExecContext& ctx,
                                    DivInputStruct arg0,
                                    BoundLayout<OpSRLLayout> layout1);
-static __device__ __noinline__ NondetRegStruct exec_TopBit_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetRegStruct exec_TopBit_W(ExecContext& ctx,
                                        ValU32Struct arg0,
                                        BoundLayout<TopBitLayout> layout1);
-static __device__ __noinline__ ValU32Struct exec_OpSRA_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpSRA_W(ExecContext& ctx,
                                    DivInputStruct arg0,
                                    BoundLayout<OpSRALayout> layout1);
-static __device__ __noinline__ ValU32Struct exec_OpSRLI_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpSRLI_W(ExecContext& ctx,
                                     DivInputStruct arg0,
                                     BoundLayout<OpSRLILayout> layout1);
-static __device__ __noinline__ ValU32Struct exec_OpSRAI_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpSRAI_W(ExecContext& ctx,
                                     DivInputStruct arg0,
                                     BoundLayout<OpSRAILayout> layout1);
-static __device__ __noinline__ ValU32Struct exec_OpDIV_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpDIV_W(ExecContext& ctx,
                                    DivInputStruct arg0,
                                    BoundLayout<OpDIVLayout> layout1);
-static __device__ __noinline__ ValU32Struct exec_OpDIVU_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpDIVU_W(ExecContext& ctx,
                                     DivInputStruct arg0,
                                     BoundLayout<OpDIVULayout> layout1);
-static __device__ __noinline__ ValU32Struct exec_OpREM_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpREM_W(ExecContext& ctx,
                                    DivInputStruct arg0,
                                    BoundLayout<OpREMLayout> layout1);
-static __device__ __noinline__ ValU32Struct exec_OpREMU_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpREMU_W(ExecContext& ctx,
                                     DivInputStruct arg0,
                                     BoundLayout<OpREMULayout> layout1);
-static __device__ __noinline__ InstOutputBaseStruct exec_Div0_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_Div0_W(ExecContext& ctx,
                                           NondetRegStruct arg0,
                                           InstInputStruct arg1_0,
                                           BoundLayout<Div0Layout> layout2);
-static __device__ __noinline__ MiscInputStruct exec_MiscInput_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscInputStruct exec_MiscInput_W(ExecContext& ctx,
                                           NondetRegStruct arg0,
                                           InstInputStruct arg1_0,
                                           BoundLayout<MiscInputLayout> layout2);
-static __device__ __noinline__ InstOutputBaseStruct exec_FinalizeMisc_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_FinalizeMisc_W(ExecContext& ctx,
                                                   NondetRegStruct arg0,
                                                   MiscInputStruct arg1_0,
                                                   MiscOutputStruct arg2_0,
                                                   BoundLayout<FinalizeMiscLayout> layout3);
-static __device__ __noinline__ MiscOutputStruct exec_OpXOR_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpXOR_W(ExecContext& ctx,
                                        MiscInputStruct arg0,
                                        BoundLayout<OpXORLayout> layout1);
-static __device__ __noinline__ MiscOutputStruct exec_OpOR_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpOR_W(ExecContext& ctx,
                                       MiscInputStruct arg0,
                                       BoundLayout<OpORLayout> layout1);
-static __device__ __noinline__ MiscOutputStruct exec_OpAND_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpAND_W(ExecContext& ctx,
                                        MiscInputStruct arg0,
                                        BoundLayout<OpANDLayout> layout1);
-static __device__ __noinline__ MiscOutputStruct exec_OpSLT_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpSLT_W(ExecContext& ctx,
                                        MiscInputStruct arg0,
                                        BoundLayout<OpSLTLayout> layout1);
-static __device__ __noinline__ MiscOutputStruct exec_OpSLTU_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpSLTU_W(ExecContext& ctx,
                                         MiscInputStruct arg0,
                                         BoundLayout<OpSLTULayout> layout1);
-static __device__ __noinline__ InstOutputBaseStruct exec_Misc0_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_Misc0_W(ExecContext& ctx,
                                            NondetRegStruct arg0,
                                            InstInputStruct arg1_0,
                                            BoundLayout<Misc0Layout> layout2);
-static __device__ __noinline__ MiscOutputStruct exec_OpXORI_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpXORI_W(ExecContext& ctx,
                                         MiscInputStruct arg0,
                                         BoundLayout<OpXORILayout> layout1);
-static __device__ __noinline__ MiscOutputStruct exec_OpORI_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpORI_W(ExecContext& ctx,
                                        MiscInputStruct arg0,
                                        BoundLayout<OpORILayout> layout1);
-static __device__ __noinline__ MiscOutputStruct exec_OpANDI_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpANDI_W(ExecContext& ctx,
                                         MiscInputStruct arg0,
                                         BoundLayout<OpANDILayout> layout1);
-static __device__ __noinline__ MiscOutputStruct exec_OpSLTI_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpSLTI_W(ExecContext& ctx,
                                         MiscInputStruct arg0,
                                         BoundLayout<OpSLTILayout> layout1);
-static __device__ __noinline__ MiscOutputStruct exec_OpSLTIU_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpSLTIU_W(ExecContext& ctx,
                                          MiscInputStruct arg0,
                                          BoundLayout<OpSLTIULayout> layout1);
-static __device__ __noinline__ MiscOutputStruct exec_OpBEQ_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpBEQ_W(ExecContext& ctx,
                                        MiscInputStruct arg0,
                                        BoundLayout<OpBEQLayout> layout1);
-static __device__ __noinline__ MiscOutputStruct exec_OpBNE_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpBNE_W(ExecContext& ctx,
                                        MiscInputStruct arg0,
                                        BoundLayout<OpBNELayout> layout1);
-static __device__ __noinline__ MiscOutputStruct exec_OpBLT_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpBLT_W(ExecContext& ctx,
                                        MiscInputStruct arg0,
                                        BoundLayout<OpBLTLayout> layout1);
-static __device__ __noinline__ InstOutputBaseStruct exec_Misc1_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_Misc1_W(ExecContext& ctx,
                                            NondetRegStruct arg0,
                                            InstInputStruct arg1_0,
                                            BoundLayout<Misc1Layout> layout2);
-static __device__ __noinline__ MiscOutputStruct exec_OpBGE_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpBGE_W(ExecContext& ctx,
                                        MiscInputStruct arg0,
                                        BoundLayout<OpBGELayout> layout1);
-static __device__ __noinline__ MiscOutputStruct exec_OpBLTU_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpBLTU_W(ExecContext& ctx,
                                         MiscInputStruct arg0,
                                         BoundLayout<OpBLTULayout> layout1);
-static __device__ __noinline__ MiscOutputStruct exec_OpBGEU_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpBGEU_W(ExecContext& ctx,
                                         MiscInputStruct arg0,
                                         BoundLayout<OpBGEULayout> layout1);
-static __device__ __noinline__ InstOutputBaseStruct exec_Misc2_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_Misc2_W(ExecContext& ctx,
                                            NondetRegStruct arg0,
                                            InstInputStruct arg1_0,
                                            BoundLayout<Misc2Layout> layout2);
-static __device__ __noinline__ MulInputStruct exec_MulInput_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MulInputStruct exec_MulInput_W(ExecContext& ctx,
                                         NondetRegStruct arg0,
                                         InstInputStruct arg1_0,
                                         BoundLayout<MulInputLayout> layout2);
-static __device__ __noinline__ DoMulStruct exec_DoMul_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR DoMulStruct exec_DoMul_W(ExecContext& ctx,
                                   ValU32Struct arg0,
                                   ValU32Struct arg1_0,
                                   Val arg2_0,
                                   Val arg3,
                                   BoundLayout<DoMulLayout> layout4);
-static __device__ __noinline__ ValU32Struct exec_OpSLL_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpSLL_W(ExecContext& ctx,
                                    MulInputStruct arg0,
                                    BoundLayout<OpSLLLayout> layout1);
-static __device__ __noinline__ ValU32Struct exec_OpSLLI_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpSLLI_W(ExecContext& ctx,
                                     MulInputStruct arg0,
                                     BoundLayout<OpSLLILayout> layout1);
-static __device__ __noinline__ ValU32Struct exec_OpMUL_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpMUL_W(ExecContext& ctx,
                                    MulInputStruct arg0,
                                    BoundLayout<OpMULLayout> layout1);
-static __device__ __noinline__ ValU32Struct exec_OpMULH_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpMULH_W(ExecContext& ctx,
                                     MulInputStruct arg0,
                                     BoundLayout<OpMULHLayout> layout1);
-static __device__ __noinline__ ValU32Struct exec_OpMULHSU_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpMULHSU_W(ExecContext& ctx,
                                       MulInputStruct arg0,
                                       BoundLayout<OpMULHSULayout> layout1);
-static __device__ __noinline__ ValU32Struct exec_OpMULHU_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpMULHU_W(ExecContext& ctx,
                                      MulInputStruct arg0,
                                      BoundLayout<OpMULHULayout> layout1);
-static __device__ __noinline__ InstOutputBaseStruct exec_Mul0_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_Mul0_W(ExecContext& ctx,
                                           NondetRegStruct arg0,
                                           InstInputStruct arg1_0,
                                           BoundLayout<Mul0Layout> layout2);
-static __device__ __noinline__ MemLoadInputStruct exec_MemLoadInput_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MemLoadInputStruct exec_MemLoadInput_W(ExecContext& ctx,
                                                 NondetRegStruct arg0,
                                                 InstInputStruct arg1_0,
                                                 BoundLayout<MemLoadInputLayout> layout2);
-static __device__ __noinline__ MemStoreInputStruct exec_MemStoreInput_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MemStoreInputStruct exec_MemStoreInput_W(ExecContext& ctx,
                                                   NondetRegStruct arg0,
                                                   InstInputStruct arg1_0,
                                                   BoundLayout<MemStoreInputLayout> layout2);
-static __device__ __noinline__ MemStoreFinalizeStruct
+static __device__ WITGEN_TU_FNATTR MemStoreFinalizeStruct
 exec_MemStoreFinalize_W(ExecContext& ctx,
                       NondetRegStruct arg0,
                       MemStoreInputStruct arg1_0,
                       ValU32Struct arg2_0,
                       BoundLayout<MemStoreFinalizeLayout> layout3);
-static __device__ __noinline__ SplitWordStruct exec_SplitWord_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR SplitWordStruct exec_SplitWord_W(ExecContext& ctx,
                                           Val arg0,
                                           BoundLayout<SplitWordLayout> layout1);
-static __device__ __noinline__ ValU32Struct exec_OpLB_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpLB_W(ExecContext& ctx,
                                   MemLoadInputStruct arg0,
                                   BoundLayout<OpLBLayout> layout1);
-static __device__ __noinline__ ValU32Struct exec_OpLH_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpLH_W(ExecContext& ctx,
                                   MemLoadInputStruct arg0,
                                   BoundLayout<OpLHLayout> layout1);
-static __device__ __noinline__ ValU32Struct exec_OpLBU_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpLBU_W(ExecContext& ctx,
                                    MemLoadInputStruct arg0,
                                    BoundLayout<OpLBULayout> layout1);
-static __device__ __noinline__ InstOutputBaseStruct exec_Mem0_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_Mem0_W(ExecContext& ctx,
                                           NondetRegStruct arg0,
                                           InstInputStruct arg1_0,
                                           BoundLayout<Mem0Layout> layout2);
-static __device__ __noinline__ ValU32Struct exec_OpSB_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpSB_W(ExecContext& ctx,
                                   MemStoreInputStruct arg0,
                                   BoundLayout<OpSBLayout> layout1);
-static __device__ __noinline__ InstOutputBaseStruct exec_Mem1_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_Mem1_W(ExecContext& ctx,
                                           NondetRegStruct arg0,
                                           InstInputStruct arg1_0,
                                           BoundLayout<Mem1Layout> layout2);
-static __device__ __noinline__ DigestRegStruct back_DigestReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR DigestRegStruct back_DigestReg_W(ExecContext& ctx,
                                           Index distance0,
                                           BoundLayout<DigestRegLayout> layout1);
-static __device__ __noinline__ DigestRegStruct exec_DigestReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR DigestRegStruct exec_DigestReg_W(ExecContext& ctx,
                                           ValU32Struct8Array arg0,
                                           BoundLayout<DigestRegLayout> layout1);
-static __device__ __noinline__ InstOutputBaseStruct
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct
 exec_ControlLoadRootAndNonce_W(ExecContext& ctx,
                              NondetRegStruct arg0,
                              InstInputStruct arg1_0,
                              BoundLayout<ControlLoadRootAndNonceLayout> layout2,
                              GlobalBuf global3);
-static __device__ __noinline__ InstOutputBaseStruct exec_ControlResume_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_ControlResume_W(ExecContext& ctx,
                                                    NondetRegStruct arg0,
                                                    InstInputStruct arg1_0,
                                                    BoundLayout<ControlResumeLayout> layout2,
                                                    GlobalBuf global3);
-static __device__ __noinline__ InstOutputBaseStruct exec_ControlUserECALL_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_ControlUserECALL_W(ExecContext& ctx,
                                                       NondetRegStruct arg0,
                                                       InstInputStruct arg1_0,
                                                       BoundLayout<ControlUserECALLLayout> layout2);
-static __device__ __noinline__ InstOutputBaseStruct exec_ControlMRET_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_ControlMRET_W(ExecContext& ctx,
                                                  NondetRegStruct arg0,
                                                  InstInputStruct arg1_0,
                                                  BoundLayout<ControlMRETLayout> layout2);
-static __device__ __noinline__ InstOutputBaseStruct exec_ControlSuspend_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_ControlSuspend_W(ExecContext& ctx,
                                                     NondetRegStruct arg0,
                                                     InstInputStruct arg1_0,
                                                     BoundLayout<ControlSuspendLayout> layout2,
                                                     GlobalBuf global3);
-static __device__ __noinline__ InstOutputBaseStruct exec_ControlStoreRoot_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_ControlStoreRoot_W(ExecContext& ctx,
                                                       NondetRegStruct arg0,
                                                       InstInputStruct arg1_0,
                                                       BoundLayout<ControlStoreRootLayout> layout2,
                                                       GlobalBuf global3);
-static __device__ __noinline__ InstOutputBaseStruct exec_ControlTable_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_ControlTable_W(ExecContext& ctx,
                                                   NondetRegStruct arg0,
                                                   InstInputStruct arg1_0,
                                                   BoundLayout<ControlTableLayout> layout2);
-static __device__ __noinline__ InstOutputBaseStruct exec_ControlDone_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_ControlDone_W(ExecContext& ctx,
                                                  NondetRegStruct arg0,
                                                  InstInputStruct arg1_0,
                                                  BoundLayout<ControlDoneLayout> layout2,
                                                  GlobalBuf global3);
-static __device__ __noinline__ InstOutputBaseStruct exec_Control0_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_Control0_W(ExecContext& ctx,
                                               NondetRegStruct arg0,
                                               InstInputStruct arg1_0,
                                               BoundLayout<Control0Layout> layout2,
                                               GlobalBuf global3);
-static __device__ __noinline__ OneHot_6_Struct exec_OneHot_6__W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR OneHot_6_Struct exec_OneHot_6__W(ExecContext& ctx,
                                           Val arg0,
                                           BoundLayout<OneHot_6_Layout> layout1);
-static __device__ __noinline__ ECallOutputStruct exec_MachineECall_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ECallOutputStruct exec_MachineECall_W(ExecContext& ctx,
                                                NondetRegStruct arg0,
                                                InstInputStruct arg1_0,
                                                Val arg2_0,
                                                BoundLayout<MachineECallLayout> layout3);
-static __device__ __noinline__ ECallOutputStruct exec_ECallTerminate_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ECallOutputStruct exec_ECallTerminate_W(ExecContext& ctx,
                                                  NondetRegStruct arg0,
                                                  InstInputStruct arg1_0,
                                                  BoundLayout<ECallTerminateLayout> layout2,
                                                  GlobalBuf global3);
-static __device__ __noinline__ OneHot_4_Struct exec_OneHot_4__W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR OneHot_4_Struct exec_OneHot_4__W(ExecContext& ctx,
                                           Val arg0,
                                           BoundLayout<OneHot_4_Layout> layout1);
-static __device__ __noinline__ DecomposeLow2Struct exec_DecomposeLow2_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR DecomposeLow2Struct exec_DecomposeLow2_W(ExecContext& ctx,
                                                   Val arg0,
                                                   BoundLayout<DecomposeLow2Layout> layout1);
-static __device__ __noinline__ ECallOutputStruct
+static __device__ WITGEN_TU_FNATTR ECallOutputStruct
 exec_ECallHostReadSetup_W(ExecContext& ctx,
                         NondetRegStruct arg0,
                         InstInputStruct arg1_0,
                         BoundLayout<ECallHostReadSetupLayout> layout2);
-static __device__ __noinline__ ECallOutputStruct exec_ECallHostWrite_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ECallOutputStruct exec_ECallHostWrite_W(ExecContext& ctx,
                                                  NondetRegStruct arg0,
                                                  InstInputStruct arg1_0,
                                                  BoundLayout<ECallHostWriteLayout> layout2);
-static __device__ __noinline__ ECallOutputStruct
+static __device__ WITGEN_TU_FNATTR ECallOutputStruct
 exec_ECallHostReadBytes_W(ExecContext& ctx,
                         NondetRegStruct arg0,
                         InstInputStruct arg1_0,
@@ -646,38 +655,38 @@ exec_ECallHostReadBytes_W(ExecContext& ctx,
                         Val arg3,
                         Val arg4,
                         BoundLayout<ECallHostReadBytesLayout> layout5);
-static __device__ __noinline__ ECallOutputStruct
+static __device__ WITGEN_TU_FNATTR ECallOutputStruct
 exec_ECallHostReadWords_W(ExecContext& ctx,
                         NondetRegStruct arg0,
                         InstInputStruct arg1_0,
                         Val arg2_0,
                         Val arg3,
                         BoundLayout<ECallHostReadWordsLayout> layout4);
-static __device__ __noinline__ InstOutputBaseStruct exec_ECall0_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_ECall0_W(ExecContext& ctx,
                                             NondetRegStruct arg0,
                                             InstInputStruct arg1_0,
                                             BoundLayout<ECall0Layout> layout2,
                                             GlobalBuf global3);
-static __device__ __noinline__ NondetRegStruct exec_SBox_W(ExecContext& ctx, Val arg0, BoundLayout<SBoxLayout> layout1);
-static __device__ __noinline__ MultiplyByMIntStruct exec_DoIntRound_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetRegStruct exec_SBox_W(ExecContext& ctx, Val arg0, BoundLayout<SBoxLayout> layout1);
+static __device__ WITGEN_TU_FNATTR MultiplyByMIntStruct exec_DoIntRound_W(ExecContext& ctx,
                                                 Val24Array arg0,
                                                 Val arg1_0,
                                                 BoundLayout<DoIntRoundLayout> layout2);
-static __device__ __noinline__ DoIntRoundsStruct exec_DoIntRounds_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR DoIntRoundsStruct exec_DoIntRounds_W(ExecContext& ctx,
                                               Val24Array arg0,
                                               BoundLayout<DoIntRoundsLayout> layout1);
-static __device__ __noinline__ MultiplyByMExtStruct exec_DoExtRound_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MultiplyByMExtStruct exec_DoExtRound_W(ExecContext& ctx,
                                                 Val24Array arg0,
                                                 Val24Array arg1_0,
                                                 BoundLayout<DoExtRoundLayout> layout2);
-static __device__ __noinline__ MultiplyByMExtStruct exec_DoExtRoundByIdx_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MultiplyByMExtStruct exec_DoExtRoundByIdx_W(ExecContext& ctx,
                                                      Val24Array arg0,
                                                      Val arg1_0,
                                                      BoundLayout<DoExtRoundByIdxLayout> layout2);
-static __device__ __noinline__ PoseidonStateStruct back_PoseidonState_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct back_PoseidonState_W(ExecContext& ctx,
                                                   Index distance0,
                                                   BoundLayout<PoseidonStateLayout> layout1);
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonState_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonState_W(ExecContext& ctx,
                                                   PoseidonOpDefStruct arg0,
                                                   Val arg1_0,
                                                   Val arg2_0,
@@ -687,120 +696,120 @@ static __device__ __noinline__ PoseidonStateStruct exec_PoseidonState_W(ExecCont
                                                   Val24Array arg6,
                                                   ExtVal arg7,
                                                   BoundLayout<PoseidonStateLayout> layout8);
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonInvalid_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonInvalid_W(ExecContext& ctx,
                                                     BoundLayout<PoseidonStateLayout> layout0);
-static __device__ __noinline__ ReadAddrStruct exec_ReadAddr_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ReadAddrStruct exec_ReadAddr_W(ExecContext& ctx,
                                         NondetRegStruct arg0,
                                         Val arg1_0,
                                         BoundLayout<ReadAddrLayout> layout2);
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonEcall_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonEcall_W(ExecContext& ctx,
                                                   NondetRegStruct arg0,
                                                   Val arg1_0,
                                                   BoundLayout<PoseidonEcallLayout> layout2);
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonPagingEntry_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonPagingEntry_W(ExecContext& ctx,
                                                         NondetRegStruct arg0,
                                                         Val arg1_0,
                                                         BoundLayout<PoseidonStateLayout> layout2);
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonEntry_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonEntry_W(ExecContext& ctx,
                                                   NondetRegStruct arg0,
                                                   ValU32Struct arg1_0,
                                                   Val arg2_0,
                                                   BoundLayout<PoseidonEntryLayout> layout3);
-static __device__ __noinline__ ReadElemStruct exec_ReadElem_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ReadElemStruct exec_ReadElem_W(ExecContext& ctx,
                                         NondetRegStruct arg0,
                                         Val arg1_0,
                                         BoundLayout<ReadElemLayout> layout2);
-static __device__ __noinline__ PoseidonStateStruct
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct
 exec_PoseidonLoadState_W(ExecContext& ctx,
                        NondetRegStruct arg0,
                        PoseidonStateStruct arg1_0,
                        BoundLayout<PoseidonLoadStateLayout> layout2);
-static __device__ __noinline__ PoseidonStateStruct
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct
 exec_PoseidonLoadInShort_W(ExecContext& ctx,
                          NondetRegStruct arg0,
                          PoseidonStateStruct arg1_0,
                          BoundLayout<PoseidonLoadInShortLayout> layout2,
                          GlobalBuf global3);
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonLoadInLow_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonLoadInLow_W(ExecContext& ctx,
                                                       NondetRegStruct arg0,
                                                       PoseidonStateStruct arg1_0,
                                                       BoundLayout<PoseidonLoadInLowLayout> layout2,
                                                       GlobalBuf global3);
-static __device__ __noinline__ PoseidonStateStruct
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct
 exec_PoseidonLoadInHigh_W(ExecContext& ctx,
                         NondetRegStruct arg0,
                         PoseidonStateStruct arg1_0,
                         BoundLayout<PoseidonLoadInHighLayout> layout2,
                         GlobalBuf global3);
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonLoadIn_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonLoadIn_W(ExecContext& ctx,
                                                    NondetRegStruct arg0,
                                                    PoseidonStateStruct arg1_0,
                                                    BoundLayout<PoseidonLoadInLayout> layout2,
                                                    GlobalBuf global3);
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonExtRound_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonExtRound_W(ExecContext& ctx,
                                                      PoseidonStateStruct arg0,
                                                      BoundLayout<PoseidonExtRoundLayout> layout1);
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonIntRounds_W(
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonIntRounds_W(
     ExecContext& ctx, PoseidonStateStruct arg0, BoundLayout<PoseidonIntRoundsLayout> layout1);
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonCheckOut_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonCheckOut_W(ExecContext& ctx,
                                                      NondetRegStruct arg0,
                                                      PoseidonStateStruct arg1_0,
                                                      BoundLayout<PoseidonCheckOutLayout> layout2);
-static __device__ __noinline__ FieldToWordStruct exec_FieldToWord_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR FieldToWordStruct exec_FieldToWord_W(ExecContext& ctx,
                                               Val arg0,
                                               BoundLayout<FieldToWordLayout> layout1);
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonStoreOut_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonStoreOut_W(ExecContext& ctx,
                                                      NondetRegStruct arg0,
                                                      PoseidonStateStruct arg1_0,
                                                      BoundLayout<PoseidonStoreOutLayout> layout2);
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonDoOut_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonDoOut_W(ExecContext& ctx,
                                                   NondetRegStruct arg0,
                                                   PoseidonStateStruct arg1_0,
                                                   BoundLayout<PoseidonDoOutLayout> layout2);
-static __device__ __noinline__ PoseidonStateStruct
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct
 exec_PoseidonStoreState_W(ExecContext& ctx,
                         NondetRegStruct arg0,
                         PoseidonStateStruct arg1_0,
                         BoundLayout<PoseidonStoreStateLayout> layout2);
-static __device__ __noinline__ IsU24Struct exec_IsU24_W(ExecContext& ctx, Val arg0, BoundLayout<IsU24Layout> layout1);
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonPagingLoadNode_W(
+static __device__ WITGEN_TU_FNATTR IsU24Struct exec_IsU24_W(ExecContext& ctx, Val arg0, BoundLayout<IsU24Layout> layout1);
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonPagingLoadNode_W(
     ExecContext& ctx, NondetRegStruct arg0, Val arg1_0, BoundLayout<PoseidonStateLayout> layout2);
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonPagingLoadPage_W(
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonPagingLoadPage_W(
     ExecContext& ctx, NondetRegStruct arg0, Val arg1_0, BoundLayout<PoseidonStateLayout> layout2);
-static __device__ __noinline__ PoseidonStateStruct
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct
 exec_PoseidonPagingLoadDone_W(ExecContext& ctx, BoundLayout<PoseidonStateLayout> layout0);
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonPagingStoreNode_W(
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonPagingStoreNode_W(
     ExecContext& ctx, NondetRegStruct arg0, Val arg1_0, BoundLayout<PoseidonStateLayout> layout2);
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonPagingStorePage_W(
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonPagingStorePage_W(
     ExecContext& ctx, NondetRegStruct arg0, Val arg1_0, BoundLayout<PoseidonStateLayout> layout2);
-static __device__ __noinline__ PoseidonStateStruct
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct
 exec_PoseidonPagingStoreDone_W(ExecContext& ctx, BoundLayout<PoseidonStateLayout> layout0);
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonPaging_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonPaging_W(ExecContext& ctx,
                                                    NondetRegStruct arg0,
                                                    Val arg1_0,
                                                    PoseidonStateStruct arg2_0,
                                                    BoundLayout<PoseidonPagingLayout> layout3);
-static __device__ __noinline__ InstOutputBaseStruct exec_Poseidon0_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_Poseidon0_W(ExecContext& ctx,
                                                NondetRegStruct arg0,
                                                InstInputStruct arg1_0,
                                                BoundLayout<Poseidon0Layout> layout2,
                                                GlobalBuf global3);
-static __device__ __noinline__ InstOutputBaseStruct exec_Poseidon1_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_Poseidon1_W(ExecContext& ctx,
                                                NondetRegStruct arg0,
                                                InstInputStruct arg1_0,
                                                BoundLayout<Poseidon1Layout> layout2);
-static __device__ __noinline__ CarryExtractStruct exec_CarryExtract_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR CarryExtractStruct exec_CarryExtract_W(ExecContext& ctx,
                                                 Val arg0,
                                                 BoundLayout<CarryExtractLayout> layout1);
-static __device__ __noinline__ UnpackReg_32__16_Struct exec_UnpackReg_32__16__W(
+static __device__ WITGEN_TU_FNATTR UnpackReg_32__16_Struct exec_UnpackReg_32__16__W(
     ExecContext& ctx, Val2Array arg0, BoundLayout<UnpackReg_32__16_Layout> layout1);
-static __device__ __noinline__ UnpackReg_32__16_Struct exec_CarryAndExpand_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR UnpackReg_32__16_Struct exec_CarryAndExpand_W(ExecContext& ctx,
                                                        Val2Array arg0,
                                                        BoundLayout<CarryAndExpandLayout> layout1);
-static __device__ __noinline__ ShaStateStruct back_ShaState_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ShaStateStruct back_ShaState_W(ExecContext& ctx,
                                         Index distance0,
                                         BoundLayout<ShaStateLayout> layout1);
-static __device__ __noinline__ ShaStateStruct exec_ShaState_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ShaStateStruct exec_ShaState_W(ExecContext& ctx,
                                         Val32Array arg0,
                                         Val32Array arg1_0,
                                         Val32Array arg2_0,
@@ -812,22 +821,22 @@ static __device__ __noinline__ ShaStateStruct exec_ShaState_W(ExecContext& ctx,
                                         Val arg8,
                                         Val arg9,
                                         BoundLayout<ShaStateLayout> layout10);
-static __device__ __noinline__ ShaStateStruct exec_ShaInvalid_W(ExecContext& ctx, BoundLayout<ShaStateLayout> layout0);
-static __device__ __noinline__ ShaStateStruct exec_ShaEcall_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ShaStateStruct exec_ShaInvalid_W(ExecContext& ctx, BoundLayout<ShaStateLayout> layout0);
+static __device__ WITGEN_TU_FNATTR ShaStateStruct exec_ShaEcall_W(ExecContext& ctx,
                                         NondetRegStruct arg0,
                                         BoundLayout<ShaEcallLayout> layout1);
-static __device__ __noinline__ ShaStateStruct exec_ShaLoadState_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ShaStateStruct exec_ShaLoadState_W(ExecContext& ctx,
                                             NondetRegStruct arg0,
                                             ShaStateStruct arg1_0,
                                             BoundLayout<ShaLoadStateLayout> layout2);
-static __device__ __noinline__ ShaStateStruct exec_ShaLoadData_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ShaStateStruct exec_ShaLoadData_W(ExecContext& ctx,
                                            NondetRegStruct arg0,
                                            ShaStateStruct arg1_0,
                                            ShaStateStruct arg2_0,
                                            ShaStateStruct arg3,
                                            ShaStateStruct arg4,
                                            BoundLayout<ShaLoadDataLayout> layout5);
-static __device__ __noinline__ ShaStateStruct exec_ShaMix_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ShaStateStruct exec_ShaMix_W(ExecContext& ctx,
                                       NondetRegStruct arg0,
                                       ShaStateStruct arg1_0,
                                       ShaStateStruct arg2_0,
@@ -837,20 +846,20 @@ static __device__ __noinline__ ShaStateStruct exec_ShaMix_W(ExecContext& ctx,
                                       ShaStateStruct arg6,
                                       ShaStateStruct arg7,
                                       BoundLayout<ShaMixLayout> layout8);
-static __device__ __noinline__ ShaStateStruct exec_ShaStoreState_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ShaStateStruct exec_ShaStoreState_W(ExecContext& ctx,
                                              NondetRegStruct arg0,
                                              ShaStateStruct arg1_0,
                                              ShaStateStruct arg2_0,
                                              ShaStateStruct arg3,
                                              BoundLayout<ShaStoreStateLayout> layout4);
-static __device__ __noinline__ InstOutputBaseStruct exec_Sha0_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_Sha0_W(ExecContext& ctx,
                                           NondetRegStruct arg0,
                                           InstInputStruct arg1_0,
                                           BoundLayout<Sha0Layout> layout2);
-static __device__ __noinline__ BigIntStateStruct back_BigIntState_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR BigIntStateStruct back_BigIntState_W(ExecContext& ctx,
                                               Index distance0,
                                               BoundLayout<BigIntStateLayout> layout1);
-static __device__ __noinline__ BigIntStateStruct exec_BigIntState_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR BigIntStateStruct exec_BigIntState_W(ExecContext& ctx,
                                               Val arg0,
                                               Val arg1_0,
                                               Val arg2_0,
@@ -859,47 +868,47 @@ static __device__ __noinline__ BigIntStateStruct exec_BigIntState_W(ExecContext&
                                               Val16Array arg5,
                                               Val arg6,
                                               BoundLayout<BigIntStateLayout> layout7);
-static __device__ __noinline__ BigIntStateStruct exec_BigIntInvalid_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR BigIntStateStruct exec_BigIntInvalid_W(ExecContext& ctx,
                                                 BoundLayout<BigIntStateLayout> layout0);
-static __device__ __noinline__ BigIntStateStruct exec_BigIntEcall_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR BigIntStateStruct exec_BigIntEcall_W(ExecContext& ctx,
                                               NondetRegStruct arg0,
                                               BoundLayout<BigIntEcallLayout> layout1);
-static __device__ __noinline__ SplitU32Struct exec_SplitU32_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR SplitU32Struct exec_SplitU32_W(ExecContext& ctx,
                                         ValU32Struct arg0,
                                         BoundLayout<SplitU32Layout> layout1);
-static __device__ __noinline__ AddrDecomposeBitsStruct exec_BigIntAddr_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR AddrDecomposeBitsStruct exec_BigIntAddr_W(ExecContext& ctx,
                                                    ValU32Struct arg0,
                                                    Val arg1_0,
                                                    BoundLayout<BigIntAddrLayout> layout2);
-static __device__ __noinline__ BigIntReadStruct exec_BigIntRead_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR BigIntReadStruct exec_BigIntRead_W(ExecContext& ctx,
                                             NondetRegStruct arg0,
                                             ValU32Struct arg1_0,
                                             Val arg2_0,
                                             BoundLayout<BigIntReadLayout> layout3);
-static __device__ __noinline__ BigIntWitnessStruct exec_BigIntWitness_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR BigIntWitnessStruct exec_BigIntWitness_W(ExecContext& ctx,
                                                   Val16Array arg0,
                                                   BoundLayout<BigIntWitnessLayout> layout1);
-static __device__ __noinline__ BigIntWitnessStruct exec_BigIntWrite_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR BigIntWitnessStruct exec_BigIntWrite_W(ExecContext& ctx,
                                                 NondetRegStruct arg0,
                                                 ValU32Struct arg1_0,
                                                 Val arg2_0,
                                                 BoundLayout<BigIntWriteLayout> layout3);
-static __device__ __noinline__ BigIntWitnessStruct exec_BigIntCheck_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR BigIntWitnessStruct exec_BigIntCheck_W(ExecContext& ctx,
                                                 BoundLayout<BigIntWitnessLayout> layout0);
-static __device__ __noinline__ BigIntStateStruct exec_BigIntStep_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR BigIntStateStruct exec_BigIntStep_W(ExecContext& ctx,
                                              NondetRegStruct arg0,
                                              BigIntStateStruct arg1_0,
                                              BoundLayout<BigIntStepLayout> layout2);
-static __device__ __noinline__ InstOutputBaseStruct exec_BigInt0_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_BigInt0_W(ExecContext& ctx,
                                              NondetRegStruct arg0,
                                              InstInputStruct arg1_0,
                                              BoundLayout<BigInt0Layout> layout2);
-static __device__ __noinline__ OneHot_13_Struct exec_OneHot_13__W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR OneHot_13_Struct exec_OneHot_13__W(ExecContext& ctx,
                                             Val arg0,
                                             BoundLayout<OneHot_13_Layout> layout1);
-static __device__ __noinline__ TopStruct exec_Top_W(ExecContext& ctx, BoundLayout<TopLayout> layout0, GlobalBuf global1);
-static __device__ __noinline__ void step_Top_W(ExecContext& ctx, MutableBuf data0, GlobalBuf global1);
-static __device__ __noinline__ NondetRegStruct back_NondetReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR TopStruct exec_Top_W(ExecContext& ctx, BoundLayout<TopLayout> layout0, GlobalBuf global1);
+static __device__ WITGEN_TU_FNATTR void step_Top_W(ExecContext& ctx, MutableBuf data0, GlobalBuf global1);
+static __device__ WITGEN_TU_FNATTR NondetRegStruct back_NondetReg_W(ExecContext& ctx,
                                           Index distance0,
                                           BoundLayout<NondetRegLayout> layout1) {
   // builtin NondetReg
@@ -907,7 +916,7 @@ static __device__ __noinline__ NondetRegStruct back_NondetReg_W(ExecContext& ctx
   return x2;
 }
 
-static __device__ __noinline__ NondetRegStruct exec_NondetReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetRegStruct exec_NondetReg_W(ExecContext& ctx,
                                           Val arg0,
                                           BoundLayout<NondetRegLayout> layout1) {
   STORE(LAYOUT_LOOKUP(layout1, _super), arg0);
@@ -915,7 +924,7 @@ static __device__ __noinline__ NondetRegStruct exec_NondetReg_W(ExecContext& ctx
   return x2;
 }
 
-static __device__ __noinline__ NondetExtRegStruct back_NondetExtReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetExtRegStruct back_NondetExtReg_W(ExecContext& ctx,
                                                 Index distance0,
                                                 BoundLayout<NondetExtRegLayout> layout1) {
   // builtin NondetExtReg
@@ -924,7 +933,7 @@ static __device__ __noinline__ NondetExtRegStruct back_NondetExtReg_W(ExecContex
   return x2;
 }
 
-static __device__ __noinline__ NondetExtRegStruct exec_NondetExtReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetExtRegStruct exec_NondetExtReg_W(ExecContext& ctx,
                                                 ExtVal arg0,
                                                 BoundLayout<NondetExtRegLayout> layout1) {
   STORE_EXT(LAYOUT_LOOKUP(layout1, _super), arg0);
@@ -932,7 +941,7 @@ static __device__ __noinline__ NondetExtRegStruct exec_NondetExtReg_W(ExecContex
   return x2;
 }
 
-static __device__ __noinline__ NondetRegStruct back_Reg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetRegStruct back_Reg_W(ExecContext& ctx,
                                     Index distance0,
                                     BoundLayout<NondetRegLayout> layout1) {
   // Reg(<preamble>:5)
@@ -940,7 +949,7 @@ static __device__ __noinline__ NondetRegStruct back_Reg_W(ExecContext& ctx,
   return x2;
 }
 
-static __device__ __noinline__ NondetRegStruct exec_Reg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetRegStruct exec_Reg_W(ExecContext& ctx,
                                     Val arg0,
                                     BoundLayout<NondetRegLayout> layout1) {
   NondetRegStruct x2 = exec_NondetReg_W(ctx, arg0, layout1);
@@ -949,7 +958,7 @@ static __device__ __noinline__ NondetRegStruct exec_Reg_W(ExecContext& ctx,
   return x2;
 }
 
-static __device__ __noinline__ NondetExtRegStruct back_ExtReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetExtRegStruct back_ExtReg_W(ExecContext& ctx,
                                           Index distance0,
                                           BoundLayout<NondetExtRegLayout> layout1) {
   // ExtReg(<preamble>:12)
@@ -957,7 +966,7 @@ static __device__ __noinline__ NondetExtRegStruct back_ExtReg_W(ExecContext& ctx
   return x2;
 }
 
-static __device__ __noinline__ NondetExtRegStruct exec_ExtReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetExtRegStruct exec_ExtReg_W(ExecContext& ctx,
                                           ExtVal arg0,
                                           BoundLayout<NondetExtRegLayout> layout1) {
   NondetExtRegStruct x2 = exec_NondetExtReg_W(ctx, arg0, layout1);
@@ -967,7 +976,7 @@ static __device__ __noinline__ NondetExtRegStruct exec_ExtReg_W(ExecContext& ctx
   return x2;
 }
 
-static __device__ __noinline__ NondetRegStruct back_NondetBitReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetRegStruct back_NondetBitReg_W(ExecContext& ctx,
                                              Index distance0,
                                              BoundLayout<NondetRegLayout> layout1) {
   // NondetBitReg(zirgen/circuit/rv32im/v2/dsl/bits.zir:13)
@@ -975,7 +984,7 @@ static __device__ __noinline__ NondetRegStruct back_NondetBitReg_W(ExecContext& 
   return x2;
 }
 
-static __device__ __noinline__ NondetRegStruct exec_NondetBitReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetRegStruct exec_NondetBitReg_W(ExecContext& ctx,
                                              Val arg0,
                                              BoundLayout<NondetRegLayout> layout1) {
   NondetRegStruct x2 = exec_NondetReg_W(ctx, arg0, layout1);
@@ -989,7 +998,7 @@ static __device__ __noinline__ NondetRegStruct exec_NondetBitReg_W(ExecContext& 
   return x2;
 }
 
-static __device__ __noinline__ NondetRegStruct back_BitReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetRegStruct back_BitReg_W(ExecContext& ctx,
                                        Index distance0,
                                        BoundLayout<NondetRegLayout> layout1) {
   // BitReg(zirgen/circuit/rv32im/v2/dsl/bits.zir:19)
@@ -997,7 +1006,7 @@ static __device__ __noinline__ NondetRegStruct back_BitReg_W(ExecContext& ctx,
   return x2;
 }
 
-static __device__ __noinline__ NondetRegStruct exec_BitReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetRegStruct exec_BitReg_W(ExecContext& ctx,
                                        Val arg0,
                                        BoundLayout<NondetRegLayout> layout1) {
   NondetRegStruct x2 = exec_NondetBitReg_W(ctx, arg0, layout1);
@@ -1006,7 +1015,7 @@ static __device__ __noinline__ NondetRegStruct exec_BitReg_W(ExecContext& ctx,
   return x2;
 }
 
-static __device__ __noinline__ NondetRegStruct exec_NondetTwitReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetRegStruct exec_NondetTwitReg_W(ExecContext& ctx,
                                               Val arg0,
                                               BoundLayout<NondetRegLayout> layout1) {
   // NondetTwitReg(zirgen/circuit/rv32im/v2/dsl/bits.zir:56)
@@ -1022,7 +1031,7 @@ static __device__ __noinline__ NondetRegStruct exec_NondetTwitReg_W(ExecContext&
   return x2;
 }
 
-static __device__ __noinline__ NondetFakeTwitRegStruct
+static __device__ WITGEN_TU_FNATTR NondetFakeTwitRegStruct
 exec_NondetFakeTwitReg_W(ExecContext& ctx, Val arg0, BoundLayout<NondetFakeTwitRegLayout> layout1) {
   // NondetFakeTwitReg(zirgen/circuit/rv32im/v2/dsl/bits.zir:64)
   NondetRegStruct x2 = exec_NondetBitReg_W(ctx, bitAnd(arg0, Val(1)), LAYOUT_LOOKUP(layout1, reg0));
@@ -1035,7 +1044,7 @@ exec_NondetFakeTwitReg_W(ExecContext& ctx, Val arg0, BoundLayout<NondetFakeTwitR
   return NondetFakeTwitRegStruct{._super = x4};
 }
 
-static __device__ __noinline__ FakeTwitRegStruct exec_FakeTwitReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR FakeTwitRegStruct exec_FakeTwitReg_W(ExecContext& ctx,
                                               Val arg0,
                                               BoundLayout<NondetFakeTwitRegLayout> layout1) {
   // FakeTwitReg(zirgen/circuit/rv32im/v2/dsl/bits.zir:76)
@@ -1045,7 +1054,7 @@ static __device__ __noinline__ FakeTwitRegStruct exec_FakeTwitReg_W(ExecContext&
   return FakeTwitRegStruct{};
 }
 
-static __device__ __noinline__ NondetRegStruct exec_IsZero_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetRegStruct exec_IsZero_W(ExecContext& ctx,
                                        Val arg0,
                                        BoundLayout<IsZeroLayout> layout1) {
   // IsZero(zirgen/circuit/rv32im/v2/dsl/is_zero.zir:8)
@@ -1068,7 +1077,7 @@ static __device__ __noinline__ NondetRegStruct exec_IsZero_W(ExecContext& ctx,
   return x2;
 }
 
-static __device__ __noinline__ ArgU8Struct exec_ArgU8_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ArgU8Struct exec_ArgU8_W(ExecContext& ctx,
                                   Val arg0,
                                   Val arg1_0,
                                   BoundLayout<ArgU8Layout> layout2) {
@@ -1085,7 +1094,7 @@ static __device__ __noinline__ ArgU8Struct exec_ArgU8_W(ExecContext& ctx,
   return ArgU8Struct{.count = x3, .val = x4};
 }
 
-static __device__ __noinline__ NondetRegStruct exec_NondetU8Reg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetRegStruct exec_NondetU8Reg_W(ExecContext& ctx,
                                             Val arg0,
                                             BoundLayout<NondetU8RegLayout> layout1) {
   // NondetU8Reg(zirgen/circuit/rv32im/v2/dsl/lookups.zir:18)
@@ -1096,7 +1105,7 @@ static __device__ __noinline__ NondetRegStruct exec_NondetU8Reg_W(ExecContext& c
   return x2.val;
 }
 
-static __device__ __noinline__ U8RegStruct exec_U8Reg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR U8RegStruct exec_U8Reg_W(ExecContext& ctx,
                                   Val arg0,
                                   BoundLayout<NondetU8RegLayout> layout1) {
   // U8Reg(zirgen/circuit/rv32im/v2/dsl/lookups.zir:26)
@@ -1106,7 +1115,7 @@ static __device__ __noinline__ U8RegStruct exec_U8Reg_W(ExecContext& ctx,
   return U8RegStruct{};
 }
 
-static __device__ __noinline__ ArgU16Struct exec_ArgU16_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ArgU16Struct exec_ArgU16_W(ExecContext& ctx,
                                     Val arg0,
                                     Val arg1_0,
                                     BoundLayout<ArgU16Layout> layout2) {
@@ -1123,7 +1132,7 @@ static __device__ __noinline__ ArgU16Struct exec_ArgU16_W(ExecContext& ctx,
   return ArgU16Struct{.count = x3, .val = x4};
 }
 
-static __device__ __noinline__ NondetU16RegStruct exec_NondetU16Reg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetU16RegStruct exec_NondetU16Reg_W(ExecContext& ctx,
                                                 Val arg0,
                                                 BoundLayout<NondetU16RegLayout> layout1) {
   // NondetU16Reg(zirgen/circuit/rv32im/v2/dsl/lookups.zir:42)
@@ -1134,7 +1143,7 @@ static __device__ __noinline__ NondetU16RegStruct exec_NondetU16Reg_W(ExecContex
   return NondetU16RegStruct{._super = x2.val};
 }
 
-static __device__ __noinline__ NondetU16RegStruct exec_U16Reg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetU16RegStruct exec_U16Reg_W(ExecContext& ctx,
                                           Val arg0,
                                           BoundLayout<NondetU16RegLayout> layout1) {
   // U16Reg(zirgen/circuit/rv32im/v2/dsl/lookups.zir:50)
@@ -1145,7 +1154,7 @@ static __device__ __noinline__ NondetU16RegStruct exec_U16Reg_W(ExecContext& ctx
   return x2;
 }
 
-static __device__ __noinline__ ToBits_5_Struct exec_ToBits_5__W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ToBits_5_Struct exec_ToBits_5__W(ExecContext& ctx,
                                           Val arg0,
                                           BoundLayout<ToBits_5_Layout> layout1) {
   // ToBits(zirgen/circuit/rv32im/v2/dsl/po2.zir:24)
@@ -1180,7 +1189,7 @@ static __device__ __noinline__ ToBits_5_Struct exec_ToBits_5__W(ExecContext& ctx
   return ToBits_5_Struct{._super = x2};
 }
 
-static __device__ __noinline__ ValU32Struct exec_DynPo2_W(ExecContext& ctx, Val arg0, BoundLayout<DynPo2Layout> layout1) {
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_DynPo2_W(ExecContext& ctx, Val arg0, BoundLayout<DynPo2Layout> layout1) {
   // DynPo2(zirgen/circuit/rv32im/v2/dsl/po2.zir:38)
   ToBits_5_Struct x2 = exec_ToBits_5__W(ctx, arg0, LAYOUT_LOOKUP(layout1, low5));
   // builtin Mul
@@ -1240,7 +1249,7 @@ static __device__ __noinline__ ValU32Struct exec_DynPo2_W(ExecContext& ctx, Val 
   return ValU32Struct{.low = x24._super, .high = x26._super};
 }
 
-static __device__ __noinline__ NormalizeU32Struct exec_NormalizeU32_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NormalizeU32Struct exec_NormalizeU32_W(ExecContext& ctx,
                                                 DenormedValU32Struct arg0,
                                                 BoundLayout<NormalizeU32Layout> layout1) {
   // NormalizeU32(zirgen/circuit/rv32im/v2/dsl/u32.zir:44)
@@ -1274,7 +1283,7 @@ static __device__ __noinline__ NormalizeU32Struct exec_NormalizeU32_W(ExecContex
   return NormalizeU32Struct{._super = x10, .highCarry = x8};
 }
 
-static __device__ __noinline__ AddrDecomposeStruct exec_AddrDecompose_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR AddrDecomposeStruct exec_AddrDecompose_W(ExecContext& ctx,
                                                   ValU32Struct arg0,
                                                   Val arg1_0,
                                                   BoundLayout<AddrDecomposeLayout> layout2) {
@@ -1305,7 +1314,7 @@ static __device__ __noinline__ AddrDecomposeStruct exec_AddrDecompose_W(ExecCont
   return AddrDecomposeStruct{._super = x11, .low2 = x3};
 }
 
-static __device__ __noinline__ AddrDecomposeBitsStruct exec_AddrDecomposeBits_W(
+static __device__ WITGEN_TU_FNATTR AddrDecomposeBitsStruct exec_AddrDecomposeBits_W(
     ExecContext& ctx, ValU32Struct arg0, Val arg1_0, BoundLayout<AddrDecomposeBitsLayout> layout2) {
   // AddrDecomposeBits(zirgen/circuit/rv32im/v2/dsl/u32.zir:81)
   NondetRegStruct x3 =
@@ -1342,7 +1351,7 @@ static __device__ __noinline__ AddrDecomposeBitsStruct exec_AddrDecomposeBits_W(
   return AddrDecomposeBitsStruct{._super = x14, .low0 = x3, .low1 = x5, .low2 = x6};
 }
 
-static __device__ __noinline__ CmpEqualStruct exec_CmpEqual_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR CmpEqualStruct exec_CmpEqual_W(ExecContext& ctx,
                                         ValU32Struct arg0,
                                         ValU32Struct arg1_0,
                                         BoundLayout<CmpEqualLayout> layout2) {
@@ -1356,7 +1365,7 @@ static __device__ __noinline__ CmpEqualStruct exec_CmpEqual_W(ExecContext& ctx,
   return CmpEqualStruct{.isEqual = x5};
 }
 
-static __device__ __noinline__ CmpLessThanUnsignedStruct
+static __device__ WITGEN_TU_FNATTR CmpLessThanUnsignedStruct
 exec_CmpLessThanUnsigned_W(ExecContext& ctx,
                          ValU32Struct arg0,
                          ValU32Struct arg1_0,
@@ -1374,7 +1383,7 @@ exec_CmpLessThanUnsigned_W(ExecContext& ctx,
   return CmpLessThanUnsignedStruct{.isLessThan = x6};
 }
 
-static __device__ __noinline__ NondetRegStruct exec_GetSignU32_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetRegStruct exec_GetSignU32_W(ExecContext& ctx,
                                            ValU32Struct arg0,
                                            BoundLayout<GetSignU32Layout> layout1) {
   // builtin Mul
@@ -1396,7 +1405,7 @@ static __device__ __noinline__ NondetRegStruct exec_GetSignU32_W(ExecContext& ct
   return x3;
 }
 
-static __device__ __noinline__ CmpLessThanStruct exec_CmpLessThan_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR CmpLessThanStruct exec_CmpLessThan_W(ExecContext& ctx,
                                               ValU32Struct arg0,
                                               ValU32Struct arg1_0,
                                               BoundLayout<CmpLessThanLayout> layout2) {
@@ -1428,7 +1437,7 @@ static __device__ __noinline__ CmpLessThanStruct exec_CmpLessThan_W(ExecContext&
   return CmpLessThanStruct{.isLessThan = x14};
 }
 
-static __device__ __noinline__ ToBits_16_Struct exec_ToBits_16__W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ToBits_16_Struct exec_ToBits_16__W(ExecContext& ctx,
                                             Val arg0,
                                             BoundLayout<ToBits_16_Layout> layout1) {
   // ToBits(zirgen/circuit/rv32im/v2/dsl/po2.zir:24)
@@ -1478,7 +1487,7 @@ static __device__ __noinline__ ToBits_16_Struct exec_ToBits_16__W(ExecContext& c
   return ToBits_16_Struct{._super = x2};
 }
 
-static __device__ __noinline__ FromBits_16_Struct exec_BitwiseAndU16_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR FromBits_16_Struct exec_BitwiseAndU16_W(ExecContext& ctx,
                                                  Val arg0,
                                                  Val arg1_0,
                                                  BoundLayout<BitwiseAndU16Layout> layout2) {
@@ -1565,7 +1574,7 @@ static __device__ __noinline__ FromBits_16_Struct exec_BitwiseAndU16_W(ExecConte
   return FromBits_16_Struct{._super = x65};
 }
 
-static __device__ __noinline__ ValU32Struct exec_BitwiseAnd_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_BitwiseAnd_W(ExecContext& ctx,
                                         ValU32Struct arg0,
                                         ValU32Struct arg1_0,
                                         BoundLayout<BitwiseAndLayout> layout2) {
@@ -1576,7 +1585,7 @@ static __device__ __noinline__ ValU32Struct exec_BitwiseAnd_W(ExecContext& ctx,
   return ValU32Struct{.low = x3._super, .high = x4._super};
 }
 
-static __device__ __noinline__ ValU32Struct exec_BitwiseOr_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_BitwiseOr_W(ExecContext& ctx,
                                        ValU32Struct arg0,
                                        ValU32Struct arg1_0,
                                        BoundLayout<BitwiseOrLayout> layout2) {
@@ -1589,7 +1598,7 @@ static __device__ __noinline__ ValU32Struct exec_BitwiseOr_W(ExecContext& ctx,
   return ValU32Struct{.low = x4, .high = x5};
 }
 
-static __device__ __noinline__ ValU32Struct exec_BitwiseXor_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_BitwiseXor_W(ExecContext& ctx,
                                         ValU32Struct arg0,
                                         ValU32Struct arg1_0,
                                         BoundLayout<BitwiseXorLayout> layout2) {
@@ -1602,7 +1611,7 @@ static __device__ __noinline__ ValU32Struct exec_BitwiseXor_W(ExecContext& ctx,
   return ValU32Struct{.low = x4, .high = x5};
 }
 
-static __device__ __noinline__ DecoderStruct exec_Decoder_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR DecoderStruct exec_Decoder_W(ExecContext& ctx,
                                       ValU32Struct arg0,
                                       BoundLayout<DecoderLayout> layout1) {
   // builtin Mul
@@ -1757,7 +1766,7 @@ static __device__ __noinline__ DecoderStruct exec_Decoder_W(ExecContext& ctx,
                        .immJ = ValU32Struct{.low = x58, .high = (x59 + x18._super)}};
 }
 
-static __device__ __noinline__ MemoryArgStruct exec_MemoryArg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MemoryArgStruct exec_MemoryArg_W(ExecContext& ctx,
                                           Val arg0,
                                           Val arg1_0,
                                           Val arg2_0,
@@ -1779,7 +1788,7 @@ static __device__ __noinline__ MemoryArgStruct exec_MemoryArg_W(ExecContext& ctx
   return MemoryArgStruct{.count = x5, .addr = x6, .cycle = x7, .dataLow = x8, .dataHigh = x9};
 }
 
-static __device__ __noinline__ CycleArgStruct exec_CycleArg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR CycleArgStruct exec_CycleArg_W(ExecContext& ctx,
                                         Val arg0,
                                         Val arg1_0,
                                         BoundLayout<CycleArgLayout> layout2) {
@@ -1793,7 +1802,7 @@ static __device__ __noinline__ CycleArgStruct exec_CycleArg_W(ExecContext& ctx,
   return CycleArgStruct{.count = x3, .cycle = x4};
 }
 
-static __device__ __noinline__ IsCycleStruct exec_IsCycle_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR IsCycleStruct exec_IsCycle_W(ExecContext& ctx,
                                       Val arg0,
                                       BoundLayout<IsCycleLayout> layout1) {
   // IsCycle(zirgen/circuit/rv32im/v2/dsl/mem.zir:60)
@@ -1807,7 +1816,7 @@ static __device__ __noinline__ IsCycleStruct exec_IsCycle_W(ExecContext& ctx,
   return IsCycleStruct{};
 }
 
-static __device__ __noinline__ MemoryIOStruct exec_MemoryIO_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MemoryIOStruct exec_MemoryIO_W(ExecContext& ctx,
                                         Val arg0,
                                         Val arg1_0,
                                         BoundLayout<MemoryIOLayout> layout2) {
@@ -1846,7 +1855,7 @@ static __device__ __noinline__ MemoryIOStruct exec_MemoryIO_W(ExecContext& ctx,
   return MemoryIOStruct{.oldTxn = x8, .newTxn = x9};
 }
 
-static __device__ __noinline__ IsForwardStruct exec_IsForward_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR IsForwardStruct exec_IsForward_W(ExecContext& ctx,
                                           MemoryIOStruct arg0,
                                           BoundLayout<IsForwardLayout> layout1) {
   // builtin Sub
@@ -1856,7 +1865,7 @@ static __device__ __noinline__ IsForwardStruct exec_IsForward_W(ExecContext& ctx
   return IsForwardStruct{};
 }
 
-static __device__ __noinline__ GetDataStruct exec_MemoryRead_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR GetDataStruct exec_MemoryRead_W(ExecContext& ctx,
                                          NondetRegStruct arg0,
                                          Val arg1_0,
                                          BoundLayout<MemoryReadLayout> layout2) {
@@ -1884,7 +1893,7 @@ static __device__ __noinline__ GetDataStruct exec_MemoryRead_W(ExecContext& ctx,
   return GetDataStruct{._super = x7, .diffLow = Val(0), .diffHigh = Val(1)};
 }
 
-static __device__ __noinline__ MemoryWriteStruct exec_MemoryWrite_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MemoryWriteStruct exec_MemoryWrite_W(ExecContext& ctx,
                                               NondetRegStruct arg0,
                                               Val arg1_0,
                                               ValU32Struct arg2_0,
@@ -1904,7 +1913,7 @@ static __device__ __noinline__ MemoryWriteStruct exec_MemoryWrite_W(ExecContext&
   return MemoryWriteStruct{};
 }
 
-static __device__ __noinline__ MemoryWriteUnconstrainedStruct
+static __device__ WITGEN_TU_FNATTR MemoryWriteUnconstrainedStruct
 exec_MemoryWriteUnconstrained_W(ExecContext& ctx,
                               NondetRegStruct arg0,
                               Val arg1_0,
@@ -1918,7 +1927,7 @@ exec_MemoryWriteUnconstrained_W(ExecContext& ctx,
   return MemoryWriteUnconstrainedStruct{.io = x4};
 }
 
-static __device__ __noinline__ GetDataStruct exec_MemoryPageIn_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR GetDataStruct exec_MemoryPageIn_W(ExecContext& ctx,
                                            NondetRegStruct arg0,
                                            Val arg1_0,
                                            BoundLayout<MemoryPageInLayout> layout2) {
@@ -1946,7 +1955,7 @@ static __device__ __noinline__ GetDataStruct exec_MemoryPageIn_W(ExecContext& ct
   return GetDataStruct{._super = x7, .diffLow = Val(0), .diffHigh = x6};
 }
 
-static __device__ __noinline__ GetDataStruct exec_MemoryPageOut_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR GetDataStruct exec_MemoryPageOut_W(ExecContext& ctx,
                                             NondetRegStruct arg0,
                                             Val arg1_0,
                                             BoundLayout<MemoryPageOutLayout> layout2) {
@@ -1968,7 +1977,7 @@ static __device__ __noinline__ GetDataStruct exec_MemoryPageOut_W(ExecContext& c
   return GetDataStruct{._super = x7, .diffLow = x5, .diffHigh = x6};
 }
 
-static __device__ __noinline__ OneHot_3_Struct exec_OneHot_3__W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR OneHot_3_Struct exec_OneHot_3__W(ExecContext& ctx,
                                           Val arg0,
                                           BoundLayout<OneHot_3_Layout> layout1) {
   // OneHot(zirgen/circuit/rv32im/v2/dsl/one_hot.zir:7)
@@ -1992,7 +2001,7 @@ static __device__ __noinline__ OneHot_3_Struct exec_OneHot_3__W(ExecContext& ctx
   return OneHot_3_Struct{._super = x2};
 }
 
-static __device__ __noinline__ GetDataStruct exec_MemoryGet_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR GetDataStruct exec_MemoryGet_W(ExecContext& ctx,
                                         NondetRegStruct arg0,
                                         Val arg1_0,
                                         OneHot_3_Struct arg2_0,
@@ -2021,7 +2030,7 @@ static __device__ __noinline__ GetDataStruct exec_MemoryGet_W(ExecContext& ctx,
   return x4;
 }
 
-static __device__ __noinline__ OneHot_8_Struct exec_OneHot_8__W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR OneHot_8_Struct exec_OneHot_8__W(ExecContext& ctx,
                                           Val arg0,
                                           BoundLayout<OneHot_8_Layout> layout1) {
   // OneHot(zirgen/circuit/rv32im/v2/dsl/one_hot.zir:7)
@@ -2055,7 +2064,7 @@ static __device__ __noinline__ OneHot_8_Struct exec_OneHot_8__W(ExecContext& ctx
   return OneHot_8_Struct{._super = x2};
 }
 
-static __device__ __noinline__ InstInputStruct exec_InstInput_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstInputStruct exec_InstInput_W(ExecContext& ctx,
                                           Val arg0,
                                           Val arg1_0,
                                           ValU32Struct arg2_0,
@@ -2068,7 +2077,7 @@ static __device__ __noinline__ InstInputStruct exec_InstInput_W(ExecContext& ctx
       .minor = arg1_0, .pcU32 = arg2_0, .state = arg3, .mode = arg4, .minorOnehot = x6};
 }
 
-static __device__ __noinline__ DoCycleTableStruct exec_DoCycleTable_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR DoCycleTableStruct exec_DoCycleTable_W(ExecContext& ctx,
                                                 NondetRegStruct arg0,
                                                 BoundLayout<DoCycleTableLayout> layout1) {
   // builtin Mul
@@ -2092,7 +2101,7 @@ static __device__ __noinline__ DoCycleTableStruct exec_DoCycleTable_W(ExecContex
   return DoCycleTableStruct{};
 }
 
-static __device__ __noinline__ DecoderStruct exec_DecodeInst_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR DecoderStruct exec_DecodeInst_W(ExecContext& ctx,
                                          NondetRegStruct arg0,
                                          InstInputStruct arg1_0,
                                          BoundLayout<DecodeInstLayout> layout2) {
@@ -2108,7 +2117,7 @@ static __device__ __noinline__ DecoderStruct exec_DecodeInst_W(ExecContext& ctx,
   return x5;
 }
 
-static __device__ __noinline__ GetDataStruct exec_ReadReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR GetDataStruct exec_ReadReg_W(ExecContext& ctx,
                                       NondetRegStruct arg0,
                                       InstInputStruct arg1_0,
                                       Val arg2_0,
@@ -2124,7 +2133,7 @@ static __device__ __noinline__ GetDataStruct exec_ReadReg_W(ExecContext& ctx,
   return x7;
 }
 
-static __device__ __noinline__ ReadSourceRegsStruct exec_ReadSourceRegs_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ReadSourceRegsStruct exec_ReadSourceRegs_W(ExecContext& ctx,
                                                     NondetRegStruct arg0,
                                                     InstInputStruct arg1_0,
                                                     DecoderStruct arg2_0,
@@ -2181,7 +2190,7 @@ static __device__ __noinline__ ReadSourceRegsStruct exec_ReadSourceRegs_W(ExecCo
   return x15;
 }
 
-static __device__ __noinline__ WriteRdStruct exec_WriteRd_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR WriteRdStruct exec_WriteRd_W(ExecContext& ctx,
                                       NondetRegStruct arg0,
                                       InstInputStruct arg1_0,
                                       DecoderStruct arg2_0,
@@ -2206,7 +2215,7 @@ static __device__ __noinline__ WriteRdStruct exec_WriteRd_W(ExecContext& ctx,
   return WriteRdStruct{};
 }
 
-static __device__ __noinline__ ExpandU32Struct exec_ExpandU32_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ExpandU32Struct exec_ExpandU32_W(ExecContext& ctx,
                                           ValU32Struct arg0,
                                           Val arg1_0,
                                           BoundLayout<ExpandU32Layout> layout2) {
@@ -2252,7 +2261,7 @@ static __device__ __noinline__ ExpandU32Struct exec_ExpandU32_W(ExecContext& ctx
   return ExpandU32Struct{.b0 = x3, .b1 = x5, .b2 = x6, .b3 = x8, .neg = (x12._super * arg1_0)};
 }
 
-static __device__ __noinline__ SplitTotalStruct exec_SplitTotal_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR SplitTotalStruct exec_SplitTotal_W(ExecContext& ctx,
                                             Val arg0,
                                             BoundLayout<SplitTotalLayout> layout1) {
   // SplitTotal(zirgen/circuit/rv32im/v2/dsl/mult.zir:98)
@@ -2274,7 +2283,7 @@ static __device__ __noinline__ SplitTotalStruct exec_SplitTotal_W(ExecContext& c
   return SplitTotalStruct{.out = x2, .carry = x6};
 }
 
-static __device__ __noinline__ MultiplyAccumulateStruct
+static __device__ WITGEN_TU_FNATTR MultiplyAccumulateStruct
 exec_MultiplyAccumulate_W(ExecContext& ctx,
                         ValU32Struct arg0,
                         ValU32Struct arg1_0,
@@ -2406,7 +2415,7 @@ exec_MultiplyAccumulate_W(ExecContext& ctx,
   return MultiplyAccumulateStruct{.outLow = x55, .outHigh = x56, .bNeg = x9.neg};
 }
 
-static __device__ __noinline__ DivInputStruct exec_DivInput_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR DivInputStruct exec_DivInput_W(ExecContext& ctx,
                                         NondetRegStruct arg0,
                                         InstInputStruct arg1_0,
                                         BoundLayout<DivInputLayout> layout2) {
@@ -2420,7 +2429,7 @@ static __device__ __noinline__ DivInputStruct exec_DivInput_W(ExecContext& ctx,
   return DivInputStruct{._super = arg1_0, .decoded = x3, .rs1 = x4.rs1, .rs2 = x4.rs2};
 }
 
-static __device__ __noinline__ DivideReturnStruct exec_DoDiv_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR DivideReturnStruct exec_DoDiv_W(ExecContext& ctx,
                                          ValU32Struct arg0,
                                          ValU32Struct arg1_0,
                                          Val arg2_0,
@@ -2630,7 +2639,7 @@ static __device__ __noinline__ DivideReturnStruct exec_DoDiv_W(ExecContext& ctx,
   return DivideReturnStruct{.quot = x11, .rem = x14};
 }
 
-static __device__ __noinline__ ValU32Struct exec_OpSRL_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpSRL_W(ExecContext& ctx,
                                    DivInputStruct arg0,
                                    BoundLayout<OpSRLLayout> layout1) {
   // VerifyOpcodeF3F7(zirgen/circuit/rv32im/v2/dsl/inst.zir:102)
@@ -2655,7 +2664,7 @@ static __device__ __noinline__ ValU32Struct exec_OpSRL_W(ExecContext& ctx,
   return x5.quot;
 }
 
-static __device__ __noinline__ NondetRegStruct exec_TopBit_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR NondetRegStruct exec_TopBit_W(ExecContext& ctx,
                                        ValU32Struct arg0,
                                        BoundLayout<TopBitLayout> layout1) {
   // builtin Mul
@@ -2676,7 +2685,7 @@ static __device__ __noinline__ NondetRegStruct exec_TopBit_W(ExecContext& ctx,
   return x3;
 }
 
-static __device__ __noinline__ ValU32Struct exec_OpSRA_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpSRA_W(ExecContext& ctx,
                                    DivInputStruct arg0,
                                    BoundLayout<OpSRALayout> layout1) {
   // VerifyOpcodeF3F7(zirgen/circuit/rv32im/v2/dsl/inst.zir:102)
@@ -2727,7 +2736,7 @@ static __device__ __noinline__ ValU32Struct exec_OpSRA_W(ExecContext& ctx,
   return ValU32Struct{.low = x14, .high = x16};
 }
 
-static __device__ __noinline__ ValU32Struct exec_OpSRLI_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpSRLI_W(ExecContext& ctx,
                                     DivInputStruct arg0,
                                     BoundLayout<OpSRLILayout> layout1) {
   // VerifyOpcodeF3F7(zirgen/circuit/rv32im/v2/dsl/inst.zir:102)
@@ -2752,7 +2761,7 @@ static __device__ __noinline__ ValU32Struct exec_OpSRLI_W(ExecContext& ctx,
   return x5.quot;
 }
 
-static __device__ __noinline__ ValU32Struct exec_OpSRAI_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpSRAI_W(ExecContext& ctx,
                                     DivInputStruct arg0,
                                     BoundLayout<OpSRAILayout> layout1) {
   // VerifyOpcodeF3F7(zirgen/circuit/rv32im/v2/dsl/inst.zir:102)
@@ -2803,7 +2812,7 @@ static __device__ __noinline__ ValU32Struct exec_OpSRAI_W(ExecContext& ctx,
   return ValU32Struct{.low = x14, .high = x16};
 }
 
-static __device__ __noinline__ ValU32Struct exec_OpDIV_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpDIV_W(ExecContext& ctx,
                                    DivInputStruct arg0,
                                    BoundLayout<OpDIVLayout> layout1) {
   // VerifyOpcodeF3F7(zirgen/circuit/rv32im/v2/dsl/inst.zir:102)
@@ -2828,7 +2837,7 @@ static __device__ __noinline__ ValU32Struct exec_OpDIV_W(ExecContext& ctx,
   return x5.quot;
 }
 
-static __device__ __noinline__ ValU32Struct exec_OpDIVU_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpDIVU_W(ExecContext& ctx,
                                     DivInputStruct arg0,
                                     BoundLayout<OpDIVULayout> layout1) {
   // VerifyOpcodeF3F7(zirgen/circuit/rv32im/v2/dsl/inst.zir:102)
@@ -2853,7 +2862,7 @@ static __device__ __noinline__ ValU32Struct exec_OpDIVU_W(ExecContext& ctx,
   return x5.quot;
 }
 
-static __device__ __noinline__ ValU32Struct exec_OpREM_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpREM_W(ExecContext& ctx,
                                    DivInputStruct arg0,
                                    BoundLayout<OpREMLayout> layout1) {
   // VerifyOpcodeF3F7(zirgen/circuit/rv32im/v2/dsl/inst.zir:102)
@@ -2878,7 +2887,7 @@ static __device__ __noinline__ ValU32Struct exec_OpREM_W(ExecContext& ctx,
   return x5.rem;
 }
 
-static __device__ __noinline__ ValU32Struct exec_OpREMU_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpREMU_W(ExecContext& ctx,
                                     DivInputStruct arg0,
                                     BoundLayout<OpREMULayout> layout1) {
   // VerifyOpcodeF3F7(zirgen/circuit/rv32im/v2/dsl/inst.zir:102)
@@ -2903,7 +2912,7 @@ static __device__ __noinline__ ValU32Struct exec_OpREMU_W(ExecContext& ctx,
   return x5.rem;
 }
 
-static __device__ __noinline__ InstOutputBaseStruct exec_Div0_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_Div0_W(ExecContext& ctx,
                                           NondetRegStruct arg0,
                                           InstInputStruct arg1_0,
                                           BoundLayout<Div0Layout> layout2) {
@@ -3020,7 +3029,7 @@ static __device__ __noinline__ InstOutputBaseStruct exec_Div0_W(ExecContext& ctx
       .newPc = x16._super, .newState = Val(48), .newMode = arg1_0.mode, .topState = x17};
 }
 
-static __device__ __noinline__ MiscInputStruct exec_MiscInput_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscInputStruct exec_MiscInput_W(ExecContext& ctx,
                                           NondetRegStruct arg0,
                                           InstInputStruct arg1_0,
                                           BoundLayout<MiscInputLayout> layout2) {
@@ -3034,7 +3043,7 @@ static __device__ __noinline__ MiscInputStruct exec_MiscInput_W(ExecContext& ctx
   return MiscInputStruct{._super = arg1_0, .decoded = x3, .rs1 = x4.rs1, .rs2 = x4.rs2};
 }
 
-static __device__ __noinline__ InstOutputBaseStruct exec_FinalizeMisc_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_FinalizeMisc_W(ExecContext& ctx,
                                                   NondetRegStruct arg0,
                                                   MiscInputStruct arg1_0,
                                                   MiscOutputStruct arg2_0,
@@ -3079,7 +3088,7 @@ static __device__ __noinline__ InstOutputBaseStruct exec_FinalizeMisc_W(ExecCont
   return x8;
 }
 
-static __device__ __noinline__ MiscOutputStruct exec_OpXOR_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpXOR_W(ExecContext& ctx,
                                        MiscInputStruct arg0,
                                        BoundLayout<OpXORLayout> layout1) {
   // VerifyOpcodeF3F7(zirgen/circuit/rv32im/v2/dsl/inst.zir:102)
@@ -3112,7 +3121,7 @@ static __device__ __noinline__ MiscOutputStruct exec_OpXOR_W(ExecContext& ctx,
   return x6;
 }
 
-static __device__ __noinline__ MiscOutputStruct exec_OpOR_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpOR_W(ExecContext& ctx,
                                       MiscInputStruct arg0,
                                       BoundLayout<OpORLayout> layout1) {
   // VerifyOpcodeF3F7(zirgen/circuit/rv32im/v2/dsl/inst.zir:102)
@@ -3145,7 +3154,7 @@ static __device__ __noinline__ MiscOutputStruct exec_OpOR_W(ExecContext& ctx,
   return x6;
 }
 
-static __device__ __noinline__ MiscOutputStruct exec_OpAND_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpAND_W(ExecContext& ctx,
                                        MiscInputStruct arg0,
                                        BoundLayout<OpANDLayout> layout1) {
   // VerifyOpcodeF3F7(zirgen/circuit/rv32im/v2/dsl/inst.zir:102)
@@ -3178,7 +3187,7 @@ static __device__ __noinline__ MiscOutputStruct exec_OpAND_W(ExecContext& ctx,
   return x6;
 }
 
-static __device__ __noinline__ MiscOutputStruct exec_OpSLT_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpSLT_W(ExecContext& ctx,
                                        MiscInputStruct arg0,
                                        BoundLayout<OpSLTLayout> layout1) {
   // VerifyOpcodeF3F7(zirgen/circuit/rv32im/v2/dsl/inst.zir:102)
@@ -3210,7 +3219,7 @@ static __device__ __noinline__ MiscOutputStruct exec_OpSLT_W(ExecContext& ctx,
                           .newPc = DenormedValU32Struct{.low = x6, .high = arg0._super.pcU32.high}};
 }
 
-static __device__ __noinline__ MiscOutputStruct exec_OpSLTU_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpSLTU_W(ExecContext& ctx,
                                         MiscInputStruct arg0,
                                         BoundLayout<OpSLTULayout> layout1) {
   // VerifyOpcodeF3F7(zirgen/circuit/rv32im/v2/dsl/inst.zir:102)
@@ -3245,7 +3254,7 @@ static __device__ __noinline__ MiscOutputStruct exec_OpSLTU_W(ExecContext& ctx,
   return x6;
 }
 
-static __device__ __noinline__ InstOutputBaseStruct exec_Misc0_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_Misc0_W(ExecContext& ctx,
                                            NondetRegStruct arg0,
                                            InstInputStruct arg1_0,
                                            BoundLayout<Misc0Layout> layout2) {
@@ -3479,7 +3488,7 @@ static __device__ __noinline__ InstOutputBaseStruct exec_Misc0_W(ExecContext& ct
   return x23;
 }
 
-static __device__ __noinline__ MiscOutputStruct exec_OpXORI_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpXORI_W(ExecContext& ctx,
                                         MiscInputStruct arg0,
                                         BoundLayout<OpXORILayout> layout1) {
   // VerifyOpcodeF3(zirgen/circuit/rv32im/v2/dsl/inst.zir:96)
@@ -3508,7 +3517,7 @@ static __device__ __noinline__ MiscOutputStruct exec_OpXORI_W(ExecContext& ctx,
   return x6;
 }
 
-static __device__ __noinline__ MiscOutputStruct exec_OpORI_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpORI_W(ExecContext& ctx,
                                        MiscInputStruct arg0,
                                        BoundLayout<OpORILayout> layout1) {
   // VerifyOpcodeF3(zirgen/circuit/rv32im/v2/dsl/inst.zir:96)
@@ -3537,7 +3546,7 @@ static __device__ __noinline__ MiscOutputStruct exec_OpORI_W(ExecContext& ctx,
   return x6;
 }
 
-static __device__ __noinline__ MiscOutputStruct exec_OpANDI_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpANDI_W(ExecContext& ctx,
                                         MiscInputStruct arg0,
                                         BoundLayout<OpANDILayout> layout1) {
   // VerifyOpcodeF3(zirgen/circuit/rv32im/v2/dsl/inst.zir:96)
@@ -3566,7 +3575,7 @@ static __device__ __noinline__ MiscOutputStruct exec_OpANDI_W(ExecContext& ctx,
   return x6;
 }
 
-static __device__ __noinline__ MiscOutputStruct exec_OpSLTI_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpSLTI_W(ExecContext& ctx,
                                         MiscInputStruct arg0,
                                         BoundLayout<OpSLTILayout> layout1) {
   // VerifyOpcodeF3(zirgen/circuit/rv32im/v2/dsl/inst.zir:96)
@@ -3595,7 +3604,7 @@ static __device__ __noinline__ MiscOutputStruct exec_OpSLTI_W(ExecContext& ctx,
                           .newPc = DenormedValU32Struct{.low = x6, .high = arg0._super.pcU32.high}};
 }
 
-static __device__ __noinline__ MiscOutputStruct exec_OpSLTIU_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpSLTIU_W(ExecContext& ctx,
                                          MiscInputStruct arg0,
                                          BoundLayout<OpSLTIULayout> layout1) {
   // VerifyOpcodeF3(zirgen/circuit/rv32im/v2/dsl/inst.zir:96)
@@ -3626,7 +3635,7 @@ static __device__ __noinline__ MiscOutputStruct exec_OpSLTIU_W(ExecContext& ctx,
   return x6;
 }
 
-static __device__ __noinline__ MiscOutputStruct exec_OpBEQ_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpBEQ_W(ExecContext& ctx,
                                        MiscInputStruct arg0,
                                        BoundLayout<OpBEQLayout> layout1) {
   // VerifyOpcodeF3(zirgen/circuit/rv32im/v2/dsl/inst.zir:96)
@@ -3668,7 +3677,7 @@ static __device__ __noinline__ MiscOutputStruct exec_OpBEQ_W(ExecContext& ctx,
   return x10;
 }
 
-static __device__ __noinline__ MiscOutputStruct exec_OpBNE_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpBNE_W(ExecContext& ctx,
                                        MiscInputStruct arg0,
                                        BoundLayout<OpBNELayout> layout1) {
   // VerifyOpcodeF3(zirgen/circuit/rv32im/v2/dsl/inst.zir:96)
@@ -3711,7 +3720,7 @@ static __device__ __noinline__ MiscOutputStruct exec_OpBNE_W(ExecContext& ctx,
   return x11;
 }
 
-static __device__ __noinline__ MiscOutputStruct exec_OpBLT_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpBLT_W(ExecContext& ctx,
                                        MiscInputStruct arg0,
                                        BoundLayout<OpBLTLayout> layout1) {
   // VerifyOpcodeF3(zirgen/circuit/rv32im/v2/dsl/inst.zir:96)
@@ -3754,7 +3763,7 @@ static __device__ __noinline__ MiscOutputStruct exec_OpBLT_W(ExecContext& ctx,
   return x11;
 }
 
-static __device__ __noinline__ InstOutputBaseStruct exec_Misc1_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_Misc1_W(ExecContext& ctx,
                                            NondetRegStruct arg0,
                                            InstInputStruct arg1_0,
                                            BoundLayout<Misc1Layout> layout2) {
@@ -3893,7 +3902,7 @@ static __device__ __noinline__ InstOutputBaseStruct exec_Misc1_W(ExecContext& ct
   return x14;
 }
 
-static __device__ __noinline__ MiscOutputStruct exec_OpBGE_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpBGE_W(ExecContext& ctx,
                                        MiscInputStruct arg0,
                                        BoundLayout<OpBGELayout> layout1) {
   // VerifyOpcodeF3(zirgen/circuit/rv32im/v2/dsl/inst.zir:96)
@@ -3936,7 +3945,7 @@ static __device__ __noinline__ MiscOutputStruct exec_OpBGE_W(ExecContext& ctx,
   return x11;
 }
 
-static __device__ __noinline__ MiscOutputStruct exec_OpBLTU_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpBLTU_W(ExecContext& ctx,
                                         MiscInputStruct arg0,
                                         BoundLayout<OpBLTULayout> layout1) {
   // VerifyOpcodeF3(zirgen/circuit/rv32im/v2/dsl/inst.zir:96)
@@ -3978,7 +3987,7 @@ static __device__ __noinline__ MiscOutputStruct exec_OpBLTU_W(ExecContext& ctx,
   return x11;
 }
 
-static __device__ __noinline__ MiscOutputStruct exec_OpBGEU_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MiscOutputStruct exec_OpBGEU_W(ExecContext& ctx,
                                         MiscInputStruct arg0,
                                         BoundLayout<OpBGEULayout> layout1) {
   // VerifyOpcodeF3(zirgen/circuit/rv32im/v2/dsl/inst.zir:96)
@@ -4022,7 +4031,7 @@ static __device__ __noinline__ MiscOutputStruct exec_OpBGEU_W(ExecContext& ctx,
   return x11;
 }
 
-static __device__ __noinline__ InstOutputBaseStruct exec_Misc2_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_Misc2_W(ExecContext& ctx,
                                            NondetRegStruct arg0,
                                            InstInputStruct arg1_0,
                                            BoundLayout<Misc2Layout> layout2) {
@@ -4269,7 +4278,7 @@ static __device__ __noinline__ InstOutputBaseStruct exec_Misc2_W(ExecContext& ct
   return x25;
 }
 
-static __device__ __noinline__ MulInputStruct exec_MulInput_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MulInputStruct exec_MulInput_W(ExecContext& ctx,
                                         NondetRegStruct arg0,
                                         InstInputStruct arg1_0,
                                         BoundLayout<MulInputLayout> layout2) {
@@ -4283,7 +4292,7 @@ static __device__ __noinline__ MulInputStruct exec_MulInput_W(ExecContext& ctx,
   return MulInputStruct{._super = arg1_0, .decoded = x3, .rs1 = x4.rs1, .rs2 = x4.rs2};
 }
 
-static __device__ __noinline__ DoMulStruct exec_DoMul_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR DoMulStruct exec_DoMul_W(ExecContext& ctx,
                                   ValU32Struct arg0,
                                   ValU32Struct arg1_0,
                                   Val arg2_0,
@@ -4300,7 +4309,7 @@ static __device__ __noinline__ DoMulStruct exec_DoMul_W(ExecContext& ctx,
   return DoMulStruct{.low = x5.outLow, .high = x5.outHigh};
 }
 
-static __device__ __noinline__ ValU32Struct exec_OpSLL_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpSLL_W(ExecContext& ctx,
                                    MulInputStruct arg0,
                                    BoundLayout<OpSLLLayout> layout1) {
   // VerifyOpcodeF3F7(zirgen/circuit/rv32im/v2/dsl/inst.zir:102)
@@ -4325,7 +4334,7 @@ static __device__ __noinline__ ValU32Struct exec_OpSLL_W(ExecContext& ctx,
   return x5.low;
 }
 
-static __device__ __noinline__ ValU32Struct exec_OpSLLI_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpSLLI_W(ExecContext& ctx,
                                     MulInputStruct arg0,
                                     BoundLayout<OpSLLILayout> layout1) {
   // VerifyOpcodeF3F7(zirgen/circuit/rv32im/v2/dsl/inst.zir:102)
@@ -4350,7 +4359,7 @@ static __device__ __noinline__ ValU32Struct exec_OpSLLI_W(ExecContext& ctx,
   return x5.low;
 }
 
-static __device__ __noinline__ ValU32Struct exec_OpMUL_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpMUL_W(ExecContext& ctx,
                                    MulInputStruct arg0,
                                    BoundLayout<OpMULLayout> layout1) {
   // VerifyOpcodeF3F7(zirgen/circuit/rv32im/v2/dsl/inst.zir:102)
@@ -4373,7 +4382,7 @@ static __device__ __noinline__ ValU32Struct exec_OpMUL_W(ExecContext& ctx,
   return x4.low;
 }
 
-static __device__ __noinline__ ValU32Struct exec_OpMULH_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpMULH_W(ExecContext& ctx,
                                     MulInputStruct arg0,
                                     BoundLayout<OpMULHLayout> layout1) {
   // VerifyOpcodeF3F7(zirgen/circuit/rv32im/v2/dsl/inst.zir:102)
@@ -4397,7 +4406,7 @@ static __device__ __noinline__ ValU32Struct exec_OpMULH_W(ExecContext& ctx,
   return x5.high;
 }
 
-static __device__ __noinline__ ValU32Struct exec_OpMULHSU_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpMULHSU_W(ExecContext& ctx,
                                       MulInputStruct arg0,
                                       BoundLayout<OpMULHSULayout> layout1) {
   // VerifyOpcodeF3F7(zirgen/circuit/rv32im/v2/dsl/inst.zir:102)
@@ -4421,7 +4430,7 @@ static __device__ __noinline__ ValU32Struct exec_OpMULHSU_W(ExecContext& ctx,
   return x5.high;
 }
 
-static __device__ __noinline__ ValU32Struct exec_OpMULHU_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpMULHU_W(ExecContext& ctx,
                                      MulInputStruct arg0,
                                      BoundLayout<OpMULHULayout> layout1) {
   // VerifyOpcodeF3F7(zirgen/circuit/rv32im/v2/dsl/inst.zir:102)
@@ -4445,7 +4454,7 @@ static __device__ __noinline__ ValU32Struct exec_OpMULHU_W(ExecContext& ctx,
   return x5.high;
 }
 
-static __device__ __noinline__ InstOutputBaseStruct exec_Mul0_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_Mul0_W(ExecContext& ctx,
                                           NondetRegStruct arg0,
                                           InstInputStruct arg1_0,
                                           BoundLayout<Mul0Layout> layout2) {
@@ -4668,7 +4677,7 @@ static __device__ __noinline__ InstOutputBaseStruct exec_Mul0_W(ExecContext& ctx
       .newPc = x15._super, .newState = Val(48), .newMode = arg1_0.mode, .topState = x16};
 }
 
-static __device__ __noinline__ MemLoadInputStruct exec_MemLoadInput_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MemLoadInputStruct exec_MemLoadInput_W(ExecContext& ctx,
                                                 NondetRegStruct arg0,
                                                 InstInputStruct arg1_0,
                                                 BoundLayout<MemLoadInputLayout> layout2) {
@@ -4693,7 +4702,7 @@ static __device__ __noinline__ MemLoadInputStruct exec_MemLoadInput_W(ExecContex
   return MemLoadInputStruct{.ii = arg1_0, .decoded = x3, .addr = x8, .data = x9};
 }
 
-static __device__ __noinline__ MemStoreInputStruct exec_MemStoreInput_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MemStoreInputStruct exec_MemStoreInput_W(ExecContext& ctx,
                                                   NondetRegStruct arg0,
                                                   InstInputStruct arg1_0,
                                                   BoundLayout<MemStoreInputLayout> layout2) {
@@ -4719,7 +4728,7 @@ static __device__ __noinline__ MemStoreInputStruct exec_MemStoreInput_W(ExecCont
   return MemStoreInputStruct{.decoded = x3, .rs2 = x4.rs2, .addr = x8, .data = x9};
 }
 
-static __device__ __noinline__ MemStoreFinalizeStruct
+static __device__ WITGEN_TU_FNATTR MemStoreFinalizeStruct
 exec_MemStoreFinalize_W(ExecContext& ctx,
                       NondetRegStruct arg0,
                       MemStoreInputStruct arg1_0,
@@ -4731,7 +4740,7 @@ exec_MemStoreFinalize_W(ExecContext& ctx,
   return MemStoreFinalizeStruct{};
 }
 
-static __device__ __noinline__ SplitWordStruct exec_SplitWord_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR SplitWordStruct exec_SplitWord_W(ExecContext& ctx,
                                           Val arg0,
                                           BoundLayout<SplitWordLayout> layout1) {
   // SplitWord(zirgen/circuit/rv32im/v2/dsl/inst_mem.zir:34)
@@ -4746,7 +4755,7 @@ static __device__ __noinline__ SplitWordStruct exec_SplitWord_W(ExecContext& ctx
   return SplitWordStruct{.byte0 = x2, .byte1 = x3};
 }
 
-static __device__ __noinline__ ValU32Struct exec_OpLB_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpLB_W(ExecContext& ctx,
                                   MemLoadInputStruct arg0,
                                   BoundLayout<OpLBLayout> layout1) {
   // VerifyOpcodeF3(zirgen/circuit/rv32im/v2/dsl/inst.zir:96)
@@ -4791,7 +4800,7 @@ static __device__ __noinline__ ValU32Struct exec_OpLB_W(ExecContext& ctx,
   return x12;
 }
 
-static __device__ __noinline__ ValU32Struct exec_OpLH_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpLH_W(ExecContext& ctx,
                                   MemLoadInputStruct arg0,
                                   BoundLayout<OpLHLayout> layout1) {
   // VerifyOpcodeF3(zirgen/circuit/rv32im/v2/dsl/inst.zir:96)
@@ -4830,7 +4839,7 @@ static __device__ __noinline__ ValU32Struct exec_OpLH_W(ExecContext& ctx,
   return ValU32Struct{.low = x6, .high = (x7._super * Val(65535))};
 }
 
-static __device__ __noinline__ ValU32Struct exec_OpLBU_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpLBU_W(ExecContext& ctx,
                                    MemLoadInputStruct arg0,
                                    BoundLayout<OpLBULayout> layout1) {
   // VerifyOpcodeF3(zirgen/circuit/rv32im/v2/dsl/inst.zir:96)
@@ -4860,7 +4869,7 @@ static __device__ __noinline__ ValU32Struct exec_OpLBU_W(ExecContext& ctx,
   return ValU32Struct{.low = (x7 + (x8 * x6.byte0._super)), .high = Val(0)};
 }
 
-static __device__ __noinline__ InstOutputBaseStruct exec_Mem0_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_Mem0_W(ExecContext& ctx,
                                           NondetRegStruct arg0,
                                           InstInputStruct arg1_0,
                                           BoundLayout<Mem0Layout> layout2) {
@@ -5086,7 +5095,7 @@ static __device__ __noinline__ InstOutputBaseStruct exec_Mem0_W(ExecContext& ctx
       .newPc = x17._super, .newState = Val(48), .newMode = arg1_0.mode, .topState = x18};
 }
 
-static __device__ __noinline__ ValU32Struct exec_OpSB_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ValU32Struct exec_OpSB_W(ExecContext& ctx,
                                   MemStoreInputStruct arg0,
                                   BoundLayout<OpSBLayout> layout1) {
   // VerifyOpcodeF3(zirgen/circuit/rv32im/v2/dsl/inst.zir:96)
@@ -5133,7 +5142,7 @@ static __device__ __noinline__ ValU32Struct exec_OpSB_W(ExecContext& ctx,
   return x14;
 }
 
-static __device__ __noinline__ InstOutputBaseStruct exec_Mem1_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_Mem1_W(ExecContext& ctx,
                                           NondetRegStruct arg0,
                                           InstInputStruct arg1_0,
                                           BoundLayout<Mem1Layout> layout2) {
@@ -5378,7 +5387,7 @@ static __device__ __noinline__ InstOutputBaseStruct exec_Mem1_W(ExecContext& ctx
       .newPc = x17._super, .newState = Val(48), .newMode = arg1_0.mode, .topState = x18};
 }
 
-static __device__ __noinline__ DigestRegStruct back_DigestReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR DigestRegStruct back_DigestReg_W(ExecContext& ctx,
                                           Index distance0,
                                           BoundLayout<DigestRegLayout> layout1) {
   // DigestReg(zirgen/circuit/rv32im/v2/dsl/inst_control.zir:7)
@@ -5396,7 +5405,7 @@ static __device__ __noinline__ DigestRegStruct back_DigestReg_W(ExecContext& ctx
   return DigestRegStruct{.values = x2};
 }
 
-static __device__ __noinline__ DigestRegStruct exec_DigestReg_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR DigestRegStruct exec_DigestReg_W(ExecContext& ctx,
                                           ValU32Struct8Array arg0,
                                           BoundLayout<DigestRegLayout> layout1) {
   // DigestReg(zirgen/circuit/rv32im/v2/dsl/inst_control.zir:7)
@@ -5414,7 +5423,7 @@ static __device__ __noinline__ DigestRegStruct exec_DigestReg_W(ExecContext& ctx
   return DigestRegStruct{.values = x2};
 }
 
-static __device__ __noinline__ InstOutputBaseStruct
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct
 exec_ControlLoadRootAndNonce_W(ExecContext& ctx,
                              NondetRegStruct arg0,
                              InstInputStruct arg1_0,
@@ -5638,7 +5647,7 @@ exec_ControlLoadRootAndNonce_W(ExecContext& ctx,
   return x13;
 }
 
-static __device__ __noinline__ InstOutputBaseStruct exec_ControlResume_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_ControlResume_W(ExecContext& ctx,
                                                    NondetRegStruct arg0,
                                                    InstInputStruct arg1_0,
                                                    BoundLayout<ControlResumeLayout> layout2,
@@ -5769,7 +5778,7 @@ static __device__ __noinline__ InstOutputBaseStruct exec_ControlResume_W(ExecCon
   return x8;
 }
 
-static __device__ __noinline__ InstOutputBaseStruct exec_ControlUserECALL_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_ControlUserECALL_W(ExecContext& ctx,
                                                       NondetRegStruct arg0,
                                                       InstInputStruct arg1_0,
                                                       BoundLayout<ControlUserECALLLayout> layout2) {
@@ -5823,7 +5832,7 @@ static __device__ __noinline__ InstOutputBaseStruct exec_ControlUserECALL_W(Exec
       .newPc = x7._super, .newState = Val(48), .newMode = Val(1), .topState = x9};
 }
 
-static __device__ __noinline__ InstOutputBaseStruct exec_ControlMRET_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_ControlMRET_W(ExecContext& ctx,
                                                  NondetRegStruct arg0,
                                                  InstInputStruct arg1_0,
                                                  BoundLayout<ControlMRETLayout> layout2) {
@@ -5880,7 +5889,7 @@ static __device__ __noinline__ InstOutputBaseStruct exec_ControlMRET_W(ExecConte
       .newPc = x10._super, .newState = Val(48), .newMode = Val(0), .topState = x11};
 }
 
-static __device__ __noinline__ InstOutputBaseStruct exec_ControlSuspend_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_ControlSuspend_W(ExecContext& ctx,
                                                     NondetRegStruct arg0,
                                                     InstInputStruct arg1_0,
                                                     BoundLayout<ControlSuspendLayout> layout2,
@@ -6046,7 +6055,7 @@ static __device__ __noinline__ InstOutputBaseStruct exec_ControlSuspend_W(ExecCo
   return x10;
 }
 
-static __device__ __noinline__ InstOutputBaseStruct exec_ControlStoreRoot_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_ControlStoreRoot_W(ExecContext& ctx,
                                                       NondetRegStruct arg0,
                                                       InstInputStruct arg1_0,
                                                       BoundLayout<ControlStoreRootLayout> layout2,
@@ -6107,7 +6116,7 @@ static __device__ __noinline__ InstOutputBaseStruct exec_ControlStoreRoot_W(Exec
   return x12;
 }
 
-static __device__ __noinline__ InstOutputBaseStruct exec_ControlTable_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_ControlTable_W(ExecContext& ctx,
                                                   NondetRegStruct arg0,
                                                   InstInputStruct arg1_0,
                                                   BoundLayout<ControlTableLayout> layout2) {
@@ -6337,7 +6346,7 @@ static __device__ __noinline__ InstOutputBaseStruct exec_ControlTable_W(ExecCont
   return x10;
 }
 
-static __device__ __noinline__ InstOutputBaseStruct exec_ControlDone_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_ControlDone_W(ExecContext& ctx,
                                                  NondetRegStruct arg0,
                                                  InstInputStruct arg1_0,
                                                  BoundLayout<ControlDoneLayout> layout2,
@@ -6404,7 +6413,7 @@ static __device__ __noinline__ InstOutputBaseStruct exec_ControlDone_W(ExecConte
   return x12;
 }
 
-static __device__ __noinline__ InstOutputBaseStruct exec_Control0_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_Control0_W(ExecContext& ctx,
                                               NondetRegStruct arg0,
                                               InstInputStruct arg1_0,
                                               BoundLayout<Control0Layout> layout2,
@@ -7384,7 +7393,7 @@ static __device__ __noinline__ InstOutputBaseStruct exec_Control0_W(ExecContext&
   return x5;
 }
 
-static __device__ __noinline__ OneHot_6_Struct exec_OneHot_6__W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR OneHot_6_Struct exec_OneHot_6__W(ExecContext& ctx,
                                           Val arg0,
                                           BoundLayout<OneHot_6_Layout> layout1) {
   // OneHot(zirgen/circuit/rv32im/v2/dsl/one_hot.zir:7)
@@ -7414,7 +7423,7 @@ static __device__ __noinline__ OneHot_6_Struct exec_OneHot_6__W(ExecContext& ctx
   return OneHot_6_Struct{._super = x2};
 }
 
-static __device__ __noinline__ ECallOutputStruct exec_MachineECall_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ECallOutputStruct exec_MachineECall_W(ExecContext& ctx,
                                                NondetRegStruct arg0,
                                                InstInputStruct arg1_0,
                                                Val arg2_0,
@@ -7456,7 +7465,7 @@ static __device__ __noinline__ ECallOutputStruct exec_MachineECall_W(ExecContext
   return ECallOutputStruct{.state = x8, .s0 = Val(0), .s1 = Val(0), .s2 = Val(0)};
 }
 
-static __device__ __noinline__ ECallOutputStruct exec_ECallTerminate_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ECallOutputStruct exec_ECallTerminate_W(ExecContext& ctx,
                                                  NondetRegStruct arg0,
                                                  InstInputStruct arg1_0,
                                                  BoundLayout<ECallTerminateLayout> layout2,
@@ -7480,7 +7489,7 @@ static __device__ __noinline__ ECallOutputStruct exec_ECallTerminate_W(ExecConte
   return ECallOutputStruct{.state = Val(4), .s0 = Val(0), .s1 = Val(0), .s2 = Val(0)};
 }
 
-static __device__ __noinline__ OneHot_4_Struct exec_OneHot_4__W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR OneHot_4_Struct exec_OneHot_4__W(ExecContext& ctx,
                                           Val arg0,
                                           BoundLayout<OneHot_4_Layout> layout1) {
   // OneHot(zirgen/circuit/rv32im/v2/dsl/one_hot.zir:7)
@@ -7506,7 +7515,7 @@ static __device__ __noinline__ OneHot_4_Struct exec_OneHot_4__W(ExecContext& ctx
   return OneHot_4_Struct{._super = x2};
 }
 
-static __device__ __noinline__ DecomposeLow2Struct exec_DecomposeLow2_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR DecomposeLow2Struct exec_DecomposeLow2_W(ExecContext& ctx,
                                                   Val arg0,
                                                   BoundLayout<DecomposeLow2Layout> layout1) {
   // DecomposeLow2(zirgen/circuit/rv32im/v2/dsl/inst_ecall.zir:59)
@@ -7537,7 +7546,7 @@ static __device__ __noinline__ DecomposeLow2Struct exec_DecomposeLow2_W(ExecCont
                              .low2Nonzero = (x9 + x5._super[3]._super)};
 }
 
-static __device__ __noinline__ ECallOutputStruct
+static __device__ WITGEN_TU_FNATTR ECallOutputStruct
 exec_ECallHostReadSetup_W(ExecContext& ctx,
                         NondetRegStruct arg0,
                         InstInputStruct arg1_0,
@@ -7597,7 +7606,7 @@ exec_ECallHostReadSetup_W(ExecContext& ctx,
                            .s2 = x7._super._super};
 }
 
-static __device__ __noinline__ ECallOutputStruct exec_ECallHostWrite_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ECallOutputStruct exec_ECallHostWrite_W(ExecContext& ctx,
                                                  NondetRegStruct arg0,
                                                  InstInputStruct arg1_0,
                                                  BoundLayout<ECallHostWriteLayout> layout2) {
@@ -7630,7 +7639,7 @@ static __device__ __noinline__ ECallOutputStruct exec_ECallHostWrite_W(ExecConte
   return ECallOutputStruct{.state = Val(48), .s0 = Val(0), .s1 = Val(0), .s2 = Val(0)};
 }
 
-static __device__ __noinline__ ECallOutputStruct
+static __device__ WITGEN_TU_FNATTR ECallOutputStruct
 exec_ECallHostReadBytes_W(ExecContext& ctx,
                         NondetRegStruct arg0,
                         InstInputStruct arg1_0,
@@ -7734,7 +7743,7 @@ exec_ECallHostReadBytes_W(ExecContext& ctx,
                            .s2 = x6};
 }
 
-static __device__ __noinline__ ECallOutputStruct
+static __device__ WITGEN_TU_FNATTR ECallOutputStruct
 exec_ECallHostReadWords_W(ExecContext& ctx,
                         NondetRegStruct arg0,
                         InstInputStruct arg1_0,
@@ -7806,7 +7815,7 @@ exec_ECallHostReadWords_W(ExecContext& ctx,
                            .s2 = (arg3 - (x15 * Val(4)))};
 }
 
-static __device__ __noinline__ InstOutputBaseStruct exec_ECall0_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_ECall0_W(ExecContext& ctx,
                                             NondetRegStruct arg0,
                                             InstInputStruct arg1_0,
                                             BoundLayout<ECall0Layout> layout2,
@@ -8223,7 +8232,7 @@ static __device__ __noinline__ InstOutputBaseStruct exec_ECall0_W(ExecContext& c
       .newPc = x30._super, .newState = x7.state, .newMode = Val(1), .topState = x31};
 }
 
-static __device__ __noinline__ NondetRegStruct exec_SBox_W(ExecContext& ctx, Val arg0, BoundLayout<SBoxLayout> layout1) {
+static __device__ WITGEN_TU_FNATTR NondetRegStruct exec_SBox_W(ExecContext& ctx, Val arg0, BoundLayout<SBoxLayout> layout1) {
   // SBox(zirgen/circuit/rv32im/v2/dsl/poseidon2.zir:25)
   NondetRegStruct x2 = exec_Reg_W(ctx, ((arg0 * arg0) * arg0), LAYOUT_LOOKUP(layout1, cubed));
   // builtin Mul
@@ -8233,7 +8242,7 @@ static __device__ __noinline__ NondetRegStruct exec_SBox_W(ExecContext& ctx, Val
   return x4;
 }
 
-static __device__ __noinline__ MultiplyByMIntStruct exec_DoIntRound_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MultiplyByMIntStruct exec_DoIntRound_W(ExecContext& ctx,
                                                 Val24Array arg0,
                                                 Val arg1_0,
                                                 BoundLayout<DoIntRoundLayout> layout2) {
@@ -8279,7 +8288,7 @@ static __device__ __noinline__ MultiplyByMIntStruct exec_DoIntRound_W(ExecContex
   return MultiplyByMIntStruct{._super = x12};
 }
 
-static __device__ __noinline__ DoIntRoundsStruct exec_DoIntRounds_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR DoIntRoundsStruct exec_DoIntRounds_W(ExecContext& ctx,
                                               Val24Array arg0,
                                               BoundLayout<DoIntRoundsLayout> layout1) {
   // DoIntRounds(zirgen/circuit/rv32im/v2/dsl/poseidon2.zir:38)
@@ -8325,7 +8334,7 @@ static __device__ __noinline__ DoIntRoundsStruct exec_DoIntRounds_W(ExecContext&
   return DoIntRoundsStruct{._super = x3};
 }
 
-static __device__ __noinline__ MultiplyByMExtStruct exec_DoExtRound_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MultiplyByMExtStruct exec_DoExtRound_W(ExecContext& ctx,
                                                 Val24Array arg0,
                                                 Val24Array arg1_0,
                                                 BoundLayout<DoExtRoundLayout> layout2) {
@@ -8512,7 +8521,7 @@ static __device__ __noinline__ MultiplyByMExtStruct exec_DoExtRound_W(ExecContex
   return MultiplyByMExtStruct{._super = x75};
 }
 
-static __device__ __noinline__ MultiplyByMExtStruct exec_DoExtRoundByIdx_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR MultiplyByMExtStruct exec_DoExtRoundByIdx_W(ExecContext& ctx,
                                                      Val24Array arg0,
                                                      Val arg1_0,
                                                      BoundLayout<DoExtRoundByIdxLayout> layout2) {
@@ -8777,7 +8786,7 @@ static __device__ __noinline__ MultiplyByMExtStruct exec_DoExtRoundByIdx_W(ExecC
   return x244;
 }
 
-static __device__ __noinline__ PoseidonStateStruct back_PoseidonState_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct back_PoseidonState_W(ExecContext& ctx,
                                                   Index distance0,
                                                   BoundLayout<PoseidonStateLayout> layout1) {
   // PoseidonState(zirgen/circuit/rv32im/v2/dsl/inst_p2.zir:34)
@@ -8829,7 +8838,7 @@ static __device__ __noinline__ PoseidonStateStruct back_PoseidonState_W(ExecCont
                              .zcheck = x17};
 }
 
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonState_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonState_W(ExecContext& ctx,
                                                   PoseidonOpDefStruct arg0,
                                                   Val arg1_0,
                                                   Val arg2_0,
@@ -8886,7 +8895,7 @@ static __device__ __noinline__ PoseidonStateStruct exec_PoseidonState_W(ExecCont
                              .zcheck = x24};
 }
 
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonInvalid_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonInvalid_W(ExecContext& ctx,
                                                     BoundLayout<PoseidonStateLayout> layout0) {
   // PoseidonInvalid(zirgen/circuit/rv32im/v2/dsl/inst_p2.zir:52)
   EQZ(Val(2013265920), "PoseidonInvalid(zirgen/circuit/rv32im/v2/dsl/inst_p2.zir:52)");
@@ -8912,7 +8921,7 @@ static __device__ __noinline__ PoseidonStateStruct exec_PoseidonInvalid_W(ExecCo
   return x1;
 }
 
-static __device__ __noinline__ ReadAddrStruct exec_ReadAddr_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ReadAddrStruct exec_ReadAddr_W(ExecContext& ctx,
                                         NondetRegStruct arg0,
                                         Val arg1_0,
                                         BoundLayout<ReadAddrLayout> layout2) {
@@ -8927,7 +8936,7 @@ static __device__ __noinline__ ReadAddrStruct exec_ReadAddr_W(ExecContext& ctx,
   return ReadAddrStruct{._super = (x4 + x5)};
 }
 
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonEcall_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonEcall_W(ExecContext& ctx,
                                                   NondetRegStruct arg0,
                                                   Val arg1_0,
                                                   BoundLayout<PoseidonEcallLayout> layout2) {
@@ -8989,7 +8998,7 @@ static __device__ __noinline__ PoseidonStateStruct exec_PoseidonEcall_W(ExecCont
   return x18;
 }
 
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonPagingEntry_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonPagingEntry_W(ExecContext& ctx,
                                                         NondetRegStruct arg0,
                                                         Val arg1_0,
                                                         BoundLayout<PoseidonStateLayout> layout2) {
@@ -9024,7 +9033,7 @@ static __device__ __noinline__ PoseidonStateStruct exec_PoseidonPagingEntry_W(Ex
   return x6;
 }
 
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonEntry_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonEntry_W(ExecContext& ctx,
                                                   NondetRegStruct arg0,
                                                   ValU32Struct arg1_0,
                                                   Val arg2_0,
@@ -9087,7 +9096,7 @@ static __device__ __noinline__ PoseidonStateStruct exec_PoseidonEntry_W(ExecCont
   return x8;
 }
 
-static __device__ __noinline__ ReadElemStruct exec_ReadElem_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ReadElemStruct exec_ReadElem_W(ExecContext& ctx,
                                         NondetRegStruct arg0,
                                         Val arg1_0,
                                         BoundLayout<ReadElemLayout> layout2) {
@@ -9099,7 +9108,7 @@ static __device__ __noinline__ ReadElemStruct exec_ReadElem_W(ExecContext& ctx,
   return ReadElemStruct{._super = (x4 + x3._super.low)};
 }
 
-static __device__ __noinline__ PoseidonStateStruct
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct
 exec_PoseidonLoadState_W(ExecContext& ctx,
                        NondetRegStruct arg0,
                        PoseidonStateStruct arg1_0,
@@ -9144,7 +9153,7 @@ exec_PoseidonLoadState_W(ExecContext& ctx,
   return x10;
 }
 
-static __device__ __noinline__ PoseidonStateStruct
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct
 exec_PoseidonLoadInShort_W(ExecContext& ctx,
                          NondetRegStruct arg0,
                          PoseidonStateStruct arg1_0,
@@ -9418,7 +9427,7 @@ exec_PoseidonLoadInShort_W(ExecContext& ctx,
   return x119;
 }
 
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonLoadInLow_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonLoadInLow_W(ExecContext& ctx,
                                                       NondetRegStruct arg0,
                                                       PoseidonStateStruct arg1_0,
                                                       BoundLayout<PoseidonLoadInLowLayout> layout2,
@@ -9564,7 +9573,7 @@ static __device__ __noinline__ PoseidonStateStruct exec_PoseidonLoadInLow_W(Exec
   return x60;
 }
 
-static __device__ __noinline__ PoseidonStateStruct
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct
 exec_PoseidonLoadInHigh_W(ExecContext& ctx,
                         NondetRegStruct arg0,
                         PoseidonStateStruct arg1_0,
@@ -9847,7 +9856,7 @@ exec_PoseidonLoadInHigh_W(ExecContext& ctx,
   return x127;
 }
 
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonLoadIn_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonLoadIn_W(ExecContext& ctx,
                                                    NondetRegStruct arg0,
                                                    PoseidonStateStruct arg1_0,
                                                    BoundLayout<PoseidonLoadInLayout> layout2,
@@ -9881,7 +9890,7 @@ static __device__ __noinline__ PoseidonStateStruct exec_PoseidonLoadIn_W(ExecCon
   return x10;
 }
 
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonExtRound_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonExtRound_W(ExecContext& ctx,
                                                      PoseidonStateStruct arg0,
                                                      BoundLayout<PoseidonExtRoundLayout> layout1) {
   // builtin Sub
@@ -9955,7 +9964,7 @@ static __device__ __noinline__ PoseidonStateStruct exec_PoseidonExtRound_W(ExecC
   return x18;
 }
 
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonIntRounds_W(
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonIntRounds_W(
     ExecContext& ctx, PoseidonStateStruct arg0, BoundLayout<PoseidonIntRoundsLayout> layout1) {
   // PoseidonIntRounds(zirgen/circuit/rv32im/v2/dsl/inst_p2.zir:256)
   Val24Array x2 = Val24Array{
@@ -9989,7 +9998,7 @@ static __device__ __noinline__ PoseidonStateStruct exec_PoseidonIntRounds_W(
   return x5;
 }
 
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonCheckOut_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonCheckOut_W(ExecContext& ctx,
                                                      NondetRegStruct arg0,
                                                      PoseidonStateStruct arg1_0,
                                                      BoundLayout<PoseidonCheckOutLayout> layout2) {
@@ -10053,7 +10062,7 @@ static __device__ __noinline__ PoseidonStateStruct exec_PoseidonCheckOut_W(ExecC
   return x16;
 }
 
-static __device__ __noinline__ FieldToWordStruct exec_FieldToWord_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR FieldToWordStruct exec_FieldToWord_W(ExecContext& ctx,
                                               Val arg0,
                                               BoundLayout<FieldToWordLayout> layout1) {
   // FieldToWord(zirgen/circuit/rv32im/v2/dsl/inst_p2.zir:282)
@@ -10095,7 +10104,7 @@ static __device__ __noinline__ FieldToWordStruct exec_FieldToWord_W(ExecContext&
   return FieldToWordStruct{.ret = x12};
 }
 
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonStoreOut_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonStoreOut_W(ExecContext& ctx,
                                                      NondetRegStruct arg0,
                                                      PoseidonStateStruct arg1_0,
                                                      BoundLayout<PoseidonStoreOutLayout> layout2) {
@@ -10164,7 +10173,7 @@ static __device__ __noinline__ PoseidonStateStruct exec_PoseidonStoreOut_W(ExecC
   return x18;
 }
 
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonDoOut_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonDoOut_W(ExecContext& ctx,
                                                   NondetRegStruct arg0,
                                                   PoseidonStateStruct arg1_0,
                                                   BoundLayout<PoseidonDoOutLayout> layout2) {
@@ -10259,7 +10268,7 @@ static __device__ __noinline__ PoseidonStateStruct exec_PoseidonDoOut_W(ExecCont
   return x7;
 }
 
-static __device__ __noinline__ PoseidonStateStruct
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct
 exec_PoseidonStoreState_W(ExecContext& ctx,
                         NondetRegStruct arg0,
                         PoseidonStateStruct arg1_0,
@@ -10312,7 +10321,7 @@ exec_PoseidonStoreState_W(ExecContext& ctx,
   return x11;
 }
 
-static __device__ __noinline__ IsU24Struct exec_IsU24_W(ExecContext& ctx, Val arg0, BoundLayout<IsU24Layout> layout1) {
+static __device__ WITGEN_TU_FNATTR IsU24Struct exec_IsU24_W(ExecContext& ctx, Val arg0, BoundLayout<IsU24Layout> layout1) {
   // IsU24(zirgen/circuit/rv32im/v2/dsl/inst_p2.zir:341)
   NondetU16RegStruct x2 =
       exec_NondetU16Reg_W(ctx, bitAnd(arg0, Val(65535)), LAYOUT_LOOKUP(layout1, low16));
@@ -10322,7 +10331,7 @@ static __device__ __noinline__ IsU24Struct exec_IsU24_W(ExecContext& ctx, Val ar
   return IsU24Struct{};
 }
 
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonPagingLoadNode_W(
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonPagingLoadNode_W(
     ExecContext& ctx, NondetRegStruct arg0, Val arg1_0, BoundLayout<PoseidonStateLayout> layout2) {
   // PoseidonOpDef(zirgen/circuit/rv32im/v2/dsl/inst_p2.zir:8)
   // PoseidonPagingLoadNode(zirgen/circuit/rv32im/v2/dsl/inst_p2.zir:346)
@@ -10353,7 +10362,7 @@ static __device__ __noinline__ PoseidonStateStruct exec_PoseidonPagingLoadNode_W
   return x5;
 }
 
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonPagingLoadPage_W(
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonPagingLoadPage_W(
     ExecContext& ctx, NondetRegStruct arg0, Val arg1_0, BoundLayout<PoseidonStateLayout> layout2) {
   // PoseidonOpDef(zirgen/circuit/rv32im/v2/dsl/inst_p2.zir:8)
   // PoseidonPagingLoadPage(zirgen/circuit/rv32im/v2/dsl/inst_p2.zir:368)
@@ -10380,7 +10389,7 @@ static __device__ __noinline__ PoseidonStateStruct exec_PoseidonPagingLoadPage_W
   return x4;
 }
 
-static __device__ __noinline__ PoseidonStateStruct
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct
 exec_PoseidonPagingLoadDone_W(ExecContext& ctx, BoundLayout<PoseidonStateLayout> layout0) {
   // PoseidonPagingLoadDone(zirgen/circuit/rv32im/v2/dsl/inst_p2.zir:390)
   PoseidonStateStruct x1 =
@@ -10404,7 +10413,7 @@ exec_PoseidonPagingLoadDone_W(ExecContext& ctx, BoundLayout<PoseidonStateLayout>
   return x1;
 }
 
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonPagingStoreNode_W(
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonPagingStoreNode_W(
     ExecContext& ctx, NondetRegStruct arg0, Val arg1_0, BoundLayout<PoseidonStateLayout> layout2) {
   // PoseidonOpDef(zirgen/circuit/rv32im/v2/dsl/inst_p2.zir:8)
   // PoseidonPagingStoreNode(zirgen/circuit/rv32im/v2/dsl/inst_p2.zir:394)
@@ -10435,7 +10444,7 @@ static __device__ __noinline__ PoseidonStateStruct exec_PoseidonPagingStoreNode_
   return x5;
 }
 
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonPagingStorePage_W(
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonPagingStorePage_W(
     ExecContext& ctx, NondetRegStruct arg0, Val arg1_0, BoundLayout<PoseidonStateLayout> layout2) {
   // PoseidonOpDef(zirgen/circuit/rv32im/v2/dsl/inst_p2.zir:8)
   // PoseidonPagingStorePage(zirgen/circuit/rv32im/v2/dsl/inst_p2.zir:416)
@@ -10462,7 +10471,7 @@ static __device__ __noinline__ PoseidonStateStruct exec_PoseidonPagingStorePage_
   return x4;
 }
 
-static __device__ __noinline__ PoseidonStateStruct
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct
 exec_PoseidonPagingStoreDone_W(ExecContext& ctx, BoundLayout<PoseidonStateLayout> layout0) {
   // PoseidonPagingStoreDone(zirgen/circuit/rv32im/v2/dsl/inst_p2.zir:438)
   PoseidonStateStruct x1 =
@@ -10486,7 +10495,7 @@ exec_PoseidonPagingStoreDone_W(ExecContext& ctx, BoundLayout<PoseidonStateLayout
   return x1;
 }
 
-static __device__ __noinline__ PoseidonStateStruct exec_PoseidonPaging_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR PoseidonStateStruct exec_PoseidonPaging_W(ExecContext& ctx,
                                                    NondetRegStruct arg0,
                                                    Val arg1_0,
                                                    PoseidonStateStruct arg2_0,
@@ -10570,7 +10579,7 @@ static __device__ __noinline__ PoseidonStateStruct exec_PoseidonPaging_W(ExecCon
   return x26;
 }
 
-static __device__ __noinline__ InstOutputBaseStruct exec_Poseidon0_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_Poseidon0_W(ExecContext& ctx,
                                                NondetRegStruct arg0,
                                                InstInputStruct arg1_0,
                                                BoundLayout<Poseidon0Layout> layout2,
@@ -11388,7 +11397,7 @@ static __device__ __noinline__ InstOutputBaseStruct exec_Poseidon0_W(ExecContext
   return x22;
 }
 
-static __device__ __noinline__ InstOutputBaseStruct exec_Poseidon1_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_Poseidon1_W(ExecContext& ctx,
                                                NondetRegStruct arg0,
                                                InstInputStruct arg1_0,
                                                BoundLayout<Poseidon1Layout> layout2) {
@@ -11469,7 +11478,7 @@ static __device__ __noinline__ InstOutputBaseStruct exec_Poseidon1_W(ExecContext
   return x18;
 }
 
-static __device__ __noinline__ CarryExtractStruct exec_CarryExtract_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR CarryExtractStruct exec_CarryExtract_W(ExecContext& ctx,
                                                 Val arg0,
                                                 BoundLayout<CarryExtractLayout> layout1) {
   // builtin Mul
@@ -11490,7 +11499,7 @@ static __device__ __noinline__ CarryExtractStruct exec_CarryExtract_W(ExecContex
   return CarryExtractStruct{.carry = x7, .out = (arg0 - (x7 * Val(65536)))};
 }
 
-static __device__ __noinline__ UnpackReg_32__16_Struct exec_UnpackReg_32__16__W(
+static __device__ WITGEN_TU_FNATTR UnpackReg_32__16_Struct exec_UnpackReg_32__16__W(
     ExecContext& ctx, Val2Array arg0, BoundLayout<UnpackReg_32__16_Layout> layout1) {
   // Div(<preamble>:18)
   // UnpackNondet(zirgen/circuit/rv32im/v2/dsl/pack.zir:29)
@@ -11636,7 +11645,7 @@ static __device__ __noinline__ UnpackReg_32__16_Struct exec_UnpackReg_32__16__W(
   return UnpackReg_32__16_Struct{._super = x34};
 }
 
-static __device__ __noinline__ UnpackReg_32__16_Struct exec_CarryAndExpand_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR UnpackReg_32__16_Struct exec_CarryAndExpand_W(ExecContext& ctx,
                                                        Val2Array arg0,
                                                        BoundLayout<CarryAndExpandLayout> layout1) {
   // CarryAndExpand(zirgen/circuit/rv32im/v2/dsl/sha2.zir:42)
@@ -11650,7 +11659,7 @@ static __device__ __noinline__ UnpackReg_32__16_Struct exec_CarryAndExpand_W(Exe
   return x4;
 }
 
-static __device__ __noinline__ ShaStateStruct back_ShaState_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ShaStateStruct back_ShaState_W(ExecContext& ctx,
                                         Index distance0,
                                         BoundLayout<ShaStateLayout> layout1) {
   // ShaState(zirgen/circuit/rv32im/v2/dsl/inst_sha.zir:20)
@@ -11708,7 +11717,7 @@ static __device__ __noinline__ ShaStateStruct back_ShaState_W(ExecContext& ctx,
                         .w = x18};
 }
 
-static __device__ __noinline__ ShaStateStruct exec_ShaState_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ShaStateStruct exec_ShaState_W(ExecContext& ctx,
                                         Val32Array arg0,
                                         Val32Array arg1_0,
                                         Val32Array arg2_0,
@@ -11770,7 +11779,7 @@ static __device__ __noinline__ ShaStateStruct exec_ShaState_W(ExecContext& ctx,
                         .w = x26};
 }
 
-static __device__ __noinline__ ShaStateStruct exec_ShaInvalid_W(ExecContext& ctx, BoundLayout<ShaStateLayout> layout0) {
+static __device__ WITGEN_TU_FNATTR ShaStateStruct exec_ShaInvalid_W(ExecContext& ctx, BoundLayout<ShaStateLayout> layout0) {
   // ShaInvalid(zirgen/circuit/rv32im/v2/dsl/inst_sha.zir:33)
   EQZ(Val(2013265920), "ShaInvalid(zirgen/circuit/rv32im/v2/dsl/inst_sha.zir:33)");
   // ShaInvalid(zirgen/circuit/rv32im/v2/dsl/inst_sha.zir:35)
@@ -11784,7 +11793,7 @@ static __device__ __noinline__ ShaStateStruct exec_ShaInvalid_W(ExecContext& ctx
   return x2;
 }
 
-static __device__ __noinline__ ShaStateStruct exec_ShaEcall_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ShaStateStruct exec_ShaEcall_W(ExecContext& ctx,
                                         NondetRegStruct arg0,
                                         BoundLayout<ShaEcallLayout> layout1) {
   // Log(<preamble>:22)
@@ -11824,7 +11833,7 @@ static __device__ __noinline__ ShaStateStruct exec_ShaEcall_W(ExecContext& ctx,
   return x8;
 }
 
-static __device__ __noinline__ ShaStateStruct exec_ShaLoadState_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ShaStateStruct exec_ShaLoadState_W(ExecContext& ctx,
                                             NondetRegStruct arg0,
                                             ShaStateStruct arg1_0,
                                             BoundLayout<ShaLoadStateLayout> layout2) {
@@ -12698,7 +12707,7 @@ static __device__ __noinline__ ShaStateStruct exec_ShaLoadState_W(ExecContext& c
   return x82;
 }
 
-static __device__ __noinline__ ShaStateStruct exec_ShaLoadData_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ShaStateStruct exec_ShaLoadData_W(ExecContext& ctx,
                                            NondetRegStruct arg0,
                                            ShaStateStruct arg1_0,
                                            ShaStateStruct arg2_0,
@@ -14551,7 +14560,7 @@ static __device__ __noinline__ ShaStateStruct exec_ShaLoadData_W(ExecContext& ct
   return x881;
 }
 
-static __device__ __noinline__ ShaStateStruct exec_ShaMix_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ShaStateStruct exec_ShaMix_W(ExecContext& ctx,
                                       NondetRegStruct arg0,
                                       ShaStateStruct arg1_0,
                                       ShaStateStruct arg2_0,
@@ -16585,7 +16594,7 @@ static __device__ __noinline__ ShaStateStruct exec_ShaMix_W(ExecContext& ctx,
   return x1104;
 }
 
-static __device__ __noinline__ ShaStateStruct exec_ShaStoreState_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR ShaStateStruct exec_ShaStoreState_W(ExecContext& ctx,
                                              NondetRegStruct arg0,
                                              ShaStateStruct arg1_0,
                                              ShaStateStruct arg2_0,
@@ -16975,7 +16984,7 @@ static __device__ __noinline__ ShaStateStruct exec_ShaStoreState_W(ExecContext& 
   return x181;
 }
 
-static __device__ __noinline__ InstOutputBaseStruct exec_Sha0_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_Sha0_W(ExecContext& ctx,
                                           NondetRegStruct arg0,
                                           InstInputStruct arg1_0,
                                           BoundLayout<Sha0Layout> layout2) {
@@ -17319,7 +17328,7 @@ static __device__ __noinline__ InstOutputBaseStruct exec_Sha0_W(ExecContext& ctx
   return x31;
 }
 
-static __device__ __noinline__ BigIntStateStruct back_BigIntState_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR BigIntStateStruct back_BigIntState_W(ExecContext& ctx,
                                               Index distance0,
                                               BoundLayout<BigIntStateLayout> layout1) {
   // BigIntState(zirgen/circuit/rv32im/v2/dsl/inst_bigint.zir:14)
@@ -17366,7 +17375,7 @@ static __device__ __noinline__ BigIntStateStruct back_BigIntState_W(ExecContext&
                            .nextState = x11};
 }
 
-static __device__ __noinline__ BigIntStateStruct exec_BigIntState_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR BigIntStateStruct exec_BigIntState_W(ExecContext& ctx,
                                               Val arg0,
                                               Val arg1_0,
                                               Val arg2_0,
@@ -17404,7 +17413,7 @@ static __device__ __noinline__ BigIntStateStruct exec_BigIntState_W(ExecContext&
                            .nextState = x17};
 }
 
-static __device__ __noinline__ BigIntStateStruct exec_BigIntInvalid_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR BigIntStateStruct exec_BigIntInvalid_W(ExecContext& ctx,
                                                 BoundLayout<BigIntStateLayout> layout0) {
   // BigIntInvalid(zirgen/circuit/rv32im/v2/dsl/inst_bigint.zir:26)
   EQZ(Val(2013265920), "BigIntInvalid(zirgen/circuit/rv32im/v2/dsl/inst_bigint.zir:26)");
@@ -17436,7 +17445,7 @@ static __device__ __noinline__ BigIntStateStruct exec_BigIntInvalid_W(ExecContex
   return x1;
 }
 
-static __device__ __noinline__ BigIntStateStruct exec_BigIntEcall_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR BigIntStateStruct exec_BigIntEcall_W(ExecContext& ctx,
                                               NondetRegStruct arg0,
                                               BoundLayout<BigIntEcallLayout> layout1) {
   // BigIntEcall(zirgen/circuit/rv32im/v2/dsl/inst_bigint.zir:41)
@@ -17473,7 +17482,7 @@ static __device__ __noinline__ BigIntStateStruct exec_BigIntEcall_W(ExecContext&
   return x4;
 }
 
-static __device__ __noinline__ SplitU32Struct exec_SplitU32_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR SplitU32Struct exec_SplitU32_W(ExecContext& ctx,
                                         ValU32Struct arg0,
                                         BoundLayout<SplitU32Layout> layout1) {
   // SplitU32(zirgen/circuit/rv32im/v2/dsl/inst_bigint.zir:58)
@@ -17486,7 +17495,7 @@ static __device__ __noinline__ SplitU32Struct exec_SplitU32_W(ExecContext& ctx,
   return x4;
 }
 
-static __device__ __noinline__ AddrDecomposeBitsStruct exec_BigIntAddr_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR AddrDecomposeBitsStruct exec_BigIntAddr_W(ExecContext& ctx,
                                                    ValU32Struct arg0,
                                                    Val arg1_0,
                                                    BoundLayout<BigIntAddrLayout> layout2) {
@@ -17501,7 +17510,7 @@ static __device__ __noinline__ AddrDecomposeBitsStruct exec_BigIntAddr_W(ExecCon
   return x4;
 }
 
-static __device__ __noinline__ BigIntReadStruct exec_BigIntRead_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR BigIntReadStruct exec_BigIntRead_W(ExecContext& ctx,
                                             NondetRegStruct arg0,
                                             ValU32Struct arg1_0,
                                             Val arg2_0,
@@ -17539,7 +17548,7 @@ static __device__ __noinline__ BigIntReadStruct exec_BigIntRead_W(ExecContext& c
   return BigIntReadStruct{._super = x10};
 }
 
-static __device__ __noinline__ BigIntWitnessStruct exec_BigIntWitness_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR BigIntWitnessStruct exec_BigIntWitness_W(ExecContext& ctx,
                                                   Val16Array arg0,
                                                   BoundLayout<BigIntWitnessLayout> layout1) {
   // BigIntWitness(zirgen/circuit/rv32im/v2/dsl/inst_bigint.zir:88)
@@ -17553,7 +17562,7 @@ static __device__ __noinline__ BigIntWitnessStruct exec_BigIntWitness_W(ExecCont
   return BigIntWitnessStruct{._super = x2};
 }
 
-static __device__ __noinline__ BigIntWitnessStruct exec_BigIntWrite_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR BigIntWitnessStruct exec_BigIntWrite_W(ExecContext& ctx,
                                                 NondetRegStruct arg0,
                                                 ValU32Struct arg1_0,
                                                 Val arg2_0,
@@ -17596,7 +17605,7 @@ static __device__ __noinline__ BigIntWitnessStruct exec_BigIntWrite_W(ExecContex
   return x21;
 }
 
-static __device__ __noinline__ BigIntWitnessStruct exec_BigIntCheck_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR BigIntWitnessStruct exec_BigIntCheck_W(ExecContext& ctx,
                                                 BoundLayout<BigIntWitnessLayout> layout0) {
   // BigIntExtern(zirgen/circuit/rv32im/v2/dsl/inst_bigint.zir:3)
   // BigIntCheck(zirgen/circuit/rv32im/v2/dsl/inst_bigint.zir:108)
@@ -17609,7 +17618,7 @@ static __device__ __noinline__ BigIntWitnessStruct exec_BigIntCheck_W(ExecContex
   return x17;
 }
 
-static __device__ __noinline__ BigIntStateStruct exec_BigIntStep_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR BigIntStateStruct exec_BigIntStep_W(ExecContext& ctx,
                                              NondetRegStruct arg0,
                                              BigIntStateStruct arg1_0,
                                              BoundLayout<BigIntStepLayout> layout2) {
@@ -17835,7 +17844,7 @@ static __device__ __noinline__ BigIntStateStruct exec_BigIntStep_W(ExecContext& 
   return x49;
 }
 
-static __device__ __noinline__ InstOutputBaseStruct exec_BigInt0_W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR InstOutputBaseStruct exec_BigInt0_W(ExecContext& ctx,
                                              NondetRegStruct arg0,
                                              InstInputStruct arg1_0,
                                              BoundLayout<BigInt0Layout> layout2) {
@@ -18744,7 +18753,7 @@ static __device__ __noinline__ InstOutputBaseStruct exec_BigInt0_W(ExecContext& 
   return x18;
 }
 
-static __device__ __noinline__ OneHot_13_Struct exec_OneHot_13__W(ExecContext& ctx,
+static __device__ WITGEN_TU_FNATTR OneHot_13_Struct exec_OneHot_13__W(ExecContext& ctx,
                                             Val arg0,
                                             BoundLayout<OneHot_13_Layout> layout1) {
   // OneHot(zirgen/circuit/rv32im/v2/dsl/one_hot.zir:7)
@@ -18798,7 +18807,7 @@ static __device__ __noinline__ OneHot_13_Struct exec_OneHot_13__W(ExecContext& c
   return OneHot_13_Struct{._super = x2};
 }
 
-static __device__ __noinline__ TopStruct exec_Top_W(ExecContext& ctx, BoundLayout<TopLayout> layout0, GlobalBuf global1) {
+static __device__ WITGEN_TU_FNATTR TopStruct exec_Top_W(ExecContext& ctx, BoundLayout<TopLayout> layout0, GlobalBuf global1) {
   // IsFirstCycle(zirgen/circuit/rv32im/v2/dsl/top.zir:15)
   // Top(zirgen/circuit/rv32im/v2/dsl/top.zir:47)
   Val x2 = INVOKE_EXTERN(ctx, isFirstCycle_0);
@@ -18947,7 +18956,7 @@ static __device__ __noinline__ TopStruct exec_Top_W(ExecContext& ctx, BoundLayou
   return TopStruct{};
 }
 
-static __device__ __noinline__ void step_Top_W(ExecContext& ctx, MutableBuf data0, GlobalBuf global1) {
+static __device__ WITGEN_TU_FNATTR void step_Top_W(ExecContext& ctx, MutableBuf data0, GlobalBuf global1) {
   // Top(zirgen/circuit/rv32im/v2/dsl/top.zir:24)
   BoundLayout<TopLayout> x2 = BIND_LAYOUT(kLayout_Top, data0);
   TopStruct x3 = exec_Top_W(ctx, x2, global1);
@@ -18955,10 +18964,27 @@ static __device__ __noinline__ void step_Top_W(ExecContext& ctx, MutableBuf data
 }
 
 
+#ifdef __HIPCC__
+// ROCm (build.rs): WITGEN_TU_LB sets the launch bounds (HIP: max threads, min waves per SIMD),
+// WITGEN_TU_KERNEL / WITGEN_TU_LAUNCH the names of a variant; perm (nullable): the launch's
+// cycles in the order to run them (absolute cycle numbers), as par_stepExec in ffi.cu.
+#ifndef WITGEN_TU_LB
+#define WITGEN_TU_LB 256, 8
+#endif
+#ifndef WITGEN_TU_KERNEL
+#define WITGEN_TU_KERNEL par_stepExecW
+#define WITGEN_TU_LAUNCH risc0_rv32im_launch_par_stepExecTU
+#endif
+__global__ void __launch_bounds__(WITGEN_TU_LB) WITGEN_TU_KERNEL(DeviceExecContext* ctx, uint32_t start, uint32_t count, const uint32_t* perm) {
+  uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x;
+  if (cycle >= count) return;
+  cycle = perm ? perm[cycle] : start + cycle;
+#else
 __global__ void __launch_bounds__(256, 1) par_stepExecW(DeviceExecContext* ctx, uint32_t start, uint32_t count) {
   uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x;
   if (cycle >= count) return;
   cycle += start;
+#endif
   ExecContext execCtx(*ctx->preflight, *ctx->tables, cycle);
   Buffer dataBuf = *ctx->data;
   Buffer preDataBuf = *ctx->pre_data;
@@ -18969,7 +18995,14 @@ __global__ void __launch_bounds__(256, 1) par_stepExecW(DeviceExecContext* ctx, 
   step_Top_W(execCtx, &data, &global);
 }
 } // namespace risc0::circuit::rv32im_v2::cuda
+#ifdef __HIPCC__
+void WITGEN_TU_LAUNCH(unsigned grid, unsigned block, cudaStream_t stream, void* ctx, uint32_t start, uint32_t count, const uint32_t* perm) {
+  using namespace risc0::circuit::rv32im_v2::cuda;
+  WITGEN_TU_KERNEL<<<grid, block, 0, stream>>>((DeviceExecContext*)ctx, start, count, perm);
+}
+#else
 void risc0_rv32im_launch_par_stepExecTU(unsigned grid, unsigned block, cudaStream_t stream, void* ctx, uint32_t start, uint32_t count) {
   using namespace risc0::circuit::rv32im_v2::cuda;
   par_stepExecW<<<grid, block, 0, stream>>>((DeviceExecContext*)ctx, start, count);
 }
+#endif

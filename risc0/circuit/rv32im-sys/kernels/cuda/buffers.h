@@ -29,6 +29,21 @@ struct Buffer {
   // reads/writes. The SHA2 precompile does back-references at distance 68;
   // without barriers hip-clang at -O2+ can reorder loads that produce a
   // corrupt witness trace, resulting in invalid segment proofs.
+#if defined(RISC0_HIP_GLOBAL_BUFS) && defined(__HIP_DEVICE_COMPILE__)
+  // Same accesses in the same order (barriers kept), through global rather than FLAT pointers
+  // (a FLAT load also waits on the LDS/scalar counter): witgen_tu.cu on ROCm.
+  __device__ void set(size_t row, size_t col, Fp val) {
+    ((__attribute__((address_space(1))) uint32_t*)(uint32_t*)buf)[col * rows + row] = val.asRaw();
+    asm volatile("" ::: "memory");
+  }
+  __device__ Fp get(size_t row, size_t col) {
+    asm volatile("" ::: "memory");
+    Fp v = Fp::fromRaw(
+        ((const __attribute__((address_space(1))) uint32_t*)(const uint32_t*)buf)[col * rows + row]);
+    asm volatile("" ::: "memory");
+    return v;
+  }
+#else
   __device__ void set(size_t row, size_t col, Fp val) {
     buf[col * rows + row] = val;
     asm volatile("" ::: "memory");
@@ -39,6 +54,7 @@ struct Buffer {
     asm volatile("" ::: "memory");
     return v;
   }
+#endif
 #elif defined(__HIP_DEVICE_COMPILE__)
   // RISC0_HIP_ROWS_PRIVATE (no row is written by another thread of the launch): no barriers,
   // and global rather than FLAT accesses (the generic pointer made every load FLAT, which also

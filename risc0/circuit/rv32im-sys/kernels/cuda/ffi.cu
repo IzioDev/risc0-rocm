@@ -43,6 +43,7 @@ namespace nvtx3 { struct scoped_range { scoped_range(const char*) {} }; }
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <unordered_map>
@@ -69,6 +70,11 @@ static const auto rv32imEventSynchronize = cudaEventSynchronize;
 void risc0_rv32im_launch_stepAccumTU(unsigned, unsigned, cudaStream_t, void*, uint32_t, const uint32_t*);
 #ifndef __HIPCC__
 void risc0_rv32im_launch_par_stepExecTU(unsigned, unsigned, cudaStream_t, void*, uint32_t, uint32_t);
+#else
+void risc0_rv32im_launch_par_stepExecTU(unsigned, unsigned, cudaStream_t, void*, uint32_t, uint32_t,
+                                        const uint32_t*);
+void risc0_rv32im_launch_par_stepExecTU2(unsigned, unsigned, cudaStream_t, void*, uint32_t, uint32_t,
+                                         const uint32_t*);
 #endif
 static bool g_verbose = (std::getenv("RISC0_VERBOSE") != nullptr);
 
@@ -778,33 +784,385 @@ static uint32_t* hipMajorPerm(int slot, const PreflightCycle* cycles, uint32_t n
   return vals.Current();
 }
 
+// Whether the current device is RDNA4 (gfx12xx).
+static bool sortGfx12() {
+  std::lock_guard<std::recursive_mutex> g(risc0_hip_hop::lock());
+  return risc0_hip_hop::is_gfx12(getCachedDevice());
+}
+
 // par_stepExec's first launch (cycles before the table split) runs its cycles grouped by major
-// within 2^RISC0_HIP_WITGEN_SORT-row windows (default 12; 0 = cycle order), as stepAccum does:
-// a wave then mostly runs one arm of step_Top's mux. Same witness: each cycle still runs once
-// and writes only its own row; the rows it reads back hold the injected values, which their own
-// cycles write again (the same values) in any order, as with the unsorted launch, whose waves
-// run in no fixed order either; the lookup-table counts are commutative atomic adds.
+// within 2^RISC0_HIP_WITGEN_SORT-row windows (0 = cycle order), as stepAccum does: a wave then
+// mostly runs one arm of step_Top's mux. Same witness: each cycle still runs once and writes only
+// its own row; the rows it reads back hold the injected values, which their own cycles write
+// again (the same values) in any order, as with the unsorted launch, whose waves run in no fixed
+// order either; the lookup-table counts are commutative atomic adds. Default 14 on gfx11 and 12
+// on gfx12 (fib 1M succinct, steps.cu's par_stepExec phase 1 per segment: RX 7900 XTX 7.21 ms at
+// 12, 6.83-6.85 at 14, 7.03-7.09 at 13 and 15; RX 9070 XT 7.22 at 12, 7.27 at 11, 7.57 at 13, 8.15
+// at 14). With witgen_tu2's par_stepExecW2 (hipWitgenTu's default) one less looked better, not yet
+// the default: RX 7900 XTX 4.48 ms at 13 vs 4.64 at 14, RX 9070 XT 4.65 at 11 vs 4.80-4.82 at 12.
 static uint32_t witgenSortWin() {
-  static const uint32_t win = [] {
+  static const int env = [] {
     const char* e = getenv("RISC0_HIP_WITGEN_SORT");
-    return e ? (uint32_t)atoi(e) : 12u;
+    return e ? atoi(e) : -1;
+  }();
+  return env >= 0 ? uint32_t(env) : sortGfx12() ? 12u : 14u;
+}
+
+// stepAccum's sort window (log2 rows; cycles are grouped by major within 2^win rows, see majorKeys):
+// RISC0_HIP_ACCUM_SORT (4..24), else 11. A smaller window keeps each wave's cycles close together
+// (row locality of the trace accesses) at the cost of more major divergence (a window holds about one
+// partly filled wave per major present). Fib 1M succinct, stepAccumA per segment, windows
+// 9/10/11/12/13: RX 7900 XTX 5.45/4.49/3.98/3.97/3.95 ms, RX 9070 XT 6.36/5.07/4.64/4.66/5.02 ms (8:
+// 7.13 and 8.79 ms). prove_busy (few majors), 9/10/11/12: RX 7900 XTX 3.10/3.18/3.18/3.21 ms, RX 9070
+// XT 3.46 (bimodal per segment, 3.0 or 3.9)/4.00/4.03/4.17 ms.
+static uint32_t accumSortWin() {
+  static const uint32_t win = [] {
+    const char* e = getenv("RISC0_HIP_ACCUM_SORT");
+    int w = e ? atoi(e) : 11;
+    return uint32_t(w < 4 ? 4 : w > 24 ? 24 : w);
   }();
   return win;
 }
 
-// stepAccum's sort window (log2 rows; cycles are grouped by major within 2^win rows, see majorKeys):
-// RISC0_HIP_ACCUM_SORT (4..24), else 9. A smaller window keeps each wave's cycles close together (row
-// locality of the trace accesses) at the cost of more major divergence; 9 is the fastest on both an
-// RX 7900 XTX and an RX 9070 XT (prove_busy po2 20, stepAccumA 3.82 -> 3.20 and 5.02 -> 3.46 ms/seg
-// vs CUDA's 14; 8 and 10 are slower on both). The gain is larger on gfx12, whose L0 misses go
-// straight to L2 (no L1 level).
-static uint32_t accumSortWin() {
-  static const uint32_t win = [] {
-    const char* e = getenv("RISC0_HIP_ACCUM_SORT");
-    int w = e ? atoi(e) : 9;
-    return uint32_t(w < 4 ? 4 : w > 24 ? 24 : w);
+// Both major sorts in one launch, in LDS (RISC0_HIP_LSORT, on unless 0): at witgen, wmsSort
+// writes par_stepExec's permutation (2^winW-row windows of [0, nW)) and stepAccum's (2^winA-row
+// windows of [0, nA)) from one read of the cycles' majors, instead of majorKeys + a hipcub radix
+// sort for each (~13 and ~23 launches, ~0.2 and ~0.33 ms per segment at po2 20). The same
+// permutations: within each window the rows ordered by (major, row), as the stable radix sort of
+// majorKeys' (window, major) keys gives. One 256-thread block per superwindow of 2^S rows,
+// S = max(winW, winA) <= kWmsMaxBits: the block stages the superwindow's majors in LDS (bytes,
+// padded by one word per 32 words so that chunk reads hit different banks), then ranks each
+// window's rows: each thread (large windows: the whole block, one window after another) or lane
+// (small windows: one wave per window) owns a contiguous chunk, and per major present a prefix
+// sum over the chunks' counts gives each chunk's first slot. The stepAccum permutation is kept for
+// the accum of the same trace (wmsAccum); injectCycleCols' columns are written from the same reads.
+constexpr uint32_t kWmsMaxBits = 15;
+// Windows of at least 2^kWmsBlockBits rows are ranked by the whole block, smaller ones by one wave.
+constexpr uint32_t kWmsBlockBits = 12;
+// par_stepExec's (major, minor) keys (RISC0_HIP_WITGEN_MINOR) need a second LDS byte array: up to
+// 2^14-row superwindows.
+constexpr uint32_t kWmsMinorMaxBits = 14;
+
+__device__ __forceinline__ uint32_t wmsPad(uint32_t word) {
+  return word + (word >> 5);
+}
+
+// LDS words for one byte array of a superwindow of 2^S rows (one pad word per 32 words).
+__host__ __device__ inline uint32_t wmsLdsWords(uint32_t S) {
+  const uint32_t words = ((1u << S) + 3) / 4;
+  return words + words / 32 + 1;
+}
+
+// injectCycleCols' five columns, written by wmsSort from the same reads of the cycles (data null:
+// not fused).
+struct WmsInject {
+  Fp* data = nullptr;
+  uint32_t rows = 0, cCycle = 0, cPcLow = 0, cPcHigh = 0, cState = 0, cMode = 0;
+};
+
+// The keys (bytes) in rows [c0, c1) of the superwindow: bit k & 31 of p[k >> 5] for each key k.
+__device__ __forceinline__ void wmsScan(const uint32_t* sKey, uint32_t c0, uint32_t c1,
+                                        uint32_t (&p)[8]) {
+#pragma unroll
+  for (int j = 0; j < 8; j++) p[j] = 0;
+  for (uint32_t w = c0 >> 2; w * 4 < c1; w++) {
+    const uint32_t word = sKey[wmsPad(w)];
+#pragma unroll
+    for (uint32_t k = 0; k < 4; k++) {
+      const uint32_t i = w * 4 + k, m = (word >> (8 * k)) & 0xff;
+      const uint32_t bit = (i >= c0 && i < c1) ? 1u << (m & 31) : 0u;
+#pragma unroll
+      for (uint32_t j = 0; j < 8; j++) p[j] |= (m >> 5) == j ? bit : 0u;
+    }
+  }
+}
+
+// How many rows of [c0, c1) have key b.
+__device__ __forceinline__ uint32_t wmsCount(const uint32_t* sKey, uint32_t c0, uint32_t c1,
+                                             uint32_t b) {
+  uint32_t c = 0;
+  for (uint32_t w = c0 >> 2; w * 4 < c1; w++) {
+    const uint32_t word = sKey[wmsPad(w)];
+#pragma unroll
+    for (uint32_t k = 0; k < 4; k++) {
+      const uint32_t i = w * 4 + k;
+      c += (i >= c0 && i < c1 && ((word >> (8 * k)) & 0xff) == b) ? 1u : 0u;
+    }
+  }
+  return c;
+}
+
+// Writes base + i for each row i of [c0, c1) with key b, in order, from perm[p].
+__device__ __forceinline__ void wmsWrite(const uint32_t* sKey, uint32_t c0, uint32_t c1, uint32_t b,
+                                         uint32_t base, uint32_t* perm, uint32_t p) {
+  for (uint32_t w = c0 >> 2; w * 4 < c1; w++) {
+    const uint32_t word = sKey[wmsPad(w)];
+#pragma unroll
+    for (uint32_t k = 0; k < 4; k++) {
+      const uint32_t i = w * 4 + k;
+      if (i >= c0 && i < c1 && ((word >> (8 * k)) & 0xff) == b) perm[p++] = base + i;
+    }
+  }
+}
+
+__device__ __forceinline__ uint32_t wmsWaveScan(uint32_t c, uint32_t lane) {
+  uint32_t incl = c;
+#pragma unroll
+  for (int d = 1; d < 32; d <<= 1) {
+    const uint32_t o = __shfl_up(incl, d, 32);
+    if (lane >= (uint32_t)d) incl += o;
+  }
+  return incl;
+}
+
+// One wave ranks rows [lo, lo + L) of the superwindow (base: its first row) into perm by (key,
+// row): lane l owns a contiguous chunk, and per key present a wave prefix sum over the chunks'
+// counts gives each lane's first slot. Wave-uniform control flow.
+__device__ void wmsRankWave(const uint32_t* sKey, uint32_t lo, uint32_t L, uint32_t base,
+                            uint32_t* perm) {
+  const uint32_t lane = threadIdx.x & 31;
+  // Chunks of E rows (a multiple of 4, so each starts at an LDS word).
+  const uint32_t E = (((L + 31) >> 5) + 3) & ~3u;
+  const uint32_t c0 = min(lo + lane * E, lo + L), c1 = min(c0 + E, lo + L);
+  uint32_t p[8];
+  wmsScan(sKey, c0, c1, p);
+#pragma unroll
+  for (int j = 0; j < 8; j++)
+#pragma unroll
+    for (int d = 16; d > 0; d >>= 1) p[j] |= __shfl_xor(p[j], d, 32);
+  uint32_t pos0 = base + lo;  // first output slot of the current key
+#pragma unroll
+  for (int j = 0; j < 8; j++) {
+    for (uint32_t bits = p[j]; bits; bits &= bits - 1) {  // wave-uniform
+      const uint32_t b = j * 32 + __builtin_ctz(bits);
+      const uint32_t c = wmsCount(sKey, c0, c1, b);
+      const uint32_t incl = wmsWaveScan(c, lane);
+      const uint32_t tot = __shfl(incl, 31, 32);
+      if (c) wmsWrite(sKey, c0, c1, b, base, perm, pos0 + incl - c);
+      pos0 += tot;
+    }
+  }
+}
+
+// The same with the whole block (thread t owns a chunk; block reductions and prefix sums through
+// sRed, which holds at least 8 + blockDim.x / 32 words). Block-uniform control flow.
+__device__ void wmsRankBlock(const uint32_t* sKey, uint32_t lo, uint32_t L, uint32_t base,
+                             uint32_t* perm, uint32_t* sRed) {
+  const uint32_t t = threadIdx.x, lane = t & 31, wave = t >> 5, nWaves = blockDim.x >> 5;
+  const uint32_t E = (((L + blockDim.x - 1) / blockDim.x) + 3) & ~3u;
+  const uint32_t c0 = min(lo + t * E, lo + L), c1 = min(c0 + E, lo + L);
+  uint32_t p[8];
+  wmsScan(sKey, c0, c1, p);
+#pragma unroll
+  for (int j = 0; j < 8; j++)
+#pragma unroll
+    for (int d = 16; d > 0; d >>= 1) p[j] |= __shfl_xor(p[j], d, 32);
+  if (t < 8) sRed[t] = 0;
+  __syncthreads();
+  if (lane < 8) {
+#pragma unroll
+    for (int j = 0; j < 8; j++)
+      if (lane == (uint32_t)j) atomicOr(&sRed[j], p[j]);
+  }
+  __syncthreads();
+#pragma unroll
+  for (int j = 0; j < 8; j++) p[j] = sRed[j];
+  uint32_t pos0 = base + lo;
+#pragma unroll
+  for (int j = 0; j < 8; j++) {
+    for (uint32_t bits = p[j]; bits; bits &= bits - 1) {  // block-uniform
+      const uint32_t b = j * 32 + __builtin_ctz(bits);
+      const uint32_t c = wmsCount(sKey, c0, c1, b);
+      const uint32_t incl = wmsWaveScan(c, lane);
+      __syncthreads();  // the previous key's reads of sRed are done
+      if (lane == 31) sRed[8 + wave] = incl;
+      __syncthreads();
+      uint32_t off = 0, tot = 0;
+      for (uint32_t w = 0; w < nWaves; w++) {
+        const uint32_t v = sRed[8 + w];
+        off += w < wave ? v : 0u;
+        tot += v;
+      }
+      if (c) wmsWrite(sKey, c0, c1, b, base, perm, pos0 + off + incl - c);
+      pos0 += tot;
+    }
+  }
+  __syncthreads();  // sRed[0..7] is reset by the next call
+}
+
+// One 256-thread block per superwindow of 2^S rows. wminor: par_stepExec's keys are
+// (min(major, 31), minor & 7) instead of the major (second byte array; S <= kWmsMinorMaxBits).
+__global__ void __launch_bounds__(256) wmsSort(const PreflightCycle* __restrict__ cycles,
+                                               uint32_t S,
+                                               uint32_t* __restrict__ permW, uint32_t nW, uint32_t winW,
+                                               uint32_t* __restrict__ permA, uint32_t nA, uint32_t winA,
+                                               uint32_t wminor, WmsInject inj) {
+  extern __shared__ uint32_t sMaj[];  // wmsLdsWords(S) words per byte array
+  __shared__ uint32_t sRed[8 + 32];
+  uint32_t* sMin = sMaj + wmsLdsWords(S);
+  const uint32_t base = blockIdx.x << S;
+  const uint32_t nMax = nW > nA ? nW : nA;
+  const uint32_t len = min(1u << S, nMax - base);
+  uint8_t* sb = reinterpret_cast<uint8_t*>(sMaj);
+  uint8_t* sm = reinterpret_cast<uint8_t*>(sMin);
+  for (uint32_t i = threadIdx.x; i < len; i += blockDim.x) {
+    const PreflightCycle& c = cycles[base + i];
+    const uint32_t at = wmsPad(i >> 2) * 4 + (i & 3);
+    sb[at] = c.major;
+    if (wminor) sm[at] = uint8_t((min(uint32_t(c.major), 31u) << 3) | (c.minor & 7u));
+    if (inj.data) {
+      // As injectCycleCols (rows [0, nA): nA = lastCycle).
+      const uint32_t row = base + i;
+      const size_t rows = inj.rows;
+      inj.data[size_t(inj.cCycle) * rows + row] = Fp(row);
+      inj.data[size_t(inj.cPcLow) * rows + row] = Fp(c.pc & 0xffff);
+      inj.data[size_t(inj.cPcHigh) * rows + row] = Fp(c.pc >> 16);
+      inj.data[size_t(inj.cState) * rows + row] = Fp(c.state);
+      inj.data[size_t(inj.cMode) * rows + row] = Fp(uint32_t(c.machineMode));
+    }
+  }
+  __syncthreads();
+  const uint32_t* sW = wminor ? sMin : sMaj;
+  // Large windows: the whole block, one window after another.
+  for (int k = 0; k < 2; k++) {
+    uint32_t* perm = k ? permA : permW;
+    const uint32_t win = k ? winA : winW, n = k ? nA : nW;
+    if (!perm || win < kWmsBlockBits) continue;
+    for (uint32_t lo = 0; lo < (1u << S) && base + lo < n; lo += 1u << win)
+      wmsRankBlock(k ? sMaj : sW, lo, min(1u << win, n - base - lo), base, perm, sRed);
+  }
+  // Small windows: one wave each.
+  const uint32_t wave = threadIdx.x >> 5, nWaves = blockDim.x >> 5;
+  const uint32_t jobsW = (permW && winW < kWmsBlockBits) ? (1u << (S - winW)) : 0;
+  const uint32_t jobsA = (permA && winA < kWmsBlockBits) ? (1u << (S - winA)) : 0;
+  for (uint32_t j = wave; j < jobsW + jobsA; j += nWaves) {
+    const bool isW = j < jobsW;
+    const uint32_t win = isW ? winW : winA, n = isW ? nW : nA;
+    const uint32_t lo = (isW ? j : j - jobsW) << win;  // window start in the superwindow
+    if (base + lo >= n) continue;
+    wmsRankWave(isW ? sW : sMaj, lo, min(1u << win, n - base - lo), base, isW ? permW : permA);
+  }
+}
+
+// Launches wmsSort: permW (null: none) gets [0, nW) in 2^winW-row windows, permA [0, nA) in
+// 2^winA-row windows; winW, winA <= kWmsMaxBits (winW is ignored when permW is null). wminor:
+// permW by (major, minor), when the superwindow is at most 2^kWmsMinorMaxBits rows (else by major).
+static inline void wmsLaunch(const PreflightCycle* cycles, uint32_t* permW, uint32_t nW, uint32_t winW,
+                             uint32_t* permA, uint32_t nA, uint32_t winA, bool wminor,
+                             const WmsInject& inj, hipStream_t stream) {
+  const uint32_t S = permW ? (winW > winA ? winW : winA) : winA;
+  const uint32_t nMax = permW && nW > nA ? nW : nA;
+  const uint32_t blocks = (nMax + (1u << S) - 1) >> S;
+  const uint32_t two = (wminor && permW && S <= kWmsMinorMaxBits) ? 1u : 0u;
+  wmsSort<<<blocks, 256, wmsLdsWords(S) * 4 * (1 + two), stream>>>(cycles, S, permW, nW, winW, permA,
+                                                                   nA, winA, two, inj);
+}
+
+// RISC0_HIP_LSORT_CHECK=1: also build each permutation with the hipcub path and compare (a host
+// sync per segment; for validation).
+__global__ void wmsCompare(const uint32_t* a, const uint32_t* b, uint32_t n, uint32_t* bad) {
+  uint32_t i = blockDim.x * blockIdx.x + threadIdx.x;
+  if (i < n && a[i] != b[i]) atomicAdd(bad, 1u);
+}
+
+static bool lsortOn() {
+  static const bool on = [] {
+    const char* e = getenv("RISC0_HIP_LSORT");
+    return !(e && e[0] == '0');
   }();
-  return win;
+  return on;
+}
+
+// RISC0_HIP_WITGEN_MINOR=1: par_stepExec's windows ordered by (major, minor) instead of the major
+// (step_Top's arms also branch on the minor), when the superwindow is at most 2^kWmsMinorMaxBits rows.
+static bool witgenMinor() {
+  static const bool on = [] {
+    const char* e = getenv("RISC0_HIP_WITGEN_MINOR");
+    return e && e[0] == '1';
+  }();
+  return on;
+}
+
+static bool lsortCheck() {
+  static const bool on = [] {
+    const char* e = getenv("RISC0_HIP_LSORT_CHECK");
+    return e && e[0] == '1';
+  }();
+  return on;
+}
+
+// The accum permutation wmsSort made at witgen, for the accum of the same trace (the device
+// preflight `cycles`, `n` cycles, window `win`); consumed once.
+struct WmsState {
+  uint32_t* perm[2] = {nullptr, nullptr};  // 0: witgen, 1: accum
+  size_t cap[2] = {0, 0};
+  uint32_t* bad = nullptr;
+  const PreflightCycle* accumCycles = nullptr;
+  uint32_t accumN = 0, accumWin = 0;
+  bool accumValid = false;
+};
+static WmsState s_wms[16];
+
+static uint32_t wmsCheckCount(const uint32_t* a, const uint32_t* b, uint32_t n, cudaStream_t stream) {
+  WmsState& st = s_wms[getCachedDevice()];
+  if (!st.bad) CUDA_OK(hipMalloc(&st.bad, sizeof(uint32_t)));
+  CUDA_OK(hipMemsetAsync(st.bad, 0, sizeof(uint32_t), stream));
+  auto cfg = getSimpleConfig(n);
+  wmsCompare<<<cfg.grid, cfg.block, 0, stream>>>(a, b, n, st.bad);
+  uint32_t h = 0;
+  CUDA_OK(hipMemcpyAsync(&h, st.bad, sizeof(uint32_t), hipMemcpyDeviceToHost, stream));
+  CUDA_OK(hipStreamSynchronize(stream));
+  return h;
+}
+
+// Witgen: both permutations in one launch when RISC0_HIP_LSORT is on and both windows are at most
+// 2^kWmsMaxBits rows; returns false otherwise (the caller sorts as before). *wperm: par_stepExec's
+// permutation (nullptr when winW is 0 or nW <= 1).
+static bool wmsEligible(uint32_t winW, uint32_t nA) {
+  return lsortOn() && winW <= kWmsMaxBits && accumSortWin() <= kWmsMaxBits && nA > 0;
+}
+
+// inj: injectCycleCols' columns to write too (data null: none; the caller injects them itself).
+static bool wmsWitgen(const PreflightCycle* cycles, uint32_t nW, uint32_t winW, uint32_t nA,
+                      cudaStream_t stream, const uint32_t** wperm, const WmsInject& inj) {
+  const uint32_t winA = accumSortWin();
+  if (!wmsEligible(winW, nA)) return false;
+  WmsState& st = s_wms[getCachedDevice()];
+  st.accumValid = false;
+  const bool doW = winW && nW > 1;
+  const size_t need[2] = {doW ? nW : 0u, nA};
+  for (int k = 0; k < 2; k++) {
+    if (need[k] > st.cap[k]) {
+      if (st.perm[k]) CUDA_OK(hipFree(st.perm[k]));
+      st.perm[k] = nullptr;
+      st.cap[k] = 0;
+      CUDA_OK(hipMalloc(&st.perm[k], need[k] * sizeof(uint32_t)));
+      st.cap[k] = need[k];
+    }
+  }
+  wmsLaunch(cycles, doW ? st.perm[0] : nullptr, nW, winW, st.perm[1], nA, winA, witgenMinor(), inj,
+            stream);
+  CUDA_OK(cudaGetLastError());
+  *wperm = doW ? st.perm[0] : nullptr;
+  if (lsortCheck() && doW && !witgenMinor()) {
+    const uint32_t* ref = hipMajorPerm(0, cycles, nW, winW, stream);
+    uint32_t bad = wmsCheckCount(st.perm[0], ref, nW, stream);
+    fprintf(stderr, "[lsort-check] witgen n=%u win=%u mismatches=%u\n", nW, winW, bad);
+  }
+  st.accumCycles = cycles;
+  st.accumN = nA;
+  st.accumWin = winA;
+  st.accumValid = true;
+  return true;
+}
+
+// Accum: wmsSort's permutation for this trace, if the witgen made one (consumed), else nullptr.
+static uint32_t* wmsAccum(const PreflightCycle* cycles, uint32_t n) {
+  WmsState& st = s_wms[getCachedDevice()];
+  if (!st.accumValid || st.accumCycles != cycles || st.accumN != n || st.accumWin != accumSortWin())
+    return nullptr;
+  st.accumValid = false;
+  return st.perm[1];
 }
 #endif
 
@@ -855,6 +1213,36 @@ static bool envOn(const char* name) {
 static bool accumTu() {
   static const bool on = envOn("RISC0_HIP_ACCUM_TU");
   return on;
+}
+#endif
+
+#ifdef __HIPCC__
+// ROCm: par_stepExec's first and second launches run witgen_tu.cu's copy of step_Top's call graph
+// (build.rs: static functions in their own TU, global rather than FLAT buffer accesses with the
+// same per-access compiler barriers, buffers.h). Default (RISC0_HIP_WITGEN_TU=2, witgen_tu2's
+// par_stepExecW2): force-inlined with launch bounds (256, 1): 256 VGPRs, 16 KB of LDS (no
+// __shared__ in the source: promoted private arrays) and 3.3 KB instead of 11.6 KB of scratch per
+// lane. Fib 1M succinct, phase 1 per segment: RX 7900 XTX 7.42 -> 4.62 ms, RX 9070 XT 7.24 -> 4.82
+// ms (phase 2 173 -> 78 and 137 -> 61 us). RISC0_HIP_WITGEN_TU=1 (witgen_tu's par_stepExecW):
+// inlined at the compiler's discretion with (256, 8) (the same 192-VGPR cap as par_stepExec): 6.02
+// / 6.07 ms (117 / 103 us). 0: steps.cu's par_stepExec. Measured and not used: the noinline call
+// graph (as on CUDA) 9.31 / 8.20 ms, discretionary inlining with (256, 1) 7.37 / 6.44 ms.
+static int hipWitgenTu() {
+  static const int v = [] {
+    const char* e = getenv("RISC0_HIP_WITGEN_TU");
+    int x = e ? atoi(e) : 2;
+    return (x >= 0 && x <= 2) ? x : 2;
+  }();
+  return v;
+}
+
+static void hipLaunchWitgenTu(int v, unsigned grid, unsigned block, cudaStream_t stream, void* ctx,
+                              uint32_t start, uint32_t count, const uint32_t* perm) {
+  if (v == 2)
+    risc0_rv32im_launch_par_stepExecTU2(grid, block, stream, ctx, start, count, perm);
+  else
+    risc0_rv32im_launch_par_stepExecTU(grid, block, stream, ctx, start, count, perm);
+  CUDA_OK(cudaGetLastError());
 }
 #endif
 
@@ -1100,7 +1488,24 @@ const char* risc0_circuit_rv32im_cuda_witgen_v2(uint32_t mode,
         buffers, preflight, lastCycle, stream, reinterpret_cast<const char*>(staged), staged_id);
     auto t1 = std::chrono::steady_clock::now();
     size_t split = preflight->tableSplitCycle;
+#ifdef __HIPCC__
+    // RISC0_HIP_LSORT: wmsSort (parallel mode) writes these columns from its read of the cycles.
+    WmsInject inj;
+    const bool fuseInject =
+        cycle_cols && mode == kStepModeParallel && wmsEligible(witgenSortWin(), lastCycle);
+    if (fuseInject) {
+      inj.data = buffers->data.buf;
+      inj.rows = buffers->data.rows;
+      inj.cCycle = cycle_cols[0];
+      inj.cPcLow = cycle_cols[1];
+      inj.cPcHigh = cycle_cols[2];
+      inj.cState = cycle_cols[3];
+      inj.cMode = cycle_cols[4];
+    }
+    if (cycle_cols && !fuseInject) {
+#else
     if (cycle_cols) {
+#endif
       auto cfg = getSimpleConfig(lastCycle);
       injectCycleCols<<<cfg.grid, cfg.block, 0, stream>>>(
           buffers->data.buf, get_cache().a_cycles, lastCycle, buffers->data.rows,
@@ -1108,6 +1513,9 @@ const char* risc0_circuit_rv32im_cuda_witgen_v2(uint32_t mode,
       CUDA_OK(cudaGetLastError());
     }
 
+#ifdef __HIPCC__
+    s_wms[getCachedDevice()].accumValid = false;  // set again below by wmsWitgen
+#endif
     switch (mode) {
     case kStepModeParallel: {
       size_t phase2Count = lastCycle - split;
@@ -1129,16 +1537,36 @@ const char* risc0_circuit_rv32im_cuda_witgen_v2(uint32_t mode,
         {
 #ifdef __HIPCC__
           const uint32_t win = witgenSortWin();
-          const uint32_t* wperm =
-              (win && split > 1) ? hipMajorPerm(0, get_cache().a_cycles, split, win, stream) : nullptr;
+          const uint32_t* wperm = nullptr;
+          if (!wmsWitgen(get_cache().a_cycles, split, win, lastCycle, stream, &wperm, inj)) {
+            if (inj.data) {  // not expected: fuseInject implies wmsWitgen runs
+              auto cfg = getSimpleConfig(lastCycle);
+              injectCycleCols<<<cfg.grid, cfg.block, 0, stream>>>(
+                  inj.data, get_cache().a_cycles, lastCycle, inj.rows, inj.cCycle, inj.cPcLow,
+                  inj.cPcHigh, inj.cState, inj.cMode);
+            }
+            wperm = (win && split > 1) ? hipMajorPerm(0, get_cache().a_cycles, split, win, stream)
+                                       : nullptr;
+          }
+          // witgen_tu.cu's par_stepExecW2 unless RISC0_HIP_WITGEN_TU=0/1 (see hipWitgenTu).
+          const int wtu = hipWitgenTu();
+          auto isPow2 = [](size_t r) { return r && (r & (r - 1)) == 0; };
+          const bool pow2rows = isPow2(buffers->data.rows) &&
+              isPow2(buffers->pre_data.rows ? buffers->pre_data.rows : buffers->data.rows);
           // Each phase on a side hardware queue (hip_hop.h) when large: they run ~2-5 ms each.
           {
             risc0_hip_hop::Scope s(stream, risc0_hip_hop::want(risc0_hip_hop::kRvWitgen, split, 18));
-            par_stepExec<<<cfg1.grid, cfg1.block, 0, s>>>(d_ctx, 0, split, wperm);
+            if (wtu && pow2rows)
+              hipLaunchWitgenTu(wtu, cfg1.grid.x, cfg1.block.x, s, d_ctx, 0, split, wperm);
+            else
+              par_stepExec<<<cfg1.grid, cfg1.block, 0, s>>>(d_ctx, 0, split, wperm);
           }
           {
             risc0_hip_hop::Scope s(stream, risc0_hip_hop::want(risc0_hip_hop::kRvWitgen, phase2Count, 18));
-            par_stepExec<<<cfg2.grid, cfg2.block, 0, s>>>(d_ctx, split, phase2Count);
+            if (wtu && pow2rows)
+              hipLaunchWitgenTu(wtu, cfg2.grid.x, cfg2.block.x, s, d_ctx, split, phase2Count, nullptr);
+            else
+              par_stepExec<<<cfg2.grid, cfg2.block, 0, s>>>(d_ctx, split, phase2Count);
           }
 #else
           par_stepExec<<<cfg1.grid, cfg1.block, 0, stream>>>(d_ctx, 0, split);
@@ -1240,7 +1668,11 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
       static size_t s_cap[16] = {};
       static void* s_sort_temp[16] = {};
       static size_t s_sort_temp_bytes[16] = {};
-      {
+      // The permutation wmsSort already made at witgen (RISC0_HIP_LSORT), if any.
+      uint32_t* fused = wmsAccum(get_cache().a_cycles, lastCycle);
+      if (fused && !lsortCheck()) {
+        perm = fused;
+      } else {
         int dev = getCachedDevice();
         if (lastCycle > s_cap[dev]) {
           for (int b = 0; b < 2; b++) {
@@ -1271,6 +1703,11 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
         CUDA_OK(hipcub::DeviceRadixSort::SortPairs(
             s_sort_temp[dev], temp_bytes, keys, vals, int(lastCycle), 0, endBit, stream));
         perm = vals.Current();
+        if (fused) {
+          uint32_t bad = wmsCheckCount(fused, perm, lastCycle, stream);
+          fprintf(stderr, "[lsort-check] accum n=%u win=%u mismatches=%u\n", lastCycle, win, bad);
+          perm = fused;
+        }
       }
 #endif
       // accum_tu.cu: the stepAccum call graph force-inlined in a whole-program TU (no ABI
@@ -1381,6 +1818,7 @@ const char* risc0_circuit_rv32im_cuda_warmup() {
     stepAccum<<<1, 1, 0, stream>>>(nullptr, 0);
     risc0_rv32im_launch_stepAccumTU(1, 1, stream, nullptr, 0, nullptr);
     finalizeZeroizeAccum<<<1, 1, 0, stream>>>(nullptr, 0);
+    if (int v = hipWitgenTu()) hipLaunchWitgenTu(v, 1, 1, stream, nullptr, 0, 0, nullptr);
 #endif
     injectCycleCols<<<1, 1, 0, stream>>>(nullptr, nullptr, 0, 0, 0, 0, 0, 0, 0);
     majorKeys<<<1, 1, 0, stream>>>(nullptr, nullptr, nullptr, 0, 0);
