@@ -40,7 +40,7 @@ use risc0_sys::{
     },
 };
 
-use super::{tracker, Buffer, Hal};
+use super::{tracker, Buffer, GatherJob, Hal};
 use crate::{
     core::{
         digest::Digest,
@@ -278,6 +278,80 @@ fn release_buffer_pools(device_only: bool) {
     // Take the pools out first, so the hipFrees run without the lock held.
     let pools = std::mem::take(&mut *buffer_pools());
     drop(pools);
+    release_prefilled();
+}
+
+/// A pooled buffer refilled in the background for a later `alloc_elem_init` of the same size and
+/// value ([HipHal::prefill_elem]): the fill runs on a side hardware queue beside the kernels then
+/// in flight instead of in front of the allocation's first use.
+struct Prefilled {
+    device: i32,
+    bytes: usize,
+    value: u32,
+    buf: HipDeviceBuffer,
+    /// The fill's completion event (hipEvent_t), 0 if it was queued on the persistent stream.
+    done: usize,
+}
+
+static PREFILLED: Mutex<Vec<Prefilled>> = Mutex::new(Vec::new());
+
+extern "C" {
+    fn risc0_zkp_hip_fill_fork(
+        buf: DevicePointer<u8>,
+        value: u32,
+        count: usize,
+        done: *mut *mut std::os::raw::c_void,
+    ) -> *const std::os::raw::c_char;
+    fn risc0_zkp_hip_fill_join(
+        done: *mut std::os::raw::c_void,
+        host: u32,
+    ) -> *const std::os::raw::c_char;
+}
+
+/// `RISC0_HIP_PREFILL=0` turns [HipHal::prefill_elem] off.
+fn prefill_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(
+        || !matches!(std::env::var("RISC0_HIP_PREFILL").as_deref(), Ok(v) if v.starts_with('0')),
+    )
+}
+
+fn prefilled() -> MutexGuard<'static, Vec<Prefilled>> {
+    PREFILLED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Bytes held prefilled for this thread's device.
+fn prefilled_bytes() -> usize {
+    let device = get_device_for_thread();
+    prefilled()
+        .iter()
+        .filter(|p| p.device == device)
+        .map(|p| p.bytes)
+        .sum()
+}
+
+/// Free every prefilled buffer (after its fill completes): they are pooled memory.
+fn release_prefilled() {
+    let all = std::mem::take(&mut *prefilled());
+    for p in all {
+        ffi_wrap(|| unsafe { risc0_zkp_hip_fill_join(p.done as *mut _, 1) }).unwrap();
+        drop(p.buf);
+    }
+}
+
+/// A prefilled buffer of `bytes` filled with `value` on this thread's device, with the persistent
+/// stream ordered after its fill.
+fn take_prefilled(bytes: usize, value: u32) -> Option<HipDeviceBuffer> {
+    let device = get_device_for_thread();
+    let p = {
+        let mut all = prefilled();
+        let i = all
+            .iter()
+            .position(|p| p.device == device && p.bytes == bytes && p.value == value)?;
+        all.remove(i)
+    };
+    ffi_wrap(|| unsafe { risc0_zkp_hip_fill_join(p.done as *mut _, 0) }).unwrap();
+    Some(p.buf)
 }
 
 /// Caches kept outside this HAL's pool by the circuit crates: device scratch of their kernel
@@ -326,7 +400,7 @@ fn release_pool_unless_fits(size: usize) {
     if size < BUFFER_POOL_SMALL_THRESHOLD {
         return;
     }
-    let pooled = pooled_bytes();
+    let pooled = pooled_bytes() + prefilled_bytes();
     if pooled == 0 {
         return;
     }
@@ -927,6 +1001,21 @@ impl<HH: HipHash + ?Sized> Hal for HipHal<HH> {
         size: usize,
         value: Self::Elem,
     ) -> Self::Buffer<Self::Elem> {
+        let bytes = size * std::mem::size_of::<Self::Elem>();
+        if let Some(buf) = take_prefilled(bytes, value.as_u32_montgomery()) {
+            tracing::trace!("alloc: {bytes} bytes, {name} (prefilled)");
+            tracker().lock().unwrap().alloc(bytes);
+            return BufferImpl {
+                buffer: Rc::new(RefCell::new(RawBuffer {
+                    name,
+                    device: get_device_for_thread(),
+                    buf: ManuallyDrop::new(buf),
+                })),
+                size,
+                offset: 0,
+                marker: PhantomData,
+            };
+        }
         let buffer = self.alloc_elem(name, size);
         // Use async fill on persistent stream to avoid device-wide sync from hipMemsetD32.
         extern "C" {
@@ -945,6 +1034,50 @@ impl<HH: HipHash + ?Sized> Hal for HipHal<HH> {
         })
         .unwrap();
         buffer
+    }
+
+    fn prefill_elem(&self, size: usize, value: Self::Elem) {
+        if !prefill_enabled() {
+            return;
+        }
+        let bytes = size * std::mem::size_of::<Self::Elem>();
+        let value = value.as_u32_montgomery();
+        let device = get_device_for_thread();
+        let mut all = prefilled();
+        if all
+            .iter()
+            .any(|p| p.device == device && p.bytes == bytes && p.value == value)
+        {
+            return;
+        }
+        // Only memory the pool already holds (a buffer just freed): never a new allocation.
+        let Some(buf) = buffer_pools()
+            .get_mut(&device)
+            .and_then(|pool| pool.pop(bytes))
+        else {
+            return;
+        };
+        let mut done: *mut std::os::raw::c_void = std::ptr::null_mut();
+        ffi_wrap(|| unsafe {
+            risc0_zkp_hip_fill_fork(buf.as_device_ptr(), value, size, &mut done)
+        })
+        .unwrap();
+        all.push(Prefilled {
+            device,
+            bytes,
+            value,
+            buf,
+            done: done as usize,
+        });
+        // Keep a few: older ones (another po2) go back to the pool.
+        let mine = all.iter().filter(|p| p.device == device).count();
+        if mine > 4 {
+            let i = all.iter().position(|p| p.device == device).unwrap();
+            let p = all.remove(i);
+            drop(all);
+            ffi_wrap(|| unsafe { risc0_zkp_hip_fill_join(p.done as *mut _, 1) }).unwrap();
+            buffer_pools().entry(device).or_default().push(p.bytes, p.buf);
+        }
     }
 
     fn copy_from_elem(&self, name: &'static str, slice: &[Self::Elem]) -> Self::Buffer<Self::Elem> {
@@ -1215,6 +1348,94 @@ impl<HH: HipHash + ?Sized> Hal for HipHal<HH> {
         } else {
             usize::MAX
         }
+    }
+
+    fn gather_multi(&self, jobs: &[GatherJob<'_, Self>]) -> Option<Vec<(Vec<Self::Elem>, Vec<Digest>)>> {
+        // RISC0_HIP_GATHER_MULTI=0: one round trip per gather, as before.
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| {
+            !matches!(std::env::var("RISC0_HIP_GATHER_MULTI").as_deref(), Ok(v) if v.starts_with('0'))
+        }) {
+            return None;
+        }
+        // One index upload, every gather kernel into one output buffer, one download: per job,
+        // its rows then its node indices; its samples then its digests (8 words each).
+        let mut idx: Vec<u32> = Vec::new();
+        let mut layout = Vec::with_capacity(jobs.len());
+        let mut words = 0usize;
+        for j in jobs {
+            let ri = idx.len();
+            idx.extend(j.rows.iter().map(|&r| r as u32));
+            let ni = idx.len();
+            idx.extend(j.node_indices.iter().map(|&k| k as u32));
+            let so = words;
+            words += j.rows.len() * j.col_size;
+            let dofs = words;
+            words += j.node_indices.len() * 8;
+            layout.push((ri, ni, so, dofs));
+        }
+        if idx.is_empty() || words == 0 {
+            return None;
+        }
+        extern "C" {
+            fn risc0_zkp_cuda_gather_samples(
+                dst: DevicePointer<u8>,
+                src: DevicePointer<u8>,
+                idxs: DevicePointer<u8>,
+                n: u32,
+                size: u32,
+                stride: u32,
+            ) -> *const std::os::raw::c_char;
+            fn risc0_zkp_cuda_gather_digests(
+                dst: DevicePointer<u8>,
+                src: DevicePointer<u8>,
+                indices: DevicePointer<u8>,
+                count: u32,
+            ) -> *const std::os::raw::c_char;
+        }
+        let idx_buf = self.copy_from_u32("gather_multi_idx", &idx);
+        let out: BufferImpl<u32> = BufferImpl::new("gather_multi_out", words);
+        for (j, &(ri, ni, so, dofs)) in jobs.iter().zip(&layout) {
+            if !j.rows.is_empty() && j.col_size > 0 {
+                ffi_wrap(|| unsafe {
+                    risc0_zkp_cuda_gather_samples(
+                        out.as_device_ptr_with_offset(so),
+                        j.matrix.as_device_ptr(),
+                        idx_buf.as_device_ptr_with_offset(ri),
+                        j.rows.len() as u32,
+                        j.col_size as u32,
+                        j.row_size as u32,
+                    )
+                })
+                .unwrap();
+            }
+            if !j.node_indices.is_empty() {
+                ffi_wrap(|| unsafe {
+                    risc0_zkp_cuda_gather_digests(
+                        out.as_device_ptr_with_offset(dofs),
+                        j.nodes.as_device_ptr(),
+                        idx_buf.as_device_ptr_with_offset(ni),
+                        j.node_indices.len() as u32,
+                    )
+                })
+                .unwrap();
+            }
+        }
+        // The download (legacy stream) follows the kernels on the blocking persistent stream.
+        let host = out.to_vec();
+        drop(idx_buf);
+        Some(
+            jobs.iter()
+                .zip(&layout)
+                .map(|(j, &(_, _, so, dofs))| {
+                    let cols: &[BabyBearElem] =
+                        unchecked_cast(&host[so..so + j.rows.len() * j.col_size]);
+                    let digests: &[Digest] =
+                        unchecked_cast(&host[dofs..dofs + j.node_indices.len() * 8]);
+                    (cols.to_vec(), digests.to_vec())
+                })
+                .collect(),
+        )
     }
 
     fn batch_get_digest_at(&self, buf: &Self::Buffer<Digest>, indices: &[usize]) -> Vec<Digest> {

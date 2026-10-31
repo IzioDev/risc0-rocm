@@ -1116,8 +1116,15 @@ const char* risc0_circuit_rv32im_cuda_witgen_v2(uint32_t mode,
           const uint32_t win = witgenSortWin();
           const uint32_t* wperm =
               (win && split > 1) ? hipMajorPerm(0, get_cache().a_cycles, split, win, stream) : nullptr;
-          par_stepExec<<<cfg1.grid, cfg1.block, 0, stream>>>(d_ctx, 0, split, wperm);
-          par_stepExec<<<cfg2.grid, cfg2.block, 0, stream>>>(d_ctx, split, phase2Count);
+          // Each phase on a side hardware queue (hip_hop.h) when large: they run ~2-5 ms each.
+          {
+            risc0_hip_hop::Scope s(stream, risc0_hip_hop::want(risc0_hip_hop::kRvWitgen, split, 18));
+            par_stepExec<<<cfg1.grid, cfg1.block, 0, s>>>(d_ctx, 0, split, wperm);
+          }
+          {
+            risc0_hip_hop::Scope s(stream, risc0_hip_hop::want(risc0_hip_hop::kRvWitgen, phase2Count, 18));
+            par_stepExec<<<cfg2.grid, cfg2.block, 0, s>>>(d_ctx, split, phase2Count);
+          }
 #else
           par_stepExec<<<cfg1.grid, cfg1.block, 0, stream>>>(d_ctx, 0, split);
           par_stepExec<<<cfg2.grid, cfg2.block, 0, stream>>>(d_ctx, split, phase2Count);
@@ -1256,15 +1263,20 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
       // accum_tu_gen.py). It needs power-of-two rows (RISC0_ROWS_POW2): rows = 2^po2.
       auto pow2 = [](size_t r) { return r && (r & (r - 1)) == 0; };
 #ifdef __HIPCC__
+      {
+      // On a side hardware queue (hip_hop.h) when large (~4 ms at 2^20 cycles).
+      risc0_hip_hop::Scope s(stream, risc0_hip_hop::want(risc0_hip_hop::kRvAccum, lastCycle, 18));
       if (!accumTu() || !pow2(buffers->data.rows) || !pow2(buffers->accum.rows)) {
-        stepAccum<<<cfg.grid, cfg.block, 0, stream>>>(d_ctx, lastCycle, perm);
+        stepAccum<<<cfg.grid, cfg.block, 0, s>>>(d_ctx, lastCycle, perm);
       } else
+        risc0_rv32im_launch_stepAccumTU(cfg.grid.x, cfg.block.x, s, d_ctx, lastCycle, perm);
+      }
 #else
       if (!pow2(buffers->data.rows) || !pow2(buffers->accum.rows)) {
         throw std::runtime_error("rv32im accum: rows must be a power of two");
       }
-#endif
       risc0_rv32im_launch_stepAccumTU(cfg.grid.x, cfg.block.x, stream, d_ctx, lastCycle, perm);
+#endif
 
       size_t rows = buffers->accum.rows;
 #ifdef __HIPCC__
@@ -1306,7 +1318,16 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
 
       // finalizeAccum fused with the INVALID -> 0 zeroize of the accum buffer.
       auto cfgz = getSimpleConfig(rows);
+#ifdef __HIPCC__
+      {
+        // ~1.1 ms at 2^20 rows: on a side hardware queue (hip_hop.h); the event below is
+        // recorded on `stream` after the scope, so it still follows the kernel.
+        risc0_hip_hop::Scope s(stream, risc0_hip_hop::want(risc0_hip_hop::kRvAccum, rows, 20));
+        finalizeZeroizeAccum<<<cfgz.grid, cfgz.block, 0, s>>>(d_ctx, lastCycle);
+      }
+#else
       finalizeZeroizeAccum<<<cfgz.grid, cfgz.block, 0, stream>>>(d_ctx, lastCycle);
+#endif
       // Last reader of this segment's device preflight: a prefetch into its slot waits for this.
       if (DevSlot* sl = get_cache().a_slot) {
         std::lock_guard<std::recursive_mutex> lk(g_slots_mu);

@@ -20096,7 +20096,16 @@ static void launch_parts(cudaStream_t stream, uint32_t grid, uint32_t block, Fp*
                          const Fp* data, const Fp* accum, const Fp* mix, const Fp* out, Fp rou, uint32_t po2,
                          uint32_t domain) {
   if constexpr (P < kNumParts) {
+#ifdef __HIPCC__
+    {
+      // Each part (~1.4-5.6 ms at domain 2^20) on a side hardware queue (hip_hop.h): the next
+      // part, queued on `stream` after this scope, still follows it.
+      risc0_hip_hop::Scope s(stream, risc0_hip_hop::want(risc0_hip_hop::kRecCheck, domain, 18));
+      ec_part<P><<<grid, block, 0, s>>>(check, ctrl, data, accum, mix, out, rou, po2, domain);
+    }
+#else
     ec_part<P><<<grid, block, 0, stream>>>(check, ctrl, data, accum, mix, out, rou, po2, domain);
+#endif
     launch_parts<P + 1>(stream, grid, block, check, ctrl, data, accum, mix, out, rou, po2, domain);
   }
 }

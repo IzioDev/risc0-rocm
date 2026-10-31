@@ -1016,13 +1016,21 @@ struct HostExecContext {
     switch (mode) {
     case kStepModeParallel: {
 #ifdef __HIPCC__
-      if (recSort() && numCycles > 1) {
-        const uint32_t* perm = recSortedCycles(stream, ctx, numCycles, cfg);
-        parStepExecPerm<<<cfg.grid, cfg.block, 0, stream>>>(ctx, perm);
-        break;
+      {
+        // The sort's kernels go on `stream` before the hop scope opens, so the hopped
+        // kernel (which waits only for work recorded before the scope) sees the permutation.
+        const uint32_t* perm =
+            (recSort() && numCycles > 1) ? recSortedCycles(stream, ctx, numCycles, cfg) : nullptr;
+        // ~4-5 ms per lift/join (~2^18 cycles): on a side hardware queue (hip_hop.h).
+        risc0_hip_hop::Scope s(stream, risc0_hip_hop::want(risc0_hip_hop::kRecStep, size_t(cfg.grid.x) * cfg.block.x, 16));
+        if (perm)
+          parStepExecPerm<<<cfg.grid, cfg.block, 0, s>>>(ctx, perm);
+        else
+          parStepExec<<<cfg.grid, cfg.block, 0, s>>>(ctx);
       }
-#endif
+#else
       parStepExec<<<cfg.grid, cfg.block, 0, stream>>>(ctx);
+#endif
     } break;
     case kStepModeSeqForward: {
       fwdStepExec<<<cfg.grid, cfg.block, 0, stream>>>(ctx);
@@ -1280,18 +1288,29 @@ struct HostAccumContext {
 
   void computeAccum() {
     nvtx3::scoped_range range("computeAccum");
-    if (accumInl()) {
 #ifdef __HIPCC__
-      if (recAccumSort() && workCycles > 1) {
-        // Made again for the verify pass (cheap), so that it does not depend on the buffer's
-        // lifetime between the two calls.
-        const uint32_t* perm = recAccumPerm(stream, ctrlBuf, steps, workCycles);
-        risc0_recursion_launch_accum_inl_perm(0, cfg.grid.x, cfg.block.x, stream, ctx, perm);
-      } else
-#endif
+    {
+      // Made again for the verify pass (cheap), so that it does not depend on the buffer's
+      // lifetime between the two calls. Its kernels go on `stream` before the hop scope opens
+      // (the hopped kernel waits only for work recorded before the scope).
+      const uint32_t* perm = (accumInl() && recAccumSort() && workCycles > 1)
+                                 ? recAccumPerm(stream, ctrlBuf, steps, workCycles)
+                                 : nullptr;
+      // ~1 ms per lift/join: on a side hardware queue (hip_hop.h).
+      risc0_hip_hop::Scope s(stream, risc0_hip_hop::want(risc0_hip_hop::kRecStep, size_t(cfg.grid.x) * cfg.block.x, 16));
+      if (perm)
+        risc0_recursion_launch_accum_inl_perm(0, cfg.grid.x, cfg.block.x, s, ctx, perm);
+      else if (accumInl())
+        risc0_recursion_launch_accum_inl(0, cfg.grid.x, cfg.block.x, s, ctx);
+      else
+        parStepComputeAccum<<<cfg.grid, cfg.block, 0, s>>>(ctx);
+    }
+#else
+    if (accumInl()) {
       risc0_recursion_launch_accum_inl(0, cfg.grid.x, cfg.block.x, stream, ctx);
     } else
     parStepComputeAccum<<<cfg.grid, cfg.block, 0, stream>>>(ctx);
+#endif
     if (syncSteps()) {
       CUDA_OK(cudaStreamSynchronize(stream));
     } else {
@@ -1346,18 +1365,29 @@ struct HostAccumContext {
     nvtx3::scoped_range range("verifyAccum");
     if (syncSteps())
       CUDA_OK(cudaDeviceSynchronize());
-    if (accumInl()) {
 #ifdef __HIPCC__
-      if (recAccumSort() && workCycles > 1) {
-        // Made again for the verify pass (cheap), so that it does not depend on the buffer's
-        // lifetime between the two calls.
-        const uint32_t* perm = recAccumPerm(stream, ctrlBuf, steps, workCycles);
-        risc0_recursion_launch_accum_inl_perm(1, cfg.grid.x, cfg.block.x, stream, ctx, perm);
-      } else
-#endif
+    {
+      // Made again for the verify pass (cheap), so that it does not depend on the buffer's
+      // lifetime between the two calls. Its kernels go on `stream` before the hop scope opens
+      // (the hopped kernel waits only for work recorded before the scope).
+      const uint32_t* perm = (accumInl() && recAccumSort() && workCycles > 1)
+                                 ? recAccumPerm(stream, ctrlBuf, steps, workCycles)
+                                 : nullptr;
+      // ~1 ms per lift/join, then the host waits: on a side hardware queue (hip_hop.h).
+      risc0_hip_hop::Scope s(stream, risc0_hip_hop::want(risc0_hip_hop::kRecStep, size_t(cfg.grid.x) * cfg.block.x, 16));
+      if (perm)
+        risc0_recursion_launch_accum_inl_perm(1, cfg.grid.x, cfg.block.x, s, ctx, perm);
+      else if (accumInl())
+        risc0_recursion_launch_accum_inl(1, cfg.grid.x, cfg.block.x, s, ctx);
+      else
+        parStepVerifyAccum<<<cfg.grid, cfg.block, 0, s>>>(ctx);
+    }
+#else
+    if (accumInl()) {
       risc0_recursion_launch_accum_inl(1, cfg.grid.x, cfg.block.x, stream, ctx);
     } else
     parStepVerifyAccum<<<cfg.grid, cfg.block, 0, stream>>>(ctx);
+#endif
     CUDA_OK(cudaStreamSynchronize(stream));
   }
 };

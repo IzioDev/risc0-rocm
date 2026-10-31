@@ -35,6 +35,7 @@ static bool use_pv_kernels() {
 }
 
 #ifdef __HIPCC__
+#include "../hip_hop.h"
 // pv.cuh's kernels from their own TU (supra/pv_hip.cu, built with the max-ilp scheduler: 2-5% faster
 // on RDNA3/4), and the top layers of a fold tree in one launch (fold_tail_k).
 // RISC0_HIP_PV_TU: 0 = this file's instances (default scheduler) only, 1 = the max-ilp TU for every
@@ -86,15 +87,20 @@ static bool use_pv_q4() {
 }
 static constexpr uint32_t PV_Q4_MAX = 1024; // fold_q4_k up to this many digests
 static constexpr uint32_t PV_TAIL = 128; // fold_tail_k's block size limit
-static void hip_pv_rows(uint4* out, const uint32_t* m, uint32_t count, uint32_t col_size, hipStream_t s) {
-  if (use_pv_tu(size_t(count) * ((col_size + 15) / 16))) {
+// Launches of >= 2^19 permutations (~0.7-1 ms and up) run on a side hardware queue (hip_hop.h): the
+// following fold layer, or the host's gpu.sync(), would otherwise wait ~0.2 ms more.
+static void hip_pv_rows(uint4* out, const uint32_t* m, uint32_t count, uint32_t col_size, hipStream_t main) {
+  const size_t perms = size_t(count) * ((col_size + 15) / 16);
+  risc0_hip_hop::Scope s(main, risc0_hip_hop::want(risc0_hip_hop::kMerkleRows, perms, 19));
+  if (use_pv_tu(perms)) {
     pv_hip_rows(out, m, count, col_size, s);
   } else {
     uint32_t bs = count < PV_BLOCK ? count : PV_BLOCK;
     pv::rows_k<<<(count + bs - 1) / bs, bs, 0, s>>>(out, m, count, col_size);
   }
 }
-static void hip_pv_fold(uint4* out, const uint4* in, uint32_t n, hipStream_t s) {
+static void hip_pv_fold(uint4* out, const uint4* in, uint32_t n, hipStream_t main) {
+  risc0_hip_hop::Scope s(main, risc0_hip_hop::want(risc0_hip_hop::kMerkleFold, n, 19));
   if (n <= PV_Q4_MAX && use_pv_q4()) {
     pv_hip_fold_q4(out, in, n, s);
   } else if (use_pv_tu(n)) {

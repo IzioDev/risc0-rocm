@@ -62,6 +62,16 @@ pub trait Buffer<T>: Clone {
     fn set_bypass_pool(&self) {}
 }
 
+/// One Merkle tree's query gathers for [Hal::gather_multi].
+pub struct GatherJob<'a, H: Hal> {
+    pub matrix: &'a H::Buffer<H::Elem>,
+    pub col_size: usize,
+    pub row_size: usize,
+    pub rows: &'a [usize],
+    pub nodes: &'a H::Buffer<Digest>,
+    pub node_indices: &'a [usize],
+}
+
 pub trait Hal {
     type Field: Field<Elem = Self::Elem, ExtElem = Self::ExtElem>;
     type Elem: Elem + RootsOfUnity;
@@ -109,6 +119,11 @@ pub trait Hal {
         });
         buffer
     }
+
+    /// Hint that `alloc_elem_init` will soon be called with this `size` and `value` (e.g. by the
+    /// next segment): a HAL may fill a buffer it holds in the background now and hand it out
+    /// then. The default does nothing.
+    fn prefill_elem(&self, _size: usize, _value: Self::Elem) {}
 
     fn alloc_extelem_zeroed(&self, name: &'static str, size: usize) -> Self::Buffer<Self::ExtElem> {
         let buffer = self.alloc_extelem(name, size);
@@ -277,6 +292,18 @@ pub trait Hal {
     /// CUDA overrides this with a gather kernel + single D2H transfer.
     fn batch_get_digest_at(&self, buf: &Self::Buffer<Digest>, indices: &[usize]) -> Vec<Digest> {
         indices.iter().map(|&idx| buf.get_at(idx)).collect()
+    }
+
+    /// The Merkle query gathers of several trees in one host round trip, where the HAL supports
+    /// it (`None` otherwise): for each job, the `rows.len() * col_size` elements
+    /// `matrix[row + i * row_size]` (query-major, as `gather_samples`) and the digests at
+    /// `node_indices` (as `batch_get_digest_at`).
+    #[allow(clippy::type_complexity)]
+    fn gather_multi(&self, _jobs: &[GatherJob<'_, Self>]) -> Option<Vec<(Vec<Self::Elem>, Vec<Digest>)>>
+    where
+        Self: Sized,
+    {
+        None
     }
 
     fn scatter(
