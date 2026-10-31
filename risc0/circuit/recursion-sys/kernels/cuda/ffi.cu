@@ -776,6 +776,100 @@ struct CachedExecBuffers : ExecBuffersState {
 
 static thread_local CachedExecBuffers g_execCache;
 
+#ifdef __HIPCC__
+// Witgen inputs uploaded ahead of their proof (HIP; RISC0_HIP_REC_STAGE=0 turns it off). A recursion
+// proof's witgen used to start by copying its trace and host chains (~50 MB: ~1.4 ms of PCIe on an
+// RX 7900 XTX or RX 9070 XT) to the device while the GPU computed nothing. `prepare`, on its own
+// thread while the GPU proves the previous proof, now hands its page-locked copies to
+// risc0_circuit_recursion_hip_stage: they are copied into one of two slots' device buffers on a
+// non-blocking stream, and the witgen of that preflight claims the slot by the host addresses and
+// sizes of its inputs, waits for the copies' event on its stream and reads the slot's buffers. A
+// live preflight's page-locked buffer is its own (the pool hands a buffer to one owner at a time),
+// and a slot is cleared when its witgen is done with it or, if never claimed, when that buffer is
+// released (risc0_circuit_recursion_hip_unstage, which first waits for the copies), so a key can
+// never match another preflight's data. With both slots taken a preflight is not staged and its
+// witgen copies as before.
+static bool recStage() {
+  static const bool on = [] {
+    const char* e = std::getenv("RISC0_HIP_REC_STAGE");
+    return recAsync() && !(e && e[0] == '0');
+  }();
+  return on;
+}
+
+struct StagedInputs {
+  // Key: the preflight's page-locked arrays and their sizes.
+  const void* wom = nullptr;
+  uint32_t numWoms = 0, numCycles = 0, numIops = 0;
+  const void* heads = nullptr;
+  uint32_t numHeads = 0, numRows = 0, dataCols = 0;
+  int device = -1;
+  bool valid = false; // staged and not claimed
+  bool busy = false;  // claimed by a running witgen
+  FpExt* dWom = nullptr;
+  size_t womCap = 0;
+  PreflightCycle* dCycles = nullptr;
+  size_t cyclesCap = 0;
+  FpExt* dIops = nullptr;
+  size_t iopsCap = 0;
+  uint32_t* dHc = nullptr; // host chains, laid out as in applyHostChains
+  size_t hcCap = 0;        // words
+  cudaStream_t stream = nullptr;
+  cudaEvent_t done = nullptr;
+};
+
+constexpr int kStageSlots = 2;
+static std::mutex g_stageMu;
+static StagedInputs g_stage[kStageSlots];
+
+template <typename T> static void stageGrow(T*& p, size_t& cap, size_t n) {
+  n = n ? n : 1;
+  if (n <= cap) return;
+  n += n / 4;
+  // The slot is idle (neither staged nor claimed): nothing reads the old buffer.
+  if (p) cudaFree(p);
+  p = nullptr;
+  cap = 0;
+  CUDA_OK(cudaMalloc(&p, n * sizeof(T)));
+  cap = n;
+}
+
+// The slot staged for `trace` on this thread's device, now claimed by the caller; or nullptr.
+static StagedInputs* stageClaim(const PreflightTrace* trace) {
+  if (!recStage()) return nullptr;
+  int device = 0;
+  CUDA_OK(cudaGetDevice(&device));
+  std::lock_guard<std::mutex> lk(g_stageMu);
+  for (auto& s : g_stage) {
+    if (s.valid && !s.busy && s.device == device && s.wom == trace->wom &&
+        s.numWoms == trace->numWoms && s.numCycles == trace->numCycles &&
+        s.numIops == trace->numIops) {
+      s.valid = false;
+      s.busy = true;
+      return &s;
+    }
+  }
+  return nullptr;
+}
+
+// Gives a claimed slot back when the witgen call ends. Declared before the HostExecContext, so it
+// runs after the context's destruction: by then the witgen's stream is synchronized (the last
+// step syncs it; on an exception RecStream's destructor does), and nothing reads the buffers.
+struct StageClaim {
+  StagedInputs* s;
+  explicit StageClaim(StagedInputs* s) : s(s) {}
+  ~StageClaim() {
+    if (!s) return;
+    std::lock_guard<std::mutex> lk(g_stageMu);
+    s->busy = false;
+    s->wom = nullptr;
+    s->heads = nullptr;
+  }
+  StageClaim(const StageClaim&) = delete;
+  StageClaim& operator=(const StageClaim&) = delete;
+};
+#endif
+
 struct HostExecContext {
   ExecContext* ctx;
   RecStream stream;
@@ -786,9 +880,15 @@ struct HostExecContext {
   // For recAccumPerm (host copies, like numCycles).
   const Fp* ctrlBuf = nullptr;
   uint32_t steps = 0;
+  // This witgen's inputs, if they were uploaded ahead (see StagedInputs).
+  StagedInputs* staged = nullptr;
 #endif
 
-  HostExecContext(ExecBuffers* buffers, PreflightTrace* trace, size_t totalCycles)
+  HostExecContext(ExecBuffers* buffers, PreflightTrace* trace, size_t totalCycles
+#ifdef __HIPCC__
+                  , StagedInputs* stagedInputs = nullptr
+#endif
+                  )
       : cfg(getSimpleConfig(trace->numCycles)), numCycles(trace->numCycles) {
     g_execCache.ensure(trace->numCycles, trace->numWoms, trace->numIops);
 
@@ -819,6 +919,16 @@ struct HostExecContext {
       // pointers come from g_execCache, not from ctx / ctx->trace: those are managed memory,
       // which the host must not touch while work is queued on a device without concurrent
       // managed access.
+#ifdef __HIPCC__
+      if (stagedInputs) {
+        // Uploaded ahead (see StagedInputs): the kernels read the slot's copies, after them.
+        CUDA_OK(cudaStreamWaitEvent(stream, stagedInputs->done, 0));
+        staged = stagedInputs;
+        ctx->trace->wom = staged->dWom;
+        ctx->trace->cycles = staged->dCycles;
+        ctx->trace->iops = staged->dIops;
+      } else {
+#endif
       CUDA_OK(cudaMemcpyAsync(g_execCache.wom, trace->wom, trace->numWoms * sizeof(FpExt),
                               cudaMemcpyHostToDevice, stream));
       CUDA_OK(cudaMemcpyAsync(g_execCache.cycles, trace->cycles,
@@ -826,6 +936,9 @@ struct HostExecContext {
                               stream));
       CUDA_OK(cudaMemcpyAsync(g_execCache.iops, trace->iops, trace->numIops * sizeof(FpExt),
                               cudaMemcpyHostToDevice, stream));
+#ifdef __HIPCC__
+      }
+#endif
       CUDA_OK(cudaMemsetAsync(g_execCache.womRows, kInvalidPattern,
                               trace->numCycles * kMaxWomRowsPerCycle * sizeof(WomArgumentRow),
                               stream));
@@ -855,6 +968,22 @@ struct HostExecContext {
     nvtx3::scoped_range range("hostChains");
     static_assert(sizeof(WomArgumentRow) == 20, "WomArgumentRow layout");
     if (hc->dataCols != 128) throw std::runtime_error("host chains: unexpected data width");
+#ifdef __HIPCC__
+    if (staged && staged->heads == hc->heads && staged->numHeads == hc->numHeads &&
+        staged->numRows == hc->numRows && staged->dataCols == hc->dataCols) {
+      // Uploaded ahead with the trace (same layout as below; the stream waits for the copies).
+      uint32_t* sHeads = staged->dHc;
+      uint32_t* sCycles = sHeads + hc->numHeads;
+      uint32_t* sRows = sCycles + hc->numRows;
+      uint32_t* sWomIdx = sRows + (size_t)hc->numRows * hc->dataCols;
+      uint32_t* sWomRows = sWomIdx + hc->numRows;
+      markHostChains<<<(hc->numHeads + 255) / 256, 256, 0, stream>>>(ctx, sHeads, hc->numHeads);
+      uint32_t n = hc->numRows * hc->dataCols;
+      scatterHostChains<<<(n + 255) / 256, 256, 0, stream>>>(
+          ctx, sCycles, sRows, sWomIdx, reinterpret_cast<const WomArgumentRow*>(sWomRows), hc->numRows, hc->dataCols);
+      return;
+    }
+#endif
     static thread_local uint32_t* dBuf = nullptr;
     static thread_local size_t dCap = 0;
     size_t nWords = hc->numHeads + (size_t)hc->numRows * (2 + hc->dataCols + kMaxWomRowsPerCycle * 5);
@@ -1258,7 +1387,12 @@ const char* risc0_circuit_recursion_cuda_witgen_chains(uint32_t mode,
     // (e.g., Rust HAL's persistent stream). hipMemcpy doesn't reliably
     // synchronize across all streams on ROCm.
     CUDA_OK(cudaDeviceSynchronize());
+#ifdef __HIPCC__
+    StageClaim claim(stageClaim(trace));
+    HostExecContext ctx(buffers, trace, totalCycles, claim.s);
+#else
     HostExecContext ctx(buffers, trace, totalCycles);
+#endif
     if (hostChains && hostChains->numHeads && mode == kStepModeParallel) {
       ctx.applyHostChains(hostChains);
     }
@@ -1368,6 +1502,90 @@ const char* risc0_circuit_recursion_cuda_host_free(void* ptr) {
   }
   return nullptr;
 }
+
+#ifdef __HIPCC__
+// Upload a prepared preflight's page-locked inputs (and host chains, if any) ahead of its witgen;
+// see StagedInputs. Called on the preparing thread; does nothing if both slots are taken. The
+// host arrays must stay alive until risc0_circuit_recursion_hip_unstage(trace->wom) returns.
+const char* risc0_circuit_recursion_hip_stage(const PreflightTrace* trace, const HostChains* hc) {
+  StagedInputs* s = nullptr;
+  try {
+    if (!recStage()) return nullptr;
+    int device = 0;
+    CUDA_OK(cudaGetDevice(&device));
+    std::lock_guard<std::mutex> lk(g_stageMu);
+    for (auto& x : g_stage) {
+      if (!x.valid && !x.busy && (x.device < 0 || x.device == device)) {
+        s = &x;
+        break;
+      }
+    }
+    if (!s) return nullptr;
+    s->device = device;
+    if (!s->stream) CUDA_OK(cudaStreamCreateWithFlags(&s->stream, cudaStreamNonBlocking));
+    if (!s->done) CUDA_OK(cudaEventCreateWithFlags(&s->done, cudaEventDisableTiming));
+    stageGrow(s->dWom, s->womCap, trace->numWoms);
+    stageGrow(s->dCycles, s->cyclesCap, trace->numCycles);
+    stageGrow(s->dIops, s->iopsCap, trace->numIops);
+    CUDA_OK(cudaMemcpyAsync(s->dWom, trace->wom, trace->numWoms * sizeof(FpExt),
+                            cudaMemcpyHostToDevice, s->stream));
+    CUDA_OK(cudaMemcpyAsync(s->dCycles, trace->cycles, trace->numCycles * sizeof(PreflightCycle),
+                            cudaMemcpyHostToDevice, s->stream));
+    CUDA_OK(cudaMemcpyAsync(s->dIops, trace->iops, trace->numIops * sizeof(FpExt),
+                            cudaMemcpyHostToDevice, s->stream));
+    s->heads = nullptr;
+    s->numHeads = s->numRows = s->dataCols = 0;
+    if (hc && hc->numHeads && hc->dataCols == 128) {
+      size_t nWords = hc->numHeads + (size_t)hc->numRows * (2 + hc->dataCols + kMaxWomRowsPerCycle * 5);
+      stageGrow(s->dHc, s->hcCap, nWords);
+      uint32_t* dHeads = s->dHc;
+      uint32_t* dCycles = dHeads + hc->numHeads;
+      uint32_t* dRows = dCycles + hc->numRows;
+      uint32_t* dWomIdx = dRows + (size_t)hc->numRows * hc->dataCols;
+      uint32_t* dWomRows = dWomIdx + hc->numRows;
+      CUDA_OK(cudaMemcpyAsync(dHeads, hc->heads, hc->numHeads * 4, cudaMemcpyHostToDevice, s->stream));
+      CUDA_OK(cudaMemcpyAsync(dCycles, hc->cycles, hc->numRows * 4, cudaMemcpyHostToDevice, s->stream));
+      CUDA_OK(cudaMemcpyAsync(dRows, hc->rows, (size_t)hc->numRows * hc->dataCols * 4, cudaMemcpyHostToDevice, s->stream));
+      CUDA_OK(cudaMemcpyAsync(dWomIdx, hc->womIdx, hc->numRows * 4, cudaMemcpyHostToDevice, s->stream));
+      CUDA_OK(cudaMemcpyAsync(dWomRows, hc->womRows, (size_t)hc->numRows * kMaxWomRowsPerCycle * 20, cudaMemcpyHostToDevice, s->stream));
+      s->heads = hc->heads;
+      s->numHeads = hc->numHeads;
+      s->numRows = hc->numRows;
+      s->dataCols = hc->dataCols;
+    }
+    CUDA_OK(cudaEventRecord(s->done, s->stream));
+    s->wom = trace->wom;
+    s->numWoms = trace->numWoms;
+    s->numCycles = trace->numCycles;
+    s->numIops = trace->numIops;
+    s->valid = true;
+  } catch (const std::exception& err) {
+    // Not staged: let no copy queued above outlive the call (they read the caller's buffers).
+    if (s && s->stream) cudaStreamSynchronize(s->stream);
+    return strdup(err.what());
+  }
+  return nullptr;
+}
+
+// Forget the inputs staged from the page-locked buffer at `wom` if no witgen claimed them, after
+// their copies are done (before the buffer is reused or freed).
+const char* risc0_circuit_recursion_hip_unstage(const void* wom) {
+  try {
+    std::lock_guard<std::mutex> lk(g_stageMu);
+    for (auto& s : g_stage) {
+      if (s.valid && s.wom == wom) {
+        s.valid = false;
+        s.wom = nullptr;
+        s.heads = nullptr;
+        CUDA_OK(cudaEventSynchronize(s.done));
+      }
+    }
+  } catch (const std::exception& err) {
+    return strdup(err.what());
+  }
+  return nullptr;
+}
+#endif
 
 const char* risc0_circuit_recursion_cuda_accum(AccumBuffers* buffers,
                                                uint32_t workCycles,

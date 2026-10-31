@@ -189,3 +189,17 @@ extern "C" {
         p: *mut std::ffi::c_void,
     ) -> *const std::os::raw::c_char;
 }
+
+// ROCm: upload a prepared recursion preflight's page-locked witgen inputs ahead of its witgen,
+// and forget them (after their copies) if it never ran. See `StagedInputs` in ffi.cu.
+#[cfg(feature = "rocm")]
+extern "C" {
+    pub fn risc0_circuit_recursion_hip_stage(
+        trace: *const RawPreflightTrace,
+        host_chains: *const RawHostChains,
+    ) -> *const std::os::raw::c_char;
+
+    pub fn risc0_circuit_recursion_hip_unstage(
+        wom: *const std::ffi::c_void,
+    ) -> *const std::os::raw::c_char;
+}
