@@ -109,83 +109,101 @@ thread_local! {
     static THREAD_DEVICE: Cell<i32> = Cell::new(0);
 }
 
-/// Auto-configure HSA_ENABLE_SDMA based on detected GPU architecture.
+/// Auto-configure GPU_MAX_HW_QUEUES based on the visible GPU architectures.
 ///
-/// RDNA4 (gfx12xx) has buggy SDMA and benefits from HSA_ENABLE_SDMA=0.
-/// RDNA3 (gfx11xx) has working SDMA and is ~7% slower with it disabled.
-/// This must run BEFORE hipInit() since HSA reads the env var during init.
+/// After a long kernel whose grid needs several rounds of waves, the next
+/// dispatch on the same hardware queue starts ~200 us late. On RDNA3 (gfx11xx)
+/// the delay goes away once the device has at least 9 compute queues (8 per
+/// process plus the runtime's own); on RDNA4 (gfx12xx) the queue count doesn't
+/// change it and a single queue is fastest.
 ///
-/// Reads GPU architectures from Linux sysfs without requiring HIP runtime.
-/// Respects any user-set HSA_ENABLE_SDMA value.
-fn auto_configure_sdma() {
+/// HSA_ENABLE_SDMA is left alone: with ROCm 7, HSA_ENABLE_SDMA=0 is slower on
+/// RDNA4 too.
+///
+/// This must run BEFORE the first HIP call since HIP reads the env var during
+/// init. Reads GPU architectures from Linux sysfs without requiring HIP
+/// runtime. Respects any user-set value.
+pub fn auto_configure_hw_queues() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        // Don't override if user explicitly set it.
-        if std::env::var("HSA_ENABLE_SDMA").is_ok() {
-            return;
-        }
-
-        // Parse HIP_VISIBLE_DEVICES to know which GPUs are active.
-        let visible: Option<Vec<usize>> = std::env::var("HIP_VISIBLE_DEVICES").ok().map(|val| {
-            val.split(',')
-                .filter_map(|s| s.trim().parse().ok())
-                .collect()
-        });
-
         // Read GPU architectures from sysfs (works without HIP runtime).
-        // /sys/class/kfd/kfd/topology/nodes/*/properties has gfx_target_version.
-        // Node 0 is typically the CPU, GPU nodes start at 1+.
-        let mut gpu_index: usize = 0;
-        let mut all_rdna4 = true;
-        let mut found_gpu = false;
-
+        // /sys/class/kfd/kfd/topology/nodes/*/properties has gfx_target_version
+        // and unique_id. CPU nodes have version 0.
         let Ok(entries) = std::fs::read_dir("/sys/class/kfd/kfd/topology/nodes") else {
             return;
         };
         let mut node_dirs: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-        node_dirs.sort_by_key(|e| e.file_name());
+        node_dirs.sort_by_key(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .parse::<u32>()
+                .unwrap_or(u32::MAX)
+        });
 
+        // (gfx_target_version, unique_id) of each GPU node, in node order.
+        let mut gpus: Vec<(u32, u64)> = Vec::new();
         for entry in node_dirs {
             let props_path = entry.path().join("properties");
             let Ok(content) = std::fs::read_to_string(&props_path) else {
                 continue;
             };
-
-            // Find gfx_target_version line. CPU nodes have version 0.
-            let gfx_version = content.lines().find_map(|line| {
-                let line = line.trim();
-                if line.starts_with("gfx_target_version") {
-                    line.split_whitespace().nth(1)?.parse::<u32>().ok()
-                } else {
-                    None
-                }
-            });
-
-            let Some(ver) = gfx_version else { continue };
+            let prop = |name: &str| {
+                content.lines().find_map(|line| {
+                    let mut it = line.split_whitespace();
+                    if it.next()? != name {
+                        return None;
+                    }
+                    it.next()?.parse::<u64>().ok()
+                })
+            };
+            let Some(ver) = prop("gfx_target_version") else {
+                continue;
+            };
             if ver == 0 {
                 continue; // CPU node
             }
-
-            // This is a GPU node. Check if it's in the visible set.
-            let is_visible = match &visible {
-                Some(vis) => vis.contains(&gpu_index),
-                None => true,
-            };
-
-            if is_visible {
-                found_gpu = true;
-                // gfx12xx = 120000..129999 (RDNA4)
-                if ver < 120000 || ver >= 130000 {
-                    all_rdna4 = false;
-                }
-            }
-
-            gpu_index += 1;
+            gpus.push((ver as u32, prop("unique_id").unwrap_or(0)));
         }
 
-        if found_gpu && all_rdna4 {
-            tracing::info!("Auto-setting HSA_ENABLE_SDMA=0 for RDNA4 GPU(s)");
-            std::env::set_var("HSA_ENABLE_SDMA", "0");
+        // ROCR_VISIBLE_DEVICES (indices or GPU-<hex unique_id>) selects and
+        // orders the GPUs; HIP_VISIBLE_DEVICES then indexes into that list.
+        let mut visible = match std::env::var("ROCR_VISIBLE_DEVICES") {
+            Ok(val) => val
+                .split(',')
+                .filter_map(|s| {
+                    let s = s.trim();
+                    match s.strip_prefix("GPU-") {
+                        Some(hex) => {
+                            let id = u64::from_str_radix(hex, 16).ok()?;
+                            gpus.iter().find(|g| g.1 == id && id != 0).copied()
+                        }
+                        None => gpus.get(s.parse::<usize>().ok()?).copied(),
+                    }
+                })
+                .collect(),
+            Err(_) => gpus,
+        };
+        if let Ok(val) = std::env::var("HIP_VISIBLE_DEVICES") {
+            visible = val
+                .split(',')
+                .filter_map(|s| visible.get(s.trim().parse::<usize>().ok()?).copied())
+                .collect();
+        }
+
+        let all_in = |range: std::ops::Range<u32>| {
+            !visible.is_empty() && visible.iter().all(|g| range.contains(&g.0))
+        };
+        // gfx12xx = 120000..129999 (RDNA4), gfx11xx = 110000..119999 (RDNA3)
+        let queues = if all_in(120000..130000) {
+            "1"
+        } else if all_in(110000..120000) {
+            "8"
+        } else {
+            return;
+        };
+        if std::env::var("GPU_MAX_HW_QUEUES").is_err() {
+            tracing::info!("Auto-setting GPU_MAX_HW_QUEUES={queues}");
+            std::env::set_var("GPU_MAX_HW_QUEUES", queues);
         }
     });
 }
@@ -199,6 +217,7 @@ pub fn set_device_for_thread(device_id: i32) {
 /// Switch the current thread to a different HIP device.
 /// Calls both the Rust thread-local and the HIP runtime hipSetDevice.
 pub fn switch_to_device(device_id: i32) {
+    auto_configure_hw_queues();
     set_device_for_thread(device_id);
     hip_check(unsafe { hipSetDevice(device_id) });
 }
@@ -210,6 +229,7 @@ pub fn get_device_for_thread() -> i32 {
 
 /// Return the number of HIP devices available.
 pub fn device_count() -> i32 {
+    auto_configure_hw_queues();
     let mut count: i32 = 0;
     let err = unsafe { hipGetDeviceCount(&mut count) };
     if err == risc0_sys::hip::HIP_SUCCESS {
@@ -783,8 +803,8 @@ impl<HH: HipHash + ?Sized> HipHal<HH> {
         let device = get_device_for_thread();
         let _lock = singleton_for_device(device).lock();
 
-        // Auto-configure SDMA before HIP runtime init reads env vars.
-        auto_configure_sdma();
+        // Auto-configure HW queues before HIP runtime init reads env vars.
+        auto_configure_hw_queues();
 
         // Set device BEFORE sppark_init so NTT tables land on the right GPU.
         hip_check(unsafe { hipInit(0) });

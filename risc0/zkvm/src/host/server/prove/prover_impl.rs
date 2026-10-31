@@ -157,6 +157,10 @@ impl ProverImpl {
                 *warmup = CudaWarmup::Running(spawn_cuda_warmup());
             }
         }
+        // ROCm: pick the per-arch HW queue count on this thread, before
+        // the warmup threads make the first HIP call.
+        #[cfg(feature = "rocm")]
+        risc0_zkp::hal::hip::auto_configure_hw_queues();
         // Parse the Groth16 witness graph (and build its parallel schedule) while the guest
         // executes instead of beside the STARK.
         #[cfg(feature = "cuda")]
