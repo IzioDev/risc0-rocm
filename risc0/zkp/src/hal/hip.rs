@@ -109,7 +109,7 @@ thread_local! {
     static THREAD_DEVICE: Cell<i32> = Cell::new(0);
 }
 
-/// Auto-configure GPU_MAX_HW_QUEUES (and HSA_SCRATCH_SINGLE_LIMIT, see below) based on the
+/// Auto-configure GPU_MAX_HW_QUEUES (and the scratch and prefetch settings below) based on the
 /// visible GPU architectures.
 ///
 /// After a long kernel whose grid needs several rounds of waves, the next
@@ -141,8 +141,9 @@ pub fn auto_configure_hw_queues() {
                 .unwrap_or(u32::MAX)
         });
 
-        // (gfx_target_version, unique_id, scratch wave slots) of each GPU node, in node order.
-        let mut gpus: Vec<(u32, u64, u64)> = Vec::new();
+        // (gfx_target_version, unique_id, scratch wave slots, VRAM bytes) of each GPU node, in
+        // node order.
+        let mut gpus: Vec<(u32, u64, u64, u64)> = Vec::new();
         for entry in node_dirs {
             let props_path = entry.path().join("properties");
             let Ok(content) = std::fs::read_to_string(&props_path) else {
@@ -172,7 +173,12 @@ pub fn auto_configure_hw_queues() {
                 (Some(s), Some(p), Some(m)) if p > 0 => s / p * m,
                 _ => 0,
             };
-            gpus.push((ver as u32, prop("unique_id").unwrap_or(0), slots));
+            gpus.push((
+                ver as u32,
+                prop("unique_id").unwrap_or(0),
+                slots,
+                node_vram_bytes(&entry.path()),
+            ));
         }
 
         // ROCR_VISIBLE_DEVICES (indices or GPU-<hex unique_id>) selects and
@@ -232,7 +238,51 @@ pub fn auto_configure_hw_queues() {
                 std::env::set_var("HSA_SCRATCH_SINGLE_LIMIT", limit.to_string());
             }
         }
+        // RDNA4: start the next segment's preflight copy at a commit's row hashes rather than in
+        // front of eval_check (RISC0_HIP_PREFETCH_ROWS, read by the rv32im HAL): beside the copy
+        // every short kernel of eval_check's prologue takes ~125 us instead of ~2 us.
+        if queues == "1" && std::env::var("RISC0_HIP_PREFETCH_ROWS").is_err() {
+            tracing::info!("Auto-setting RISC0_HIP_PREFETCH_ROWS=1");
+            std::env::set_var("RISC0_HIP_PREFETCH_ROWS", "1");
+        }
+        // Scratch kept per queue between dispatches: the runtime frees a queue's scratch after
+        // each dispatch with a large scratch need (rv32im par_stepExec x2, stepAccumA and
+        // ef_eval_split each segment: ~1 GB / 0.5 GB / 0.3 GB on an RX 7900 XTX), and the next
+        // such dispatch waits for it to be allocated again (~0.1-0.3 ms each on a quiet host, a
+        // runtime thread's wake-up on a busy one). RISC0_HIP_SCRATCH_KEEP=1 sets
+        // HSA_NO_SCRATCH_RECLAIM=1 (the largest scratch each queue used stays allocated, ~1.5 GB);
+        // default: on when every visible GPU has at least 20 GiB of VRAM.
+        let keep = match std::env::var("RISC0_HIP_SCRATCH_KEEP").as_deref() {
+            Ok(v) => v.starts_with('1'),
+            Err(_) => visible.iter().all(|g| g.3 >= 20 << 30),
+        };
+        if keep && std::env::var("HSA_NO_SCRATCH_RECLAIM").is_err() {
+            tracing::info!("Auto-setting HSA_NO_SCRATCH_RECLAIM=1");
+            std::env::set_var("HSA_NO_SCRATCH_RECLAIM", "1");
+        }
     });
+}
+
+/// VRAM of a KFD topology node: its frame-buffer memory banks (heap_type 1 public, 2 private).
+fn node_vram_bytes(node: &std::path::Path) -> u64 {
+    let Ok(banks) = std::fs::read_dir(node.join("mem_banks")) else {
+        return 0;
+    };
+    banks
+        .filter_map(|b| std::fs::read_to_string(b.ok()?.path().join("properties")).ok())
+        .filter_map(|content| {
+            let prop = |name: &str| {
+                content.lines().find_map(|line| {
+                    let mut it = line.split_whitespace();
+                    if it.next()? != name {
+                        return None;
+                    }
+                    it.next()?.parse::<u64>().ok()
+                })
+            };
+            matches!(prop("heap_type"), Some(1 | 2)).then(|| prop("size_in_bytes").unwrap_or(0))
+        })
+        .sum()
 }
 
 /// Set the HIP device ID for the current thread.
@@ -395,6 +445,17 @@ pub fn register_release_hook(hook: fn(bool)) {
     if !hooks.iter().any(|h| std::ptr::fn_addr_eq(*h, hook)) {
         hooks.push(hook);
     }
+}
+
+/// Run by the Poseidon2 `hash_rows` before it launches the row hashes (one long kernel at the
+/// sizes that matter), once the persistent stream is idle: see [register_hash_rows_hook].
+static HASH_ROWS_HOOK: OnceLock<fn()> = OnceLock::new();
+
+/// Register `hook` (the first registration wins) to run at the start of each Poseidon2
+/// `hash_rows`, on the proving thread: work it queues on another stream (a DMA) overlaps the row
+/// hashes instead of the short latency-bound kernels around them.
+pub fn register_hash_rows_hook(hook: fn()) {
+    let _ = HASH_ROWS_HOOK.set(hook);
 }
 
 fn run_release_hooks(device_only: bool) {
@@ -582,6 +643,9 @@ impl HipHash for HipHashPoseidon2 {
         assert_eq!(matrix.size(), col_size * row_size);
 
         sync_persistent_stream();
+        if let Some(hook) = HASH_ROWS_HOOK.get() {
+            hook();
+        }
         let err = unsafe {
             sppark_poseidon2_rows(
                 output.as_device_ptr(),

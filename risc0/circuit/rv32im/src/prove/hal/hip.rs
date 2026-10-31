@@ -54,6 +54,13 @@ pub struct HipCircuitHal<HH: HipHash> {
 impl<HH: HipHash> HipCircuitHal<HH> {
     pub fn new(_hal: Arc<HipHal<HH>>) -> Self {
         risc0_zkp::hal::hip::register_release_hook(super::super::witgen::cuda_stage::release);
+        // RISC0_HIP_PREFETCH_ROWS=1: also start the next segment's staged preflight copy at the
+        // row hashes of a commit (rows_k, tens of ms), as soon as it is staged. On an RX 9070 XT
+        // the copy (~8.7 ms at po2=20) slows every short kernel beside it (~2 -> ~125 us each),
+        // which before eval_check stretches its prologue by ~1-2 ms.
+        if matches!(std::env::var("RISC0_HIP_PREFETCH_ROWS").as_deref(), Ok(v) if v.starts_with('1')) {
+            risc0_zkp::hal::hip::register_hash_rows_hook(super::super::witgen::cuda_stage::prefetch_ready);
+        }
         Self { _hal }
     }
 }
