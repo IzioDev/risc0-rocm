@@ -24,6 +24,9 @@
 # LDS words are used there too. Other targets were not measured. Measured on the ef harness at po2 20
 # (medians of interleaved runs, bit-exact), RX 7900 XTX: 142.7 -> 138.5 ms on the inlined kernel
 # with buffer trace loads (160.5 -> 156.3 ms with the chain functions called; 16 words 158.1).
+# With lu_alias=True (regen.py's gfx12 variant) ef_sm keeps `nmain` rows and the LogUp words past them
+# live in wmma_hip.py's staging array ef_wlds, which LogUp blocks never use (15 words per thread at 12
+# slots): 31 LogUp words for the LDS of 16 (RX 9070 XT, ef harness: -1.0 ms).
 #
 # usage: smem_hip.py <in.cu> <out.cu> [--nmain N] [--nlu N]
 import collections
@@ -35,7 +38,7 @@ LU = {'rk_accblk', 'rv32im_v2_2', 'rv32im_v2_1', 'rv32im_v2_0'}
 ANCHOR = '#define RK_ST4(p, w0, w1, w2, w3, v)'
 
 
-def convert(s, nmain=32, nlu=32, gfx12=False, stats=None):
+def convert(s, nmain=32, nlu=32, gfx12=False, lu_alias=False, stats=None):
     lines = s.split('\n')
     cnt = {'m': collections.Counter(), 'l': collections.Counter()}
     nfn = 0
@@ -59,7 +62,7 @@ def convert(s, nmain=32, nlu=32, gfx12=False, stats=None):
         i = end + 1
     s = '\n'.join(lines)
     hot = {'M': [w for w, _ in cnt['m'].most_common(nmain)], 'L': [w for w, _ in cnt['l'].most_common(nlu)]}
-    n = max(nmain, nlu, 1)
+    n = nmain if lu_alias else max(nmain, nlu, 1)
     out = ['// smem_hip.py: on gfx11%s the hottest slab words of each phase in LDS (ef_sm), the rest in the'
            % (' and gfx12' if gfx12 else ''),
            '// scratch slab; other targets use the slab for every word.',
@@ -68,13 +71,20 @@ def convert(s, nmain=32, nlu=32, gfx12=False, stats=None):
            '#define EF_NHOT %du' % n,
            '__shared__ uint32_t ef_sm[EF_NHOT][EF_THREADS];',
            '#define EF_SMW(k) ef_sm[k][threadIdx.x]']
+    if lu_alias:
+        out += ['// LogUp words past the EF_NHOT rows: in ef_wlds (wmma_hip.py), unused by LogUp blocks',
+                'static_assert(%du <= EF_NHOT + sizeof(ef_wlds) / sizeof(ef_wlds[0]) / EF_THREADS, "LogUp alias words");'
+                % len(hot['L']),
+                '#define EF_SMWL(k) ((k) < EF_NHOT ? ef_sm[(k) < EF_NHOT ? (k) : 0][threadIdx.x] : '
+                'ef_wlds[((k) < EF_NHOT ? 0 : (k) - EF_NHOT) * EF_THREADS + threadIdx.x])']
     for g in ('M', 'L'):
         out.append('__device__ __forceinline__ constexpr int ef_hot%s(uint32_t w) { switch (w) { %s default: return -1; } }'
                    % (g, ' '.join('case %du: return %d;' % (w, k) for k, w in enumerate(hot[g]))))
+        smw = 'EF_SMWL' if lu_alias and g == 'L' else 'EF_SMW'
         out.append('#define RK_LD1%s(p, w) (static_cast<const ::risc0::Fp>(::risc0::Fp::fromRaw(ef_hot%s(w) >= 0 ? '
-                   'EF_SMW(ef_hot%s(w) < 0 ? 0 : ef_hot%s(w)) : ef_ldl((p), (w)))))' % (g, g, g, g))
-        out.append('#define RK_ST1%s(p, w, v) do { if (ef_hot%s(w) >= 0) EF_SMW(ef_hot%s(w) < 0 ? 0 : ef_hot%s(w)) = '
-                   '::risc0::Fp(v).asRaw(); else ef_stl((p), (w), ::risc0::Fp(v).asRaw()); } while (0)' % (g, g, g, g))
+                   '%s(ef_hot%s(w) < 0 ? 0 : ef_hot%s(w)) : ef_ldl((p), (w)))))' % (g, g, smw, g, g))
+        out.append('#define RK_ST1%s(p, w, v) do { if (ef_hot%s(w) >= 0) %s(ef_hot%s(w) < 0 ? 0 : ef_hot%s(w)) = '
+                   '::risc0::Fp(v).asRaw(); else ef_stl((p), (w), ::risc0::Fp(v).asRaw()); } while (0)' % (g, g, smw, g, g))
     out.append('#else')
     for g in ('M', 'L'):
         out.append('#define RK_LD1%s RK_LD1' % g)

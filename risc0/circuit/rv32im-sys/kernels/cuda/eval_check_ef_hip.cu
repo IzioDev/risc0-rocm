@@ -22,12 +22,18 @@
 // loads through per-32-column buffer resources (to_hip.py) and, on gfx11, the
 // hottest slab words in LDS (smem_hip.py). gfx12 compiles its own variant of
 // the lines that differ (archsel_hip.py): 12 WMMA staging slots per wave and
-// 16 LDS slab words per phase (~134 instead of ~137 ms on an RX 9070 XT);
-// other targets, and the host pass, read the default: 24 slots, 32 words on
-// gfx11, where each scalar chain link's poly_mix constant is loaded at most 4
-// links ahead (pmlag_hip.py: ~123.5 instead of ~136 ms on an RX 7900 XTX, no
-// v_readlane-restored SGPR spills) and the kernel runs 3 blocks per SIMD
-// (build.rs: EF_MINB_GFX11, ~115.7 ms). At po2 20 with 64-wide waves and EF_MINB
+// 16 LDS slab words per phase (~134 instead of ~137 ms on an RX 9070 XT), 15
+// more LogUp words in the WMMA staging area, which LogUp blocks do not use
+// (smem_hip.py), the WMMA A operands through an opaque SGPR base (wmma_hip.py)
+// and the poly_mix constants of the plain chain links, the FpExt-term links and
+// the closures loaded no earlier than pmlag_hip.py allows (~130.8 ms); other
+// targets, and the host pass, read the default: 24 slots, 32 words on gfx11,
+// where each scalar chain link's poly_mix constant is loaded at most 4 links
+// ahead (pmlag_hip.py: ~123.5 instead of ~136 ms on an RX 7900 XTX, no
+// v_readlane-restored SGPR spills; FpExt-term links and closures too, ~2 ms
+// less), the lazy 64-bit accumulators are not reassociated (opq_hip.py, ~5 ms
+// less) and the kernel runs 3 blocks per SIMD (build.rs: EF_MINB_GFX11, ~115.7
+// ms before pmlag_hip.py's closures and opq_hip.py). At po2 20 with 64-wide waves and EF_MINB
 // 4 (build.rs): ~139 ms on an RX 7900 XTX (gfx1100) and ~137 ms on an RX 9070 XT
 // (gfx1201), against ~156 and 141 ms inlined with global loads and the scratch
 // slab, 160 and 169 ms with the chain functions called (callee-saved register
@@ -149,6 +155,12 @@ namespace {
 constexpr size_t kInvRate = 4;
 
 
+// opq_hip.py: on gfx11 a lazy 64-bit accumulator LLVM may not reassociate (an empty asm, no instruction).
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__)
+#define EF_OPQ64(t) asm("" : "+v"(t))
+#else
+#define EF_OPQ64(t)
+#endif
 // ---- lincomb.py: lazily reduced FpExt linear combinations ----
 struct RkW { uint32_t lo[4]; uint32_t hi[4]; };   // S_j = hi*2^32 + lo, hi < P between steps
 __device__ __forceinline__ static uint32_t rkw_mulhi(uint32_t a, uint32_t b) { return uint32_t((uint64_t(a) * uint64_t(b)) >> 32); }
@@ -156,6 +168,7 @@ __device__ __forceinline__ static uint32_t rkw_fold(uint32_t h) { uint32_t f = h
 __device__ __forceinline__ static void rkw_mac(RkW& w, int j, uint32_t x, uint32_t y) {
 #ifdef EF_WIDE
   uint64_t t = ((uint64_t(w.hi[j]) << 32) | w.lo[j]) + uint64_t(x) * uint64_t(y);
+  EF_OPQ64(t);
   w.lo[j] = uint32_t(t); w.hi[j] = uint32_t(t >> 32);
 #else
   uint32_t p = x * y, n = w.lo[j] + p;
@@ -227,6 +240,7 @@ __device__ __forceinline__ static void rkw1_ff(RkW1& w, Fp a, Fp b, bool neg) {
 #ifdef EF_WIDE
   const uint32_t x = neg ? Fp::P - a.asRaw() : a.asRaw(), y = b.asRaw();
   uint64_t t = ((uint64_t(w.hi) << 32) | w.lo) + uint64_t(x) * uint64_t(y);
+  EF_OPQ64(t);
   w.hi = rkw1_fold(uint32_t(t >> 32)); w.lo = uint32_t(t);
 #else
   const uint32_t x = neg ? Fp::P - a.asRaw() : a.asRaw(), y = b.asRaw();
@@ -253,6 +267,7 @@ template <typename A> __device__ __forceinline__ static RkAcc rk_link(const A& b
   RkAcc s = rk_acc(base); uint32_t cr = c.asRaw();
   for (int j = 0; j < 4; j++) {
     uint64_t t = ((uint64_t(s.hi[j]) << 32) | s.lo[j]) + uint64_t(cr) * uint64_t(pm.elems[j].asRaw());
+    EF_OPQ64(t);
     uint32_t h = uint32_t(t >> 32);
     s.lo[j] = uint32_t(t); s.hi[j] = rk_umin(h, h - Fp::P);
   }
@@ -280,6 +295,7 @@ template <typename A> __device__ __forceinline__ static RkAcc rk_link_nf(const A
   RkAcc s = rk_acc(base); uint32_t cr = c.asRaw();
   for (int j = 0; j < 4; j++) {
     uint64_t t = ((uint64_t(s.hi[j]) << 32) | s.lo[j]) + uint64_t(cr) * uint64_t(pm.elems[j].asRaw());
+    EF_OPQ64(t);
     s.lo[j] = uint32_t(t); s.hi[j] = uint32_t(t >> 32);
   }
   return s;
@@ -322,7 +338,9 @@ __device__ __forceinline__ static uint64_t ef_madw(uint32_t a, uint32_t b, uint6
 #ifdef EF_MADW_ASM
   uint64_t d; asm("mad.wide.u32 %0, %1, %2, %3;" : "=l"(d) : "r"(a), "r"(b), "l"(c)); return d;
 #else
-  return c + uint64_t(a) * uint64_t(b);
+  uint64_t d = c + uint64_t(a) * uint64_t(b);
+  EF_OPQ64(d);
+  return d;
 #endif
 }
 __device__ __forceinline__ static uint64_t ef_fold64(uint64_t t) {
@@ -368,8 +386,9 @@ template <typename A> __device__ __forceinline__ static RkAcc rk_link_nf_k(const
 __device__ __forceinline__ static FpExt rk_xmul(const FpExt& a) {
   return FpExt(a.elems[3] * Fp(0x78000001u - 11u), a.elems[0], a.elems[1], a.elems[2]);
 }
-// pmlag_hip.py: on gfx11 each scalar chain link's constant loaded at most W links ahead.
-#if defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__)
+// pmlag_hip.py: on gfx11 and gfx12 each scalar chain link's constant loaded at most W links ahead,
+// each FpExt-term link's and chained closure's constant rows not before the accumulator they depend on.
+#if defined(__HIP_DEVICE_COMPILE__) && (defined(__GFX11__) || defined(__GFX12__))
 #define EF_DEP(e) (e)
 __device__ __forceinline__ static ::risc0::FpExt ef_pml(uint32_t k, uint32_t dep) {
   uint64_t p = reinterpret_cast<uint64_t>(ef_pm_raw);
@@ -377,15 +396,46 @@ __device__ __forceinline__ static ::risc0::FpExt ef_pml(uint32_t k, uint32_t dep
   const uint4 v = ((const __attribute__((address_space(4))) uint4*)p)[k];
   return ::risc0::FpExt(::risc0::Fp::fromRaw(v.x), ::risc0::Fp::fromRaw(v.y), ::risc0::Fp::fromRaw(v.z), ::risc0::Fp::fromRaw(v.w));
 }
+__device__ __forceinline__ static uint4 ef_pmu(const uint32_t* tab, uint32_t k, uint32_t dep) {
+  uint64_t p = reinterpret_cast<uint64_t>(tab);
+  asm("" : "+s"(p) : "v"(dep));
+  return ((const __attribute__((address_space(4))) uint4*)p)[k];
+}
 template <typename A> __device__ __forceinline__ static RkAcc rk_link_kl(const A& base, Fp c, uint32_t k, uint32_t dep) { return rk_link(base, c, ef_pml(k, dep)); }
 template <typename A> __device__ __forceinline__ static RkAcc rk_link_nf_kl(const A& base, Fp c, uint32_t k, uint32_t dep) { return rk_link_nf(base, c, ef_pml(k, dep)); }
 #else
 #define EF_DEP(e) 0u
+__device__ __forceinline__ static uint4 ef_pmu(const uint32_t* tab, uint32_t k, uint32_t) { return reinterpret_cast<const uint4*>(tab)[k]; }
 template <typename A> __device__ __forceinline__ static RkAcc rk_link_kl(const A& base, Fp c, uint32_t k, uint32_t) { return rk_link_k(base, c, k); }
 template <typename A> __device__ __forceinline__ static RkAcc rk_link_nf_kl(const A& base, Fp c, uint32_t k, uint32_t) { return rk_link_nf_k(base, c, k); }
 #endif
-template <typename A> __device__ __forceinline__ static RkAcc rk_link_kl(const A& base, FpExt c, uint32_t k, uint32_t) { return rk_link_k(base, c, k); }
-template <typename A> __device__ __forceinline__ static RkAcc rk_link_nf_kl(const A& base, FpExt c, uint32_t k, uint32_t) { return rk_link_nf_k(base, c, k); }
+// rk_link_k(base, FpExt c, k) and rk_cl_acc(w, u, k) with the constant rows through ef_pmu
+template <typename A> __device__ __forceinline__ static RkAcc rk_link_kxl(const A& base, FpExt c, uint32_t k, uint32_t dep) {
+  RkAcc s = rk_acc(base);
+  const uint32_t a0 = c.elems[0].asRaw(), a1 = c.elems[1].asRaw(), a2 = c.elems[2].asRaw(), a3 = c.elems[3].asRaw();
+  const uint4 b = ef_pmu(ef_pm_raw, k, dep), n = ef_pmu(ef_pmn_raw, k, dep);
+  EF_PMROW(b, n);
+  for (int j = 0; j < 4; j++) {
+    uint64_t t = ef_fold64((uint64_t(s.hi[j]) << 32) | s.lo[j]);
+    t = ef_fold64(ef_madw(a1, X[j][1], ef_madw(a0, X[j][0], t)));
+    t = ef_fold64(ef_madw(a3, X[j][3], ef_madw(a2, X[j][2], t)));
+    s.lo[j] = uint32_t(t); s.hi[j] = uint32_t(t >> 32);
+  }
+  return s;
+}
+__device__ __forceinline__ static void rk_cl_accl(RkW& w, const FpExt& u, uint32_t k, uint32_t dep) {
+  const uint32_t a0 = u.elems[0].asRaw(), a1 = u.elems[1].asRaw(), a2 = u.elems[2].asRaw(), a3 = u.elems[3].asRaw();
+  const uint4 b = ef_pmu(ef_pm_raw, k, dep), n = ef_pmu(ef_pmn_raw, k, dep);
+  EF_PMROW(b, n);
+  for (int j = 0; j < 4; j++) {
+    uint64_t t = (uint64_t(w.hi[j]) << 32) | w.lo[j];
+    t = ef_fold64(ef_madw(a1, X[j][1], ef_madw(a0, X[j][0], t)));
+    t = ef_fold64(ef_madw(a3, X[j][3], ef_madw(a2, X[j][2], t)));
+    w.lo[j] = uint32_t(t); w.hi[j] = uint32_t(t >> 32);
+  }
+}
+template <typename A> __device__ __forceinline__ static RkAcc rk_link_kl(const A& base, FpExt c, uint32_t k, uint32_t dep) { return rk_link_kxl(base, c, k, dep); }
+template <typename A> __device__ __forceinline__ static RkAcc rk_link_nf_kl(const A& base, FpExt c, uint32_t k, uint32_t dep) { return rk_link_kxl(base, c, k, dep); }
 // ---- wmma_hip.py: poly_mix chains on the gfx12 matrix units (V_WMMA_I32_16X16X16_IU8) ----
 #if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx1200__) || defined(__gfx1201__)) && !defined(EF_NO_WMMA)
 #define EF_WM 1
@@ -408,21 +458,27 @@ typedef const __attribute__((address_space(1))) uint32_t ef_wgu32;
 #define EF_WSTR 80u    // dwords per slot: 64 points + 16 pad, so the tile reads are bank-conflict free
 __shared__ uint32_t ef_wlds[(EF_THREADS / 64) * EF_WSLOTS * EF_WSTR];
 // lane, its wave's staging tile, rdo = (lane / 16) * EF_WSTR + lane % 16 (operand row group = link)
-struct EfW { ef_lu32* st; uint32_t lane, rdo; };
+struct EfW { ef_lu32* st; ef_wgu32* q; uint32_t lane, rdo; };
 __device__ __forceinline__ static EfW ef_wsetup() {
   EfW w;
   w.lane = threadIdx.x & 63u;
   w.rdo = (w.lane >> 4) * EF_WSTR + (w.lane & 15u);
   w.st = (ef_lu32*)(ef_wlds + (threadIdx.x >> 6) * (EF_WSLOTS * EF_WSTR));
+  // The A operand table through an opaque SGPR base (an empty asm): each ef_wq load is then base +
+  // lane offset + an immediate offset, instead of a 64-bit PC-relative SGPR address per constant
+  // that the scheduler hoisted and spilled to VGPR lanes (~600 s_getpc and ~970 v_readlane per wave).
+  uint64_t q = reinterpret_cast<uint64_t>(ef_wq_raw);
+  asm("" : "+s"(q));
+  w.q = (ef_wgu32*)q;
   return w;
 }
 #define EF_WSETUP const EfW efw = ef_wsetup();
 __device__ __forceinline__ static void ef_wst(const EfW& w, uint32_t slot, Fp c) { w.st[slot * EF_WSTR + w.lane] = c.asRaw(); }
 // A operand: Q rows of the links with constants k0..k0+3, or ka..kd with n < 4 real links (zero rows)
-__device__ __forceinline__ static int ef_wq(const EfW& w, uint32_t k0) { return (int)((ef_wgu32*)ef_wq_raw)[k0 * 16u + w.lane]; }
+__device__ __forceinline__ static int ef_wq(const EfW& w, uint32_t k0) { return (int)(w.q + k0 * 16u)[w.lane]; }
 __device__ __forceinline__ static int ef_wq4(const EfW& w, uint32_t ka, uint32_t kb, uint32_t kc, uint32_t kd, uint32_t n) {
   const uint32_t g = w.lane >> 4, k = g == 0 ? ka : g == 1 ? kb : g == 2 ? kc : kd;
-  const int v = (int)((ef_wgu32*)ef_wq_raw)[k * 16u + (w.lane & 15u)];
+  const int v = (int)w.q[k * 16u + (w.lane & 15u)];
   return g < n ? v : 0;
 }
 // 4 links (slots s0..s0+3) x 4 point tiles: unsigned bytes, i32 accumulation
@@ -449,6 +505,8 @@ __device__ __forceinline__ static FpExt ef_wfin(const EfW& w, const ef_v4i* d, u
 }
 #else
 #define EF_WSETUP
+// smem_hip.py's LogUp alias words (gfx12 variant) when the WMMA staging is compiled out (EF_NO_WMMA)
+__shared__ uint32_t ef_wlds[15u * EF_THREADS];
 #endif
 // ---- end helpers ----
 constexpr uint32_t RK_QN = 107;
@@ -502,6 +560,9 @@ __device__ __forceinline__ void ef_stl(void* p, uint32_t w, uint32_t v) {
 __shared__ uint32_t ef_sm[EF_NHOT][EF_THREADS];
 #define EF_SMW(k) ef_sm[k][threadIdx.x]
 #if defined(__GFX12__) // archsel_hip
+// LogUp words past the EF_NHOT rows: in ef_wlds (wmma_hip.py), unused by LogUp blocks
+static_assert(31u <= EF_NHOT + sizeof(ef_wlds) / sizeof(ef_wlds[0]) / EF_THREADS, "LogUp alias words");
+#define EF_SMWL(k) ((k) < EF_NHOT ? ef_sm[(k) < EF_NHOT ? (k) : 0][threadIdx.x] : ef_wlds[((k) < EF_NHOT ? 0 : (k) - EF_NHOT) * EF_THREADS + threadIdx.x])
 __device__ __forceinline__ constexpr int ef_hotM(uint32_t w) { switch (w) { case 5u: return 0; case 7u: return 1; case 8u: return 2; case 18u: return 3; case 1u: return 4; case 14u: return 5; case 10u: return 6; case 15u: return 7; case 9u: return 8; case 20u: return 9; case 16u: return 10; case 0u: return 11; case 11u: return 12; case 12u: return 13; case 17u: return 14; case 22u: return 15; default: return -1; } }
 #else // archsel_hip
 __device__ __forceinline__ constexpr int ef_hotM(uint32_t w) { switch (w) { case 5u: return 0; case 7u: return 1; case 8u: return 2; case 18u: return 3; case 1u: return 4; case 14u: return 5; case 10u: return 6; case 15u: return 7; case 9u: return 8; case 20u: return 9; case 16u: return 10; case 0u: return 11; case 11u: return 12; case 12u: return 13; case 17u: return 14; case 22u: return 15; case 21u: return 16; case 13u: return 17; case 19u: return 18; case 4u: return 19; case 23u: return 20; case 29u: return 21; case 3u: return 22; case 6u: return 23; case 24u: return 24; case 25u: return 25; case 27u: return 26; case 28u: return 27; case 26u: return 28; case 2u: return 29; case 33u: return 30; case 34u: return 31; default: return -1; } }
@@ -509,12 +570,14 @@ __device__ __forceinline__ constexpr int ef_hotM(uint32_t w) { switch (w) { case
 #define RK_LD1M(p, w) (static_cast<const ::risc0::Fp>(::risc0::Fp::fromRaw(ef_hotM(w) >= 0 ? EF_SMW(ef_hotM(w) < 0 ? 0 : ef_hotM(w)) : ef_ldl((p), (w)))))
 #define RK_ST1M(p, w, v) do { if (ef_hotM(w) >= 0) EF_SMW(ef_hotM(w) < 0 ? 0 : ef_hotM(w)) = ::risc0::Fp(v).asRaw(); else ef_stl((p), (w), ::risc0::Fp(v).asRaw()); } while (0)
 #if defined(__GFX12__) // archsel_hip
-__device__ __forceinline__ constexpr int ef_hotL(uint32_t w) { switch (w) { case 4u: return 0; case 5u: return 1; case 6u: return 2; case 7u: return 3; case 8u: return 4; case 9u: return 5; case 10u: return 6; case 11u: return 7; case 20u: return 8; case 21u: return 9; case 22u: return 10; case 23u: return 11; case 40u: return 12; case 41u: return 13; case 42u: return 14; case 43u: return 15; default: return -1; } }
+__device__ __forceinline__ constexpr int ef_hotL(uint32_t w) { switch (w) { case 4u: return 0; case 5u: return 1; case 6u: return 2; case 7u: return 3; case 8u: return 4; case 9u: return 5; case 10u: return 6; case 11u: return 7; case 20u: return 8; case 21u: return 9; case 22u: return 10; case 23u: return 11; case 40u: return 12; case 41u: return 13; case 42u: return 14; case 43u: return 15; case 60u: return 16; case 61u: return 17; case 62u: return 18; case 63u: return 19; case 80u: return 20; case 81u: return 21; case 82u: return 22; case 83u: return 23; case 84u: return 24; case 85u: return 25; case 86u: return 26; case 87u: return 27; case 92u: return 28; case 93u: return 29; case 94u: return 30; default: return -1; } }
+#define RK_LD1L(p, w) (static_cast<const ::risc0::Fp>(::risc0::Fp::fromRaw(ef_hotL(w) >= 0 ? EF_SMWL(ef_hotL(w) < 0 ? 0 : ef_hotL(w)) : ef_ldl((p), (w)))))
+#define RK_ST1L(p, w, v) do { if (ef_hotL(w) >= 0) EF_SMWL(ef_hotL(w) < 0 ? 0 : ef_hotL(w)) = ::risc0::Fp(v).asRaw(); else ef_stl((p), (w), ::risc0::Fp(v).asRaw()); } while (0)
 #else // archsel_hip
 __device__ __forceinline__ constexpr int ef_hotL(uint32_t w) { switch (w) { case 4u: return 0; case 5u: return 1; case 6u: return 2; case 7u: return 3; case 8u: return 4; case 9u: return 5; case 10u: return 6; case 11u: return 7; case 20u: return 8; case 21u: return 9; case 22u: return 10; case 23u: return 11; case 40u: return 12; case 41u: return 13; case 42u: return 14; case 43u: return 15; case 60u: return 16; case 61u: return 17; case 62u: return 18; case 63u: return 19; case 80u: return 20; case 81u: return 21; case 82u: return 22; case 83u: return 23; case 84u: return 24; case 85u: return 25; case 86u: return 26; case 87u: return 27; case 92u: return 28; case 93u: return 29; case 94u: return 30; case 95u: return 31; default: return -1; } }
-#endif // archsel_hip
 #define RK_LD1L(p, w) (static_cast<const ::risc0::Fp>(::risc0::Fp::fromRaw(ef_hotL(w) >= 0 ? EF_SMW(ef_hotL(w) < 0 ? 0 : ef_hotL(w)) : ef_ldl((p), (w)))))
 #define RK_ST1L(p, w, v) do { if (ef_hotL(w) >= 0) EF_SMW(ef_hotL(w) < 0 ? 0 : ef_hotL(w)) = ::risc0::Fp(v).asRaw(); else ef_stl((p), (w), ::risc0::Fp(v).asRaw()); } while (0)
+#endif // archsel_hip
 #else
 #define RK_LD1M RK_LD1
 #define RK_ST1M RK_ST1
@@ -1207,7 +1270,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* arg0,
   EF_W((ef_wst(efw, 18u, x356); ef_wblk(efw, efd_1, 12u, efq_1_12); ef_wblk(efw, efd_1, 16u, efq_1_16); FpExt x357 = ef_wfin(efw, efd_1, 0u, arg3);), FpExt x357 = rk_fin(rk_link_kl(x351, x356, 19u, EF_DEP(x334.lo[0])));)
 #endif // archsel_hip
   auto x53 = ::risc0::Fp::fromRaw(efl_arg8_26_0);
-  RkW _cx358 = _cx289; rk_cl_acc(_cx358, x53 * x357, 277u); FpExt x358 = rkw_fin(_cx358);
+  RkW _cx358 = _cx289; rk_cl_accl(_cx358, x53 * x357, 277u, EF_DEP(_cx289.lo[0])); FpExt x358 = rkw_fin(_cx358);
   const uint32_t efl_arg8_27_0 = EF_LDCR(arg8, 27u, 0u);
   constexpr Fp x24(3);
   auto x359 = x290 - x24;
@@ -1241,7 +1304,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* arg0,
   EF_W((ef_wst(efw, 10u, x35); ef_wblk(efw, efd_2, 4u, efq_2_4); ef_wblk(efw, efd_2, 8u, efq_2_8); FpExt x370 = ef_wfin(efw, efd_2, 0u, arg3);), FpExt x370 = rk_fin(rk_link_kl(x369, x35, 11u, EF_DEP(x366.lo[0])));)
 #endif // archsel_hip
   auto x54 = ::risc0::Fp::fromRaw(efl_arg8_27_0);
-  RkW _cx371 = _cx358; rk_cl_acc(_cx371, x54 * x370, 283u); FpExt x371 = rkw_fin(_cx371);
+  RkW _cx371 = _cx358; rk_cl_accl(_cx371, x54 * x370, 283u, EF_DEP(_cx358.lo[0])); FpExt x371 = rkw_fin(_cx371);
   constexpr Fp x23(19);
   const uint32_t efl_arg8_28_0 = EF_LDCR(arg8, 28u, 0u);
   const uint32_t efl_arg8_21_0 = EF_LDCR(arg8, 21u, 0u);
@@ -1266,7 +1329,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* arg0,
   EF_W((ef_wst(efw, 5u, x35); ef_wblk(efw, efd_4, 0u, efq_4_0); ef_wblk(efw, efd_4, 4u, efq_4_4); FpExt x379 = ef_wfin(efw, efd_4, 0u, x373);), FpExt x379 = rk_fin(rk_link_kl(x378, x35, 6u, EF_DEP(x375.lo[0])));)
 #endif // archsel_hip
   auto x56 = ::risc0::Fp::fromRaw(efl_arg8_28_0);
-  RkW _cx380 = _cx371; rk_cl_acc(_cx380, x56 * x379, 286u); FpExt x380 = rkw_fin(_cx380);
+  RkW _cx380 = _cx371; rk_cl_accl(_cx380, x56 * x379, 286u, EF_DEP(_cx371.lo[0])); FpExt x380 = rkw_fin(_cx380);
   auto x381 = x37 + x38;
   auto x57 = ::risc0::Fp::fromRaw(efl_arg8_21_0);
   // lincombF: fused into a lazy Fp linear combination
@@ -1907,7 +1970,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* arg0,
 #else // archsel_hip
   FpExt x758 = rk_fin(rk_link_kl(x682, x2000385, 1u, EF_DEP(x679.lo[0])));
 #endif // archsel_hip
-  RkW _cx759 = _cx683; rk_cl_acc(_cx759, x58 * x758, 154u); FpExt x759 = rkw_fin(_cx759);
+  RkW _cx759 = _cx683; rk_cl_accl(_cx759, x58 * x758, 154u, EF_DEP(_cx683.lo[0])); FpExt x759 = rkw_fin(_cx759);
   auto x760 = (((::risc0::Fp::fromRaw(efl_arg8_79_0) * Fp(4u)) + ::risc0::Fp::fromRaw(efl_arg8_80_0)) - Fp(7u));
   auto x2000386 = x760 - x604;
 #if defined(__GFX12__) // archsel_hip
@@ -1915,7 +1978,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* arg0,
 #else // archsel_hip
   FpExt x834 = rk_fin(rk_link_kl(x682, x2000386, 1u, EF_DEP(x680.lo[0])));
 #endif // archsel_hip
-  RkW _cx835 = _cx759; rk_cl_acc(_cx835, x91 * x834, 220u); FpExt x835 = rkw_fin(_cx835);
+  RkW _cx835 = _cx759; rk_cl_accl(_cx835, x91 * x834, 220u, EF_DEP(_cx759.lo[0])); FpExt x835 = rkw_fin(_cx835);
   auto x836 = x292 - x439;
   auto x837 = x294 - x504;
 #if defined(__GFX12__) // archsel_hip
@@ -1973,7 +2036,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* arg0,
   EF_W((const int efq_9_16 = ef_wq4(efw, 17u, 18u, 17u, 17u, 2u); ef_wst(efw, 16u, x350);), RkAcc x858 = rk_link_nf_kl(x857, x350, 17u, EF_DEP(x854.lo[0]));)
   EF_W((ef_wst(efw, 17u, x356); ef_wblk(efw, efd_9, 12u, efq_9_12); ef_wblk(efw, efd_9, 16u, efq_9_16); FpExt x859 = ef_wfin(efw, efd_9, 0u, x373);), FpExt x859 = rk_fin(rk_link_kl(x858, x356, 18u, EF_DEP(x855.lo[0])));)
 #endif // archsel_hip
-  RkW _cx860 = _cx835; rk_cl_acc(_cx860, x92 * x859, 274u); FpExt x860 = rkw_fin(_cx860);
+  RkW _cx860 = _cx835; rk_cl_accl(_cx860, x92 * x859, 274u, EF_DEP(_cx835.lo[0])); FpExt x860 = rkw_fin(_cx860);
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_10[4] = {}; const int efq_10_0 = ef_wq(efw, 1u); ef_wst(efw, 0u, x359);), RkAcc x861 = rk_link_nf_k(x373, x359, 1u);)
   EF_W((ef_wst(efw, 1u, x299);), RkAcc x862 = rk_link_k(x861, x299, 2u);)
@@ -1997,7 +2060,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* arg0,
   EF_W((const int efq_10_8 = ef_wq4(efw, 9u, 10u, 9u, 9u, 2u); ef_wst(efw, 8u, x34);), RkAcc x869 = rk_link_nf_kl(x868, x34, 9u, EF_DEP(x865.lo[0]));)
   EF_W((ef_wst(efw, 9u, x35); ef_wblk(efw, efd_10, 4u, efq_10_4); ef_wblk(efw, efd_10, 8u, efq_10_8); FpExt x870 = ef_wfin(efw, efd_10, 0u, x373);), FpExt x870 = rk_fin(rk_link_kl(x869, x35, 10u, EF_DEP(x866.lo[0])));)
 #endif // archsel_hip
-  RkW _cx871 = _cx860; rk_cl_acc(_cx871, x36 * x870, 277u); FpExt x871 = rkw_fin(_cx871);
+  RkW _cx871 = _cx860; rk_cl_accl(_cx871, x36 * x870, 277u, EF_DEP(_cx860.lo[0])); FpExt x871 = rkw_fin(_cx871);
   constexpr Fp x7(99);
   auto x872 = x55 - x7;
   auto x873 = ef_lsub(x37, x38);
@@ -2069,46 +2132,38 @@ __device__ EF_CHAIN FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* arg0,
   EF_W((ef_wst(efw, 13u, x34);), RkAcc x900 = rk_link_kl(x899, x34, 14u, EF_DEP(x896.lo[0]));)
   EF_W((ef_wst(efw, 14u, x35); ef_wblk(efw, efd_12, 8u, efq_12_8); ef_wblk(efw, efd_12, 12u, efq_12_12); FpExt x901 = ef_wfin(efw, efd_12, 0u, x875);), FpExt x901 = rk_fin(rk_link_kl(x900, x35, 15u, EF_DEP(x897.lo[0])));)
 #endif // archsel_hip
-  RkW _cx902 = _cx871; rk_cl_acc(_cx902, x53 * x901, 281u); FpExt x902 = rkw_fin(_cx902);
+  RkW _cx902 = _cx871; rk_cl_accl(_cx902, x53 * x901, 281u, EF_DEP(_cx871.lo[0])); FpExt x902 = rkw_fin(_cx902);
   auto x903 = x290 - x27;
   auto x2000387 = x903 - x290;
 #if defined(__GFX12__) // archsel_hip
-  FpExt x918 = rk_fin(rk_link_k(x901, x2000387, 1u));
+  FpExt x918 = rk_fin(rk_link_kl(x901, x2000387, 1u, EF_DEP(x373.elems[0].asRaw())));
 #else // archsel_hip
   FpExt x918 = rk_fin(rk_link_kl(x901, x2000387, 1u, EF_DEP(x898.lo[0])));
 #endif // archsel_hip
-  RkW _cx919 = _cx902; rk_cl_acc(_cx919, x54 * x918, 285u); FpExt x919 = rkw_fin(_cx919);
+  RkW _cx919 = _cx902; rk_cl_accl(_cx919, x54 * x918, 285u, EF_DEP(_cx902.lo[0])); FpExt x919 = rkw_fin(_cx919);
   auto x2000389 = x872 - x372;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x2000388 = rk_link_nf_k(x859, x2000389, 0u);
+  RkAcc x2000388 = rk_link_nf_kl(x859, x2000389, 0u, EF_DEP(x758.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x2000388 = rk_link_nf_kl(x859, x2000389, 0u, EF_DEP(x899.lo[0]));
 #endif // archsel_hip
   auto x2000391 = x604 - x291;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x2000390 = rk_link_k(x2000388, x2000391, 1u);
+  RkAcc x2000390 = rk_link_kl(x2000388, x2000391, 1u, EF_DEP(x834.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x2000390 = rk_link_kl(x2000388, x2000391, 1u, EF_DEP(x900.lo[0]));
 #endif // archsel_hip
   auto x2000393 = x305 - x841;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x2000392 = rk_link_nf_k(x2000390, x2000393, 4u);
+  RkAcc x2000392 = rk_link_nf_kl(x2000390, x2000393, 4u, EF_DEP(x875.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x2000392 = rk_link_nf_kl(x2000390, x2000393, 4u, EF_DEP(x901.elems[0].asRaw()));
 #endif // archsel_hip
   auto x2000395 = x314 - x846;
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x2000394 = rk_link_k(x2000392, x2000395, 7u);
-#else // archsel_hip
   RkAcc x2000394 = rk_link_kl(x2000392, x2000395, 7u, EF_DEP(x918.elems[0].asRaw()));
-#endif // archsel_hip
   auto x2000396 = x332 - x853;
-#if defined(__GFX12__) // archsel_hip
-  FpExt x937 = rk_fin(rk_link_k(x2000394, x2000396, 13u));
-#else // archsel_hip
   FpExt x937 = rk_fin(rk_link_kl(x2000394, x2000396, 13u, EF_DEP(x2000388.lo[0])));
-#endif // archsel_hip
-  RkW _cx938 = _cx919; rk_cl_acc(_cx938, x56 * x937, 292u); FpExt x938 = rkw_fin(_cx938);
+  RkW _cx938 = _cx919; rk_cl_accl(_cx938, x56 * x937, 292u, EF_DEP(_cx919.lo[0])); FpExt x938 = rkw_fin(_cx938);
   const uint32_t efl_arg8_18_0 = EF_LDCR(arg8, 18u, 0u);
   const uint32_t efl_arg8_14_4 = EF_LDCR(arg8, 14u, 4u);
   auto x939 = ef_lsub(x440, x430);
@@ -2266,7 +2321,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* arg0,
 #endif // archsel_hip
   const uint32_t efl_arg8_78_0 = EF_LDCR(arg8, 78u, 0u);
   auto x151 = ::risc0::Fp::fromRaw(efl_arg8_2_0);
-  RkW _cx1037 = _cx593; rk_cl_acc(_cx1037, x151 * x1036, 343u); FpExt x1037 = rkw_fin(_cx1037);
+  RkW _cx1037 = _cx593; rk_cl_accl(_cx1037, x151 * x1036, 343u, EF_DEP(_cx593.lo[0])); FpExt x1037 = rkw_fin(_cx1037);
   auto x1038 = x92 + x36;
   auto x1039 = x1038 + x53;
   auto x1040 = x1039 + x54;
@@ -2307,7 +2362,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* arg0,
   auto x1062 = x290 - x5;
   auto x2000397 = x1062 - x604;
 #if defined(__GFX12__) // archsel_hip
-  FpExt x1080 = rk_fin(rk_link_k(x937, x2000397, 1u));
+  FpExt x1080 = rk_fin(rk_link_kl(x937, x2000397, 1u, EF_DEP(x2000390.lo[0])));
 #else // archsel_hip
   FpExt x1080 = rk_fin(rk_link_kl(x937, x2000397, 1u, EF_DEP(x1033.lo[0])));
 #endif // archsel_hip
@@ -2335,14 +2390,14 @@ __device__ EF_CHAIN FpExt rv32im_v2_19(uint32_t cycle, uint32_t steps, Fp* arg0,
   EF_W((const int efq_17_8 = ef_wq4(efw, 9u, 10u, 9u, 9u, 2u); ef_wst(efw, 8u, x34);), RkAcc x1090 = rk_link_nf_kl(x1089, x34, 9u, EF_DEP(x1086.lo[0]));)
   EF_W((ef_wst(efw, 9u, x35); ef_wblk(efw, efd_17, 4u, efq_17_4); ef_wblk(efw, efd_17, 8u, efq_17_8); FpExt x1091 = ef_wfin(efw, efd_17, 0u, x875);), FpExt x1091 = rk_fin(rk_link_kl(x1090, x35, 10u, EF_DEP(x1087.lo[0])));)
 #endif // archsel_hip
-  RkW _cx1092 = _cx1081; rk_cl_acc(_cx1092, x58 * x1091, 98u); FpExt x1092 = rkw_fin(_cx1092);
+  RkW _cx1092 = _cx1081; rk_cl_accl(_cx1092, x58 * x1091, 98u, EF_DEP(_cx1081.lo[0])); FpExt x1092 = rkw_fin(_cx1092);
   auto x2000398 = x760 - x684;
 #if defined(__GFX12__) // archsel_hip
-  FpExt x1102 = rk_fin(rk_link_k(x1091, x2000398, 1u));
+  FpExt x1102 = rk_fin(rk_link_kl(x1091, x2000398, 1u, EF_DEP(x2000392.lo[0])));
 #else // archsel_hip
   FpExt x1102 = rk_fin(rk_link_kl(x1091, x2000398, 1u, EF_DEP(x1088.lo[0])));
 #endif // archsel_hip
-  RkW _cx1103 = _cx1092; rk_cl_acc(_cx1103, x91 * x1102, 109u); FpExt x1103 = rkw_fin(_cx1103);
+  RkW _cx1103 = _cx1092; rk_cl_accl(_cx1103, x91 * x1102, 109u, EF_DEP(_cx1092.lo[0])); FpExt x1103 = rkw_fin(_cx1103);
   constexpr Fp x4(111);
   auto x1104 = ef_lsub(x55, x4);
   auto x2000002 = x92 * x1104;
@@ -2667,11 +2722,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* arg0,
   RkAcc x246 = rk_link_k(x242, x245, 74u);
   auto x40 = ::risc0::Fp::fromRaw(efl_arg9_111_0);
   auto x247 = ef_lsub(x40, x244);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x248 = rk_fin(rk_link_k(x246, x247, 75u));
-#else // archsel_hip
   FpExt x248 = rk_fin(rk_link_kl(x246, x247, 75u, EF_DEP(x238.lo[0])));
-#endif // archsel_hip
   constexpr Fp x32(3);
   auto x41 = ::risc0::Fp::fromRaw(efl_arg9_56_0);
   auto x249 = ef_lsub(x41, x32);
@@ -2683,11 +2734,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* arg0,
   auto x251 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_94_0));
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx253 = rkw1_ff0(x42, x37, false); rkw1_ff(_wx253, x251, x35, false); auto x253 = rkw1_fin(_wx253);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x254 = rk_fin(rk_link_k(arg2, x249, 0u));
-#else // archsel_hip
   FpExt x254 = rk_fin(rk_link_kl(arg2, x249, 0u, EF_DEP(x240.lo[0])));
-#endif // archsel_hip
   auto x255 = ((::risc0::Fp::fromRaw(efl_arg9_51_0) * Fp(4u)) + ::risc0::Fp::fromRaw(efl_arg9_52_0));
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_22[4] = {}; const int efq_22_0 = ef_wq(efw, 1u); ef_wst(efw, 0u, x255);), RkAcc x256 = rk_link_nf_k(x254, x255, 1u);)
@@ -2808,7 +2855,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* arg0,
   EF_W((ef_wst(efw, 7u, x51); ef_wblk(efw, efd_23, 0u, efq_23_0); ef_wblk(efw, efd_23, 4u, efq_23_4); FpExt x294 = ef_wfin(efw, efd_23, 0u, x254);), FpExt x294 = rk_fin(rk_link_kl(x293, x51, 8u, EF_DEP(x286.lo[0])));)
 #endif // archsel_hip
   auto x52 = ::risc0::Fp::fromRaw(efl_arg9_22_0);
-  RkW _cx295 = _cx280; rk_cl_acc(_cx295, x52 * x294, 85u); FpExt x295 = rkw_fin(_cx295);
+  RkW _cx295 = _cx280; rk_cl_accl(_cx295, x52 * x294, 85u, EF_DEP(_cx280.lo[0])); FpExt x295 = rkw_fin(_cx295);
   constexpr Fp x28(2);
   auto x296 = x255 - x28;
 #if defined(__GFX12__) // archsel_hip
@@ -2833,7 +2880,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* arg0,
   EF_W((ef_wst(efw, 6u, x47); ef_wblk(efw, efd_24, 0u, efq_24_0); ef_wblk(efw, efd_24, 4u, efq_24_4); FpExt x303 = ef_wfin(efw, efd_24, 0u, x254);), FpExt x303 = rk_fin(rk_link_kl(x302, x47, 7u, EF_DEP(x299.lo[0])));)
 #endif // archsel_hip
   auto x53 = ::risc0::Fp::fromRaw(efl_arg9_23_0);
-  RkW _cx304 = _cx295; rk_cl_acc(_cx304, x53 * x303, 94u); FpExt x304 = rkw_fin(_cx304);
+  RkW _cx304 = _cx295; rk_cl_accl(_cx304, x53 * x303, 94u, EF_DEP(_cx295.lo[0])); FpExt x304 = rkw_fin(_cx304);
   constexpr Fp x27(4);
   auto x305 = x255 - x27;
 #if defined(__GFX12__) // archsel_hip
@@ -2852,7 +2899,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* arg0,
   EF_W((ef_wst(efw, 5u, x47); ef_wblk(efw, efd_25, 0u, efq_25_0); ef_wblk(efw, efd_25, 4u, efq_25_4); FpExt x311 = ef_wfin(efw, efd_25, 0u, x254);), FpExt x311 = rk_fin(rk_link_kl(x310, x47, 6u, EF_DEP(x307.lo[0])));)
 #endif // archsel_hip
   auto x54 = ::risc0::Fp::fromRaw(efl_arg9_24_0);
-  RkW _cx312 = _cx304; rk_cl_acc(_cx312, x54 * x311, 102u); FpExt x312 = rkw_fin(_cx312);
+  RkW _cx312 = _cx304; rk_cl_accl(_cx312, x54 * x311, 102u, EF_DEP(_cx304.lo[0])); FpExt x312 = rkw_fin(_cx312);
   const uint32_t efl_arg9_25_0 = EF_LDCR(arg9, 25u, 0u);
   const uint32_t efl_arg9_26_0 = EF_LDCR(arg9, 26u, 0u);
   const uint32_t efl_arg9_27_0 = EF_LDCR(arg9, 27u, 0u);
@@ -2875,13 +2922,13 @@ __device__ EF_CHAIN FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* arg0,
   EF_W((ef_wst(efw, 5u, x47); ef_wblk(efw, efd_26, 0u, efq_26_0); ef_wblk(efw, efd_26, 4u, efq_26_4); FpExt x319 = ef_wfin(efw, efd_26, 0u, x254);), FpExt x319 = rk_fin(rk_link_kl(x318, x47, 6u, EF_DEP(x315.lo[0])));)
 #endif // archsel_hip
   auto x55 = ::risc0::Fp::fromRaw(efl_arg9_25_0);
-  RkW _cx320 = _cx312; rk_cl_acc(_cx320, x55 * x319, 109u); FpExt x320 = rkw_fin(_cx320);
+  RkW _cx320 = _cx312; rk_cl_accl(_cx320, x55 * x319, 109u, EF_DEP(_cx312.lo[0])); FpExt x320 = rkw_fin(_cx320);
   auto x56 = ::risc0::Fp::fromRaw(efl_arg9_26_0);
-  RkW _cx321 = _cx320; rk_cl_acc(_cx321, x56 * arg3, 116u); FpExt x321 = rkw_fin(_cx321);
+  RkW _cx321 = _cx320; rk_cl_accl(_cx321, x56 * arg3, 116u, EF_DEP(_cx320.lo[0])); FpExt x321 = rkw_fin(_cx321);
   auto x57 = ::risc0::Fp::fromRaw(efl_arg9_27_0);
-  RkW _cx322 = _cx321; rk_cl_acc(_cx322, x57 * arg3, 121u); FpExt x322 = rkw_fin(_cx322);
+  RkW _cx322 = _cx321; rk_cl_accl(_cx322, x57 * arg3, 121u, EF_DEP(_cx321.lo[0])); FpExt x322 = rkw_fin(_cx322);
   auto x58 = ::risc0::Fp::fromRaw(efl_arg9_28_0);
-  RkW _cx323 = _cx322; rk_cl_acc(_cx323, x58 * arg3, 126u); FpExt x323 = rkw_fin(_cx323);
+  RkW _cx323 = _cx322; rk_cl_accl(_cx323, x58 * arg3, 126u, EF_DEP(_cx322.lo[0])); FpExt x323 = rkw_fin(_cx323);
   const uint32_t efl_arg9_113_0 = EF_LDCR(arg9, 113u, 0u);
   auto x59 = ::risc0::Fp::fromRaw(efl_arg9_32_0);
   // lincombF: fused into a lazy Fp linear combination
@@ -3569,7 +3616,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* arg0,
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
 #if defined(__GFX12__) // archsel_hip
-  FpExt x565 = rk_fin(rk_link_k(arg2, x561, 0u));
+  FpExt x565 = rk_fin(rk_link_kl(arg2, x561, 0u, EF_DEP(x242.lo[0])));
   EF_W((ef_v4i efd_30[4] = {}; const int efq_30_0 = ef_wq(efw, 1u); ef_wst(efw, 0u, x255);), RkAcc x566 = rk_link_nf_k(x565, x255, 1u);)
   EF_W((ef_wst(efw, 1u, x257);), RkAcc x567 = rk_link_k(x566, x257, 2u);)
   EF_W((ef_wst(efw, 2u, x259);), RkAcc x568 = rk_link_nf_k(x567, x259, 3u);)
@@ -3615,7 +3662,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* arg0,
   EF_W((const int efq_31_4 = ef_wq4(efw, 5u, 6u, 5u, 5u, 2u); ef_wst(efw, 4u, x51);), RkAcc x582 = rk_link_nf_kl(x581, x51, 5u, EF_DEP(x578.lo[0]));)
   EF_W((ef_wst(efw, 5u, x47); ef_wblk(efw, efd_31, 0u, efq_31_0); ef_wblk(efw, efd_31, 4u, efq_31_4); FpExt x583 = ef_wfin(efw, efd_31, 0u, x565);), FpExt x583 = rk_fin(rk_link_kl(x582, x47, 6u, EF_DEP(x579.lo[0])));)
 #endif // archsel_hip
-  RkW _cx584 = _cx577; rk_cl_acc(_cx584, x52 * x583, 113u); FpExt x584 = rkw_fin(_cx584);
+  RkW _cx584 = _cx577; rk_cl_accl(_cx584, x52 * x583, 113u, EF_DEP(_cx577.lo[0])); FpExt x584 = rkw_fin(_cx584);
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_32[4] = {}; const int efq_32_0 = ef_wq(efw, 1u); ef_wst(efw, 0u, x296);), RkAcc x585 = rk_link_nf_k(x565, x296, 1u);)
   EF_W((ef_wst(efw, 1u, x101);), RkAcc x586 = rk_link_k(x585, x101, 2u);)
@@ -3633,12 +3680,12 @@ __device__ EF_CHAIN FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* arg0,
   EF_W((ef_wst(efw, 5u, x51);), RkAcc x590 = rk_link_kl(x589, x51, 6u, EF_DEP(x586.lo[0]));)
   EF_W((ef_wst(efw, 6u, x47); ef_wblk(efw, efd_32, 0u, efq_32_0); ef_wblk(efw, efd_32, 4u, efq_32_4); FpExt x591 = ef_wfin(efw, efd_32, 0u, x565);), FpExt x591 = rk_fin(rk_link_kl(x590, x47, 7u, EF_DEP(x587.lo[0])));)
 #endif // archsel_hip
-  RkW _cx592 = _cx584; rk_cl_acc(_cx592, x53 * x591, 120u); FpExt x592 = rkw_fin(_cx592);
-  RkW _cx593 = _cx592; rk_cl_acc(_cx593, x54 * arg3, 128u); FpExt x593 = rkw_fin(_cx593);
-  RkW _cx594 = _cx593; rk_cl_acc(_cx594, x55 * arg3, 133u); FpExt x594 = rkw_fin(_cx594);
-  RkW _cx595 = _cx594; rk_cl_acc(_cx595, x56 * arg3, 138u); FpExt x595 = rkw_fin(_cx595);
-  RkW _cx596 = _cx595; rk_cl_acc(_cx596, x57 * arg3, 143u); FpExt x596 = rkw_fin(_cx596);
-  RkW _cx597 = _cx596; rk_cl_acc(_cx597, x58 * arg3, 148u); FpExt x597 = rkw_fin(_cx597);
+  RkW _cx592 = _cx584; rk_cl_accl(_cx592, x53 * x591, 120u, EF_DEP(_cx584.lo[0])); FpExt x592 = rkw_fin(_cx592);
+  RkW _cx593 = _cx592; rk_cl_accl(_cx593, x54 * arg3, 128u, EF_DEP(_cx592.lo[0])); FpExt x593 = rkw_fin(_cx593);
+  RkW _cx594 = _cx593; rk_cl_accl(_cx594, x55 * arg3, 133u, EF_DEP(_cx593.lo[0])); FpExt x594 = rkw_fin(_cx594);
+  RkW _cx595 = _cx594; rk_cl_accl(_cx595, x56 * arg3, 138u, EF_DEP(_cx594.lo[0])); FpExt x595 = rkw_fin(_cx595);
+  RkW _cx596 = _cx595; rk_cl_accl(_cx596, x57 * arg3, 143u, EF_DEP(_cx595.lo[0])); FpExt x596 = rkw_fin(_cx596);
+  RkW _cx597 = _cx596; rk_cl_accl(_cx597, x58 * arg3, 148u, EF_DEP(_cx596.lo[0])); FpExt x597 = rkw_fin(_cx597);
   // lincombF: fused into a lazy Fp linear combination
   auto x599 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_110_0));
   auto x108 = ::risc0::Fp::fromRaw(efl_arg9_34_0);
@@ -3787,7 +3834,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* arg0,
   EF_W((ef_wst(efw, 13u, x661); ef_wblk(efw, efd_33, 8u, efq_33_8); ef_wblk(efw, efd_33, 12u, efq_33_12); FpExt x662 = ef_wfin(efw, efd_33, 0u, x597);), FpExt x662 = rk_fin(rk_link_kl(x658, x661, 167u, EF_DEP(x649.lo[0])));)
 #endif // archsel_hip
   auto x120 = ::risc0::Fp::fromRaw(efl_arg9_7_0);
-  RkW _cx663 = _cx403; rk_cl_acc(_cx663, x120 * x662, 418u); FpExt x663 = rkw_fin(_cx663);
+  RkW _cx663 = _cx403; rk_cl_accl(_cx663, x120 * x662, 418u, EF_DEP(_cx403.lo[0])); FpExt x663 = rkw_fin(_cx663);
   auto x664 = ((Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_18_0)) * ::risc0::Fp::fromRaw(efl_arg9_16_4));
   auto x665 = x664 - x33;
   auto x666 = ((Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_18_0)) * ::risc0::Fp::fromRaw(efl_arg9_14_4));
@@ -3811,14 +3858,14 @@ __device__ EF_CHAIN FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* arg0,
   auto x121 = ::risc0::Fp::fromRaw(efl_arg9_189_0);
   auto x674 = x121 - x454;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x675 = rk_link_nf_k(arg2, x674, 0u);
+  RkAcc x675 = rk_link_nf_kl(arg2, x674, 0u, EF_DEP(x246.lo[0]));
 #else // archsel_hip
   RkAcc x675 = rk_link_nf_kl(arg2, x674, 0u, EF_DEP(x653.lo[0]));
 #endif // archsel_hip
   auto x122 = ::risc0::Fp::fromRaw(efl_arg9_191_0);
   auto x676 = x122 - x367;
 #if defined(__GFX12__) // archsel_hip
-  FpExt x677 = rk_fin(rk_link_k(x675, x676, 1u));
+  FpExt x677 = rk_fin(rk_link_kl(x675, x676, 1u, EF_DEP(x248.elems[0].asRaw())));
 #else // archsel_hip
   FpExt x677 = rk_fin(rk_link_kl(x675, x676, 1u, EF_DEP(x656.lo[0])));
 #endif // archsel_hip
@@ -4605,13 +4652,13 @@ __device__ EF_CHAIN FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* arg0,
 #endif // archsel_hip
   RkW _cx901 = rk_cl0(x677, x48 * x900, 2u); FpExt x901 = rkw_fin(_cx901);
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x902 = rk_link_nf_k(arg2, x665, 0u);
+  RkAcc x902 = rk_link_nf_kl(arg2, x665, 0u, EF_DEP(x254.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x902 = rk_link_nf_kl(arg2, x665, 0u, EF_DEP(x897.lo[0]));
 #endif // archsel_hip
   auto x903 = (::risc0::Fp::fromRaw(efl_arg9_181_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_181_0)));
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x904 = rk_link_k(x902, x903, 1u);
+  RkAcc x904 = rk_link_kl(x902, x903, 1u, EF_DEP(x565.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x904 = rk_link_kl(x902, x903, 1u, EF_DEP(x898.lo[0]));
 #endif // archsel_hip
@@ -4621,29 +4668,22 @@ __device__ EF_CHAIN FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* arg0,
   auto x906 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_181_0));
   auto x907 = x905 - x906;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x908 = rk_link_nf_k(x904, x907, 2u);
+  RkAcc x908 = rk_link_nf_kl(x904, x907, 2u, EF_DEP(x675.lo[0]));
 #else // archsel_hip
   RkAcc x908 = rk_link_nf_kl(x904, x907, 2u, EF_DEP(x899.lo[0]));
 #endif // archsel_hip
   auto x209 = ::risc0::Fp::fromRaw(efl_arg9_181_0);
   auto x909 = x209 * x667;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x910 = rk_link_k(x908, x909, 3u);
+  RkAcc x910 = rk_link_kl(x908, x909, 3u, EF_DEP(x677.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x910 = rk_link_kl(x908, x909, 3u, EF_DEP(x900.elems[0].asRaw()));
 #endif // archsel_hip
   auto x911 = ef_lmul(x209, x208);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x912 = rk_fin(rk_link_k(x910, x911, 4u));
-  RkAcc x913 = rk_link_nf_k(arg2, x693, 0u);
-  FpExt x914 = rk_fin(rk_link_k(x913, x695, 1u));
-  FpExt x915 = rk_fin(rk_link_k(x914, x697, 2u));
-#else // archsel_hip
   FpExt x912 = rk_fin(rk_link_kl(x910, x911, 4u, EF_DEP(x902.lo[0])));
   RkAcc x913 = rk_link_nf_kl(arg2, x693, 0u, EF_DEP(x904.lo[0]));
   FpExt x914 = rk_fin(rk_link_kl(x913, x695, 1u, EF_DEP(x908.lo[0])));
   FpExt x915 = rk_fin(rk_link_kl(x914, x697, 2u, EF_DEP(x910.lo[0])));
-#endif // archsel_hip
   constexpr Fp x13(1073725572);
   auto x917 = x44 - x13;
 #if defined(__GFX12__) // archsel_hip
@@ -5093,7 +5133,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* arg0,
 #else // archsel_hip
   EF_W((ef_wst(efw, 13u, x1079); ef_wblk(efw, efd_40, 8u, efq_40_56); ef_wblk(efw, efd_40, 12u, efq_40_60); FpExt x1080 = ef_wfin(efw, efd_40, 0u, efb_40);), FpExt x1080 = rk_fin(rk_link_kl(x1078, x1079, 71u, EF_DEP(x1071.lo[0])));)
 #endif // archsel_hip
-  RkW _cx1081 = _cx958; rk_cl_acc(_cx1081, x906 * x1080, 41u); FpExt x1081 = rkw_fin(_cx1081);
+  RkW _cx1081 = _cx958; rk_cl_accl(_cx1081, x906 * x1080, 41u, EF_DEP(_cx958.lo[0])); FpExt x1081 = rkw_fin(_cx1081);
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_41[4] = {}; const int efq_41_0 = ef_wq(efw, 113u); ef_wst(efw, 0u, x65);), RkAcc x1082 = rk_link_nf_k(x1081, x65, 113u);)
   EF_W((ef_wst(efw, 1u, x102);), RkAcc x1083 = rk_link_k(x1082, x102, 114u);)
@@ -5165,7 +5205,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_15(uint32_t cycle, uint32_t steps, Fp* arg0,
   EF_W((ef_wst(efw, 6u, x206);), RkAcc x1112 = rk_link_nf_kl(x1111, x206, 143u, EF_DEP(x1108.lo[0]));)
   EF_W((ef_wst(efw, 7u, x207); ef_wblk(efw, efd_41, 0u, efq_41_24); ef_wblk(efw, efd_41, 4u, efq_41_28); FpExt x1113 = ef_wfin(efw, efd_41, 0u, x1081);), FpExt x1113 = rk_fin(rk_link_kl(x1112, x207, 144u, EF_DEP(x1109.lo[0])));)
 #endif // archsel_hip
-  RkW _cx1114 = _cx901; rk_cl_acc(_cx1114, x52 * x1113, 132u); FpExt x1114 = rkw_fin(_cx1114);
+  RkW _cx1114 = _cx901; rk_cl_accl(_cx1114, x52 * x1113, 132u, EF_DEP(_cx901.lo[0])); FpExt x1114 = rkw_fin(_cx1114);
   auto x1115 = x668 - x209;
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_42[4] = {}; const int efq_42_0 = ef_wq(efw, 0u); ef_wst(efw, 0u, x1115);), RkAcc x1116 = rk_link_nf_k(arg2, x1115, 0u);)
@@ -6116,9 +6156,9 @@ __device__ EF_CHAIN FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* arg0,
   EF_W((ef_wst(efw, 1u, x53); ef_wblk(efw, efd_48, 0u, efq_48_48); FpExt x330 = ef_wfin(efw, efd_48, 0u, efb_48);), FpExt x330 = rk_fin(rk_link_kl(x329, x53, 86u, EF_DEP(x326.lo[0])));)
 #endif // archsel_hip
   auto x84 = ::risc0::Fp::fromRaw(efl_arg10_24_0);
-  RkW _cx331 = _cx208; rk_cl_acc(_cx331, x84 * x330, 411u); FpExt x331 = rkw_fin(_cx331);
+  RkW _cx331 = _cx208; rk_cl_accl(_cx331, x84 * x330, 411u, EF_DEP(_cx208.lo[0])); FpExt x331 = rkw_fin(_cx331);
   auto x85 = ::risc0::Fp::fromRaw(efl_arg10_25_0);
-  RkW _cx332 = _cx331; rk_cl_acc(_cx332, x85 * x330, 412u); FpExt x332 = rkw_fin(_cx332);
+  RkW _cx332 = _cx331; rk_cl_accl(_cx332, x85 * x330, 412u, EF_DEP(_cx331.lo[0])); FpExt x332 = rkw_fin(_cx332);
   constexpr Fp x19(1);
   auto x86 = ::risc0::Fp::fromRaw(efl_arg10_33_4);
   auto x333 = ef_lsub(x19, x86);
@@ -6976,40 +7016,20 @@ __device__ EF_CHAIN FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* arg0,
 #endif // archsel_hip
   constexpr Fp x8(30720);
   auto x613 = x8 - x117;
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x614 = rk_link_nf_k(arg7, x116, 0u);
-#else // archsel_hip
   RkAcc x614 = rk_link_nf_kl(arg7, x116, 0u, EF_DEP(x605.lo[0]));
-#endif // archsel_hip
   auto x615 = x30 - x19;
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x616 = rk_link_k(x614, x615, 1u);
-#else // archsel_hip
   RkAcc x616 = rk_link_kl(x614, x615, 1u, EF_DEP(x609.elems[0].asRaw()));
-#endif // archsel_hip
   auto x118 = ::risc0::Fp::fromRaw(efl_arg10_159_0);
   const uint32_t efl_arg10_0_0 = EF_LDCR(arg10, 0u, 0u);
   auto x617 = ef_lsub(x118, x613);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x618 = rk_fin(rk_link_k(x616, x617, 2u));
-#else // archsel_hip
   FpExt x618 = rk_fin(rk_link_kl(x616, x617, 2u, EF_DEP(x611.lo[0])));
-#endif // archsel_hip
   RkW _cx619 = rk_cl0(x612, x107 * x618, 4u); FpExt x619 = rkw_fin(_cx619);
   constexpr Fp x7(30719);
   auto x620 = x7 - x117;
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x621 = rk_link_nf_k(arg7, x615, 0u);
-#else // archsel_hip
   RkAcc x621 = rk_link_nf_kl(arg7, x615, 0u, EF_DEP(x612.elems[0].asRaw()));
-#endif // archsel_hip
   auto x622 = x118 - x620;
-#if defined(__GFX12__) // archsel_hip
-  FpExt x623 = rk_fin(rk_link_k(x621, x622, 1u));
-#else // archsel_hip
   FpExt x623 = rk_fin(rk_link_kl(x621, x622, 1u, EF_DEP(x614.lo[0])));
-#endif // archsel_hip
-  RkW _cx624 = _cx619; rk_cl_acc(_cx624, x499 * x623, 7u); FpExt x624 = rkw_fin(_cx624);
+  RkW _cx624 = _cx619; rk_cl_accl(_cx624, x499 * x623, 7u, EF_DEP(_cx619.lo[0])); FpExt x624 = rkw_fin(_cx624);
   auto x625 = (::risc0::Fp::fromRaw(efl_arg10_68_0) - Fp(2013265920u));
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_54[4] = {}; const int efq_54_0 = ef_wq4(efw, 9u, 10u, 11u, 13u, 4u); ef_wst(efw, 0u, x625);), RkAcc x626 = rk_link_nf_k(x624, x625, 9u);)
@@ -7068,20 +7088,20 @@ __device__ EF_CHAIN FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* arg0,
 #endif // archsel_hip
   auto x648 = x8 - x121;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x649 = rk_link_nf_k(arg7, x120, 0u);
+  RkAcc x649 = rk_link_nf_kl(arg7, x120, 0u, EF_DEP(x616.lo[0]));
 #else // archsel_hip
   RkAcc x649 = rk_link_nf_kl(arg7, x120, 0u, EF_DEP(x639.lo[0]));
 #endif // archsel_hip
   auto x650 = (::risc0::Fp::fromRaw(efl_arg10_162_0) - Fp(1u));
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x651 = rk_link_k(x649, x650, 1u);
+  RkAcc x651 = rk_link_kl(x649, x650, 1u, EF_DEP(x618.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x651 = rk_link_kl(x649, x650, 1u, EF_DEP(x643.lo[0]));
 #endif // archsel_hip
   auto x122 = ::risc0::Fp::fromRaw(efl_arg10_163_0);
   auto x652 = ef_lsub(x122, x648);
 #if defined(__GFX12__) // archsel_hip
-  FpExt x653 = rk_fin(rk_link_k(x651, x652, 2u));
+  FpExt x653 = rk_fin(rk_link_kl(x651, x652, 2u, EF_DEP(x621.lo[0])));
 #else // archsel_hip
   FpExt x653 = rk_fin(rk_link_kl(x651, x652, 2u, EF_DEP(x645.lo[0])));
 #endif // archsel_hip
@@ -7089,18 +7109,14 @@ __device__ EF_CHAIN FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* arg0,
   RkW _cx654 = rk_cl0(x647, x106 * x653, 22u); FpExt x654 = rkw_fin(_cx654);
   auto x655 = x7 - x121;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x656 = rk_link_nf_k(arg7, x650, 0u);
+  RkAcc x656 = rk_link_nf_kl(arg7, x650, 0u, EF_DEP(x623.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x656 = rk_link_nf_kl(arg7, x650, 0u, EF_DEP(x647.elems[0].asRaw()));
 #endif // archsel_hip
   auto x657 = x122 - x655;
-#if defined(__GFX12__) // archsel_hip
-  FpExt x658 = rk_fin(rk_link_k(x656, x657, 1u));
-#else // archsel_hip
   FpExt x658 = rk_fin(rk_link_kl(x656, x657, 1u, EF_DEP(x649.lo[0])));
-#endif // archsel_hip
   auto x659 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg10_197_0));
-  RkW _cx660 = _cx654; rk_cl_acc(_cx660, x659 * x658, 25u); FpExt x660 = rkw_fin(_cx660);
+  RkW _cx660 = _cx654; rk_cl_accl(_cx660, x659 * x658, 25u, EF_DEP(_cx654.lo[0])); FpExt x660 = rkw_fin(_cx660);
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_57[4] = {}; const int efq_57_0 = ef_wq4(efw, 27u, 28u, 29u, 31u, 4u); ef_wst(efw, 0u, x356);), RkAcc x661 = rk_link_nf_k(x660, x356, 27u);)
   EF_W((ef_wst(efw, 1u, x358);), RkAcc x662 = rk_link_k(x661, x358, 28u);)
@@ -7154,13 +7170,13 @@ __device__ EF_CHAIN FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* arg0,
 #endif // archsel_hip
   auto x681 = x8 - x125;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x682 = rk_link_nf_k(arg7, x124, 0u);
+  RkAcc x682 = rk_link_nf_kl(arg7, x124, 0u, EF_DEP(x651.lo[0]));
 #else // archsel_hip
   RkAcc x682 = rk_link_nf_kl(arg7, x124, 0u, EF_DEP(x672.lo[0]));
 #endif // archsel_hip
   auto x683 = x36 - x19;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x684 = rk_link_k(x682, x683, 1u);
+  RkAcc x684 = rk_link_kl(x682, x683, 1u, EF_DEP(x653.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x684 = rk_link_kl(x682, x683, 1u, EF_DEP(x676.lo[0]));
 #endif // archsel_hip
@@ -7168,7 +7184,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* arg0,
   auto x126 = ::risc0::Fp::fromRaw(efl_arg10_167_0);
   auto x685 = ef_lsub(x126, x681);
 #if defined(__GFX12__) // archsel_hip
-  FpExt x686 = rk_fin(rk_link_k(x684, x685, 2u));
+  FpExt x686 = rk_fin(rk_link_kl(x684, x685, 2u, EF_DEP(x656.lo[0])));
 #else // archsel_hip
   FpExt x686 = rk_fin(rk_link_kl(x684, x685, 2u, EF_DEP(x678.lo[0])));
 #endif // archsel_hip
@@ -7176,18 +7192,14 @@ __device__ EF_CHAIN FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* arg0,
   RkW _cx687 = rk_cl0(x680, x127 * x686, 40u); FpExt x687 = rkw_fin(_cx687);
   auto x688 = x7 - x125;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x689 = rk_link_nf_k(arg7, x683, 0u);
+  RkAcc x689 = rk_link_nf_kl(arg7, x683, 0u, EF_DEP(x658.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x689 = rk_link_nf_kl(arg7, x683, 0u, EF_DEP(x680.elems[0].asRaw()));
 #endif // archsel_hip
   auto x690 = x126 - x688;
-#if defined(__GFX12__) // archsel_hip
-  FpExt x691 = rk_fin(rk_link_k(x689, x690, 1u));
-#else // archsel_hip
   FpExt x691 = rk_fin(rk_link_kl(x689, x690, 1u, EF_DEP(x682.lo[0])));
-#endif // archsel_hip
   auto x692 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg10_198_0));
-  RkW _cx693 = _cx687; rk_cl_acc(_cx693, x692 * x691, 43u); FpExt x693 = rkw_fin(_cx693);
+  RkW _cx693 = _cx687; rk_cl_accl(_cx693, x692 * x691, 43u, EF_DEP(_cx687.lo[0])); FpExt x693 = rkw_fin(_cx693);
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_60[4] = {}; const int efq_60_0 = ef_wq4(efw, 45u, 46u, 47u, 49u, 4u); ef_wst(efw, 0u, x376);), RkAcc x694 = rk_link_nf_k(x693, x376, 45u);)
   EF_W((ef_wst(efw, 1u, x378);), RkAcc x695 = rk_link_k(x694, x378, 46u);)
@@ -7241,20 +7253,20 @@ __device__ EF_CHAIN FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* arg0,
 #endif // archsel_hip
   auto x714 = x8 - x130;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x715 = rk_link_nf_k(arg7, x129, 0u);
+  RkAcc x715 = rk_link_nf_kl(arg7, x129, 0u, EF_DEP(x684.lo[0]));
 #else // archsel_hip
   RkAcc x715 = rk_link_nf_kl(arg7, x129, 0u, EF_DEP(x705.lo[0]));
 #endif // archsel_hip
   auto x716 = (::risc0::Fp::fromRaw(efl_arg10_170_0) - Fp(1u));
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x717 = rk_link_k(x715, x716, 1u);
+  RkAcc x717 = rk_link_kl(x715, x716, 1u, EF_DEP(x686.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x717 = rk_link_kl(x715, x716, 1u, EF_DEP(x709.lo[0]));
 #endif // archsel_hip
   auto x131 = ::risc0::Fp::fromRaw(efl_arg10_171_0);
   auto x718 = ef_lsub(x131, x714);
 #if defined(__GFX12__) // archsel_hip
-  FpExt x719 = rk_fin(rk_link_k(x717, x718, 2u));
+  FpExt x719 = rk_fin(rk_link_kl(x717, x718, 2u, EF_DEP(x689.lo[0])));
 #else // archsel_hip
   FpExt x719 = rk_fin(rk_link_kl(x717, x718, 2u, EF_DEP(x711.lo[0])));
 #endif // archsel_hip
@@ -7263,18 +7275,14 @@ __device__ EF_CHAIN FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* arg0,
   RkW _cx720 = rk_cl0(x713, x132 * x719, 58u); FpExt x720 = rkw_fin(_cx720);
   auto x721 = x7 - x130;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x722 = rk_link_nf_k(arg7, x716, 0u);
+  RkAcc x722 = rk_link_nf_kl(arg7, x716, 0u, EF_DEP(x691.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x722 = rk_link_nf_kl(arg7, x716, 0u, EF_DEP(x713.elems[0].asRaw()));
 #endif // archsel_hip
   auto x723 = x131 - x721;
-#if defined(__GFX12__) // archsel_hip
-  FpExt x724 = rk_fin(rk_link_k(x722, x723, 1u));
-#else // archsel_hip
   FpExt x724 = rk_fin(rk_link_kl(x722, x723, 1u, EF_DEP(x715.lo[0])));
-#endif // archsel_hip
   auto x725 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg10_199_0));
-  RkW _cx726 = _cx720; rk_cl_acc(_cx726, x725 * x724, 61u); FpExt x726 = rkw_fin(_cx726);
+  RkW _cx726 = _cx720; rk_cl_accl(_cx726, x725 * x724, 61u, EF_DEP(_cx720.lo[0])); FpExt x726 = rkw_fin(_cx726);
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_63[4] = {}; const int efq_63_0 = ef_wq4(efw, 63u, 64u, 65u, 67u, 4u); ef_wst(efw, 0u, x396);), RkAcc x727 = rk_link_nf_k(x726, x396, 63u);)
   EF_W((ef_wst(efw, 1u, x398);), RkAcc x728 = rk_link_k(x727, x398, 64u);)
@@ -7328,13 +7336,13 @@ __device__ EF_CHAIN FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* arg0,
 #endif // archsel_hip
   auto x747 = x8 - x135;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x748 = rk_link_nf_k(arg7, x134, 0u);
+  RkAcc x748 = rk_link_nf_kl(arg7, x134, 0u, EF_DEP(x717.lo[0]));
 #else // archsel_hip
   RkAcc x748 = rk_link_nf_kl(arg7, x134, 0u, EF_DEP(x738.lo[0]));
 #endif // archsel_hip
   auto x749 = x42 - x19;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x750 = rk_link_k(x748, x749, 1u);
+  RkAcc x750 = rk_link_kl(x748, x749, 1u, EF_DEP(x719.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x750 = rk_link_kl(x748, x749, 1u, EF_DEP(x742.lo[0]));
 #endif // archsel_hip
@@ -7342,7 +7350,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* arg0,
   auto x136 = ::risc0::Fp::fromRaw(efl_arg10_175_0);
   auto x751 = ef_lsub(x136, x747);
 #if defined(__GFX12__) // archsel_hip
-  FpExt x752 = rk_fin(rk_link_k(x750, x751, 2u));
+  FpExt x752 = rk_fin(rk_link_kl(x750, x751, 2u, EF_DEP(x722.lo[0])));
 #else // archsel_hip
   FpExt x752 = rk_fin(rk_link_kl(x750, x751, 2u, EF_DEP(x744.lo[0])));
 #endif // archsel_hip
@@ -7350,18 +7358,14 @@ __device__ EF_CHAIN FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* arg0,
   RkW _cx753 = rk_cl0(x746, x137 * x752, 76u); FpExt x753 = rkw_fin(_cx753);
   auto x754 = x7 - x135;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x755 = rk_link_nf_k(arg7, x749, 0u);
+  RkAcc x755 = rk_link_nf_kl(arg7, x749, 0u, EF_DEP(x724.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x755 = rk_link_nf_kl(arg7, x749, 0u, EF_DEP(x746.elems[0].asRaw()));
 #endif // archsel_hip
   auto x756 = x136 - x754;
-#if defined(__GFX12__) // archsel_hip
-  FpExt x757 = rk_fin(rk_link_k(x755, x756, 1u));
-#else // archsel_hip
   FpExt x757 = rk_fin(rk_link_kl(x755, x756, 1u, EF_DEP(x748.lo[0])));
-#endif // archsel_hip
   auto x758 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg10_200_0));
-  RkW _cx759 = _cx753; rk_cl_acc(_cx759, x758 * x757, 79u); FpExt x759 = rkw_fin(_cx759);
+  RkW _cx759 = _cx753; rk_cl_accl(_cx759, x758 * x757, 79u, EF_DEP(_cx753.lo[0])); FpExt x759 = rkw_fin(_cx759);
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_66[4] = {}; const int efq_66_0 = ef_wq4(efw, 81u, 82u, 83u, 85u, 4u); ef_wst(efw, 0u, x416);), RkAcc x760 = rk_link_nf_k(x759, x416, 81u);)
   EF_W((ef_wst(efw, 1u, x418);), RkAcc x761 = rk_link_k(x760, x418, 82u);)
@@ -7414,20 +7418,20 @@ __device__ EF_CHAIN FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* arg0,
 #endif // archsel_hip
   auto x780 = x8 - x140;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x781 = rk_link_nf_k(arg7, x139, 0u);
+  RkAcc x781 = rk_link_nf_kl(arg7, x139, 0u, EF_DEP(x750.lo[0]));
 #else // archsel_hip
   RkAcc x781 = rk_link_nf_kl(arg7, x139, 0u, EF_DEP(x771.lo[0]));
 #endif // archsel_hip
   auto x782 = x45 - x19;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x783 = rk_link_k(x781, x782, 1u);
+  RkAcc x783 = rk_link_kl(x781, x782, 1u, EF_DEP(x752.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x783 = rk_link_kl(x781, x782, 1u, EF_DEP(x775.lo[0]));
 #endif // archsel_hip
   auto x141 = ::risc0::Fp::fromRaw(efl_arg10_179_0);
   auto x784 = ef_lsub(x141, x780);
 #if defined(__GFX12__) // archsel_hip
-  FpExt x785 = rk_fin(rk_link_k(x783, x784, 2u));
+  FpExt x785 = rk_fin(rk_link_kl(x783, x784, 2u, EF_DEP(x755.lo[0])));
 #else // archsel_hip
   FpExt x785 = rk_fin(rk_link_kl(x783, x784, 2u, EF_DEP(x777.lo[0])));
 #endif // archsel_hip
@@ -7435,18 +7439,14 @@ __device__ EF_CHAIN FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* arg0,
   const uint32_t efl_arg10_119_0 = EF_LDCR(arg10, 119u, 0u);
   auto x787 = x7 - x140;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x788 = rk_link_nf_k(arg7, x782, 0u);
+  RkAcc x788 = rk_link_nf_kl(arg7, x782, 0u, EF_DEP(x757.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x788 = rk_link_nf_kl(arg7, x782, 0u, EF_DEP(x779.elems[0].asRaw()));
 #endif // archsel_hip
   auto x789 = x141 - x787;
-#if defined(__GFX12__) // archsel_hip
-  FpExt x790 = rk_fin(rk_link_k(x788, x789, 1u));
-#else // archsel_hip
   FpExt x790 = rk_fin(rk_link_kl(x788, x789, 1u, EF_DEP(x781.lo[0])));
-#endif // archsel_hip
   auto x791 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg10_201_0));
-  RkW _cx792 = _cx786; rk_cl_acc(_cx792, x791 * x790, 97u); FpExt x792 = rkw_fin(_cx792);
+  RkW _cx792 = _cx786; rk_cl_accl(_cx792, x791 * x790, 97u, EF_DEP(_cx786.lo[0])); FpExt x792 = rkw_fin(_cx792);
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_69[4] = {}; const int efq_69_0 = ef_wq4(efw, 99u, 100u, 101u, 103u, 4u); ef_wst(efw, 0u, x436);), RkAcc x793 = rk_link_nf_k(x792, x436, 99u);)
   EF_W((ef_wst(efw, 1u, x438);), RkAcc x794 = rk_link_k(x793, x438, 100u);)
@@ -7500,20 +7500,20 @@ __device__ EF_CHAIN FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* arg0,
 #endif // archsel_hip
   auto x813 = x8 - x144;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x814 = rk_link_nf_k(arg7, x143, 0u);
+  RkAcc x814 = rk_link_nf_kl(arg7, x143, 0u, EF_DEP(x783.lo[0]));
 #else // archsel_hip
   RkAcc x814 = rk_link_nf_kl(arg7, x143, 0u, EF_DEP(x804.lo[0]));
 #endif // archsel_hip
   auto x815 = x48 - x19;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x816 = rk_link_k(x814, x815, 1u);
+  RkAcc x816 = rk_link_kl(x814, x815, 1u, EF_DEP(x785.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x816 = rk_link_kl(x814, x815, 1u, EF_DEP(x808.lo[0]));
 #endif // archsel_hip
   auto x145 = ::risc0::Fp::fromRaw(efl_arg10_183_0);
   auto x817 = ef_lsub(x145, x813);
 #if defined(__GFX12__) // archsel_hip
-  FpExt x818 = rk_fin(rk_link_k(x816, x817, 2u));
+  FpExt x818 = rk_fin(rk_link_kl(x816, x817, 2u, EF_DEP(x788.lo[0])));
 #else // archsel_hip
   FpExt x818 = rk_fin(rk_link_kl(x816, x817, 2u, EF_DEP(x810.lo[0])));
 #endif // archsel_hip
@@ -7521,18 +7521,14 @@ __device__ EF_CHAIN FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* arg0,
   RkW _cx819 = rk_cl0(x812, x146 * x818, 112u); FpExt x819 = rkw_fin(_cx819);
   auto x820 = x7 - x144;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x821 = rk_link_nf_k(arg7, x815, 0u);
+  RkAcc x821 = rk_link_nf_kl(arg7, x815, 0u, EF_DEP(x790.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x821 = rk_link_nf_kl(arg7, x815, 0u, EF_DEP(x812.elems[0].asRaw()));
 #endif // archsel_hip
   auto x822 = x145 - x820;
-#if defined(__GFX12__) // archsel_hip
-  FpExt x823 = rk_fin(rk_link_k(x821, x822, 1u));
-#else // archsel_hip
   FpExt x823 = rk_fin(rk_link_kl(x821, x822, 1u, EF_DEP(x814.lo[0])));
-#endif // archsel_hip
   auto x824 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg10_202_0));
-  RkW _cx825 = _cx819; rk_cl_acc(_cx825, x824 * x823, 115u); FpExt x825 = rkw_fin(_cx825);
+  RkW _cx825 = _cx819; rk_cl_accl(_cx825, x824 * x823, 115u, EF_DEP(_cx819.lo[0])); FpExt x825 = rkw_fin(_cx825);
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_72[4] = {}; const int efq_72_0 = ef_wq4(efw, 117u, 118u, 119u, 121u, 4u); ef_wst(efw, 0u, x456);), RkAcc x826 = rk_link_nf_k(x825, x456, 117u);)
   EF_W((ef_wst(efw, 1u, x458);), RkAcc x827 = rk_link_k(x826, x458, 118u);)
@@ -7591,20 +7587,20 @@ __device__ EF_CHAIN FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* arg0,
 #endif // archsel_hip
   auto x847 = x8 - x149;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x848 = rk_link_nf_k(arg7, x148, 0u);
+  RkAcc x848 = rk_link_nf_kl(arg7, x148, 0u, EF_DEP(x816.lo[0]));
 #else // archsel_hip
   RkAcc x848 = rk_link_nf_kl(arg7, x148, 0u, EF_DEP(x837.lo[0]));
 #endif // archsel_hip
   auto x849 = x51 - x19;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x850 = rk_link_k(x848, x849, 1u);
+  RkAcc x850 = rk_link_kl(x848, x849, 1u, EF_DEP(x818.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x850 = rk_link_kl(x848, x849, 1u, EF_DEP(x841.lo[0]));
 #endif // archsel_hip
   auto x151 = ::risc0::Fp::fromRaw(efl_arg10_187_0);
   auto x851 = ef_lsub(x151, x847);
 #if defined(__GFX12__) // archsel_hip
-  FpExt x852 = rk_fin(rk_link_k(x850, x851, 2u));
+  FpExt x852 = rk_fin(rk_link_kl(x850, x851, 2u, EF_DEP(x821.lo[0])));
 #else // archsel_hip
   FpExt x852 = rk_fin(rk_link_kl(x850, x851, 2u, EF_DEP(x843.lo[0])));
 #endif // archsel_hip
@@ -7613,17 +7609,13 @@ __device__ EF_CHAIN FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* arg0,
   RkW _cx853 = rk_cl0(x846, x150 * x852, 130u); FpExt x853 = rkw_fin(_cx853);
   auto x854 = x7 - x149;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x855 = rk_link_nf_k(arg7, x849, 0u);
+  RkAcc x855 = rk_link_nf_kl(arg7, x849, 0u, EF_DEP(x823.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x855 = rk_link_nf_kl(arg7, x849, 0u, EF_DEP(x846.elems[0].asRaw()));
 #endif // archsel_hip
   auto x856 = x151 - x854;
-#if defined(__GFX12__) // archsel_hip
-  FpExt x857 = rk_fin(rk_link_k(x855, x856, 1u));
-#else // archsel_hip
   FpExt x857 = rk_fin(rk_link_kl(x855, x856, 1u, EF_DEP(x848.lo[0])));
-#endif // archsel_hip
-  RkW _cx858 = _cx853; rk_cl_acc(_cx858, x844 * x857, 133u); FpExt x858 = rkw_fin(_cx858);
+  RkW _cx858 = _cx853; rk_cl_accl(_cx858, x844 * x857, 133u, EF_DEP(_cx853.lo[0])); FpExt x858 = rkw_fin(_cx858);
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_75[4] = {}; RkAcc efs_75 = rk_acc(x858); const int efq_75_0 = ef_wq4(efw, 135u, 136u, 137u, 139u, 4u); ef_wst(efw, 0u, x476);), RkAcc x859 = rk_link_nf_k(x858, x476, 135u);)
   EF_W((ef_wst(efw, 1u, x478);), RkAcc x860 = rk_link_k(x859, x478, 136u);)
@@ -7762,16 +7754,16 @@ __device__ EF_CHAIN FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* arg0,
   EF_W((const int efq_75_44 = ef_wq4(efw, 182u, 182u, 182u, 182u, 1u); ef_wst(efw, 20u, x576); ef_wblk(efw, efd_75, 16u, efq_75_40); ef_wblk(efw, efd_75, 20u, efq_75_44);), RkAcc x919 = rk_link_nf_kl(x918, x576, 182u, EF_DEP(x915.lo[0]));)
   EF_W((efs_75 = rk_link_k(efs_75, x279, 183u); FpExt x920 = ef_wfin(efw, efd_75, 0u, rk_fin(efs_75));), FpExt x920 = rk_fin(rk_link_kl(x919, x279, 183u, EF_DEP(x916.lo[0])));)
 #endif // archsel_hip
-  RkW _cx921 = _cx603; rk_cl_acc(_cx921, x333 * x920, 144u); FpExt x921 = rkw_fin(_cx921);
+  RkW _cx921 = _cx603; rk_cl_accl(_cx921, x333 * x920, 144u, EF_DEP(_cx603.lo[0])); FpExt x921 = rkw_fin(_cx921);
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x922 = rk_link_nf_k(x921, x52, 279u);
-  FpExt x923 = rk_fin(rk_link_k(x922, x53, 280u));
+  RkAcc x922 = rk_link_nf_kl(x921, x52, 279u, EF_DEP(x850.lo[0]));
+  FpExt x923 = rk_fin(rk_link_kl(x922, x53, 280u, EF_DEP(x852.elems[0].asRaw())));
 #else // archsel_hip
   RkAcc x922 = rk_link_nf_kl(x921, x52, 279u, EF_DEP(x917.lo[0]));
   FpExt x923 = rk_fin(rk_link_kl(x922, x53, 280u, EF_DEP(x918.lo[0])));
 #endif // archsel_hip
   auto x155 = ::risc0::Fp::fromRaw(efl_arg10_26_0);
-  RkW _cx924 = _cx332; rk_cl_acc(_cx924, x155 * x923, 413u); FpExt x924 = rkw_fin(_cx924);
+  RkW _cx924 = _cx332; rk_cl_accl(_cx924, x155 * x923, 413u, EF_DEP(_cx332.lo[0])); FpExt x924 = rkw_fin(_cx924);
   constexpr Fp x6(1140850688);
   auto x925 = ef_lsub(x6, x87);
   constexpr Fp x5(1761607681);
@@ -7839,7 +7831,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* arg0,
   auto x958 = x926 + x19;
   auto x959 = x107 - x958;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x960 = rk_link_nf_k(arg7, x608, 0u);
+  RkAcc x960 = rk_link_nf_kl(arg7, x608, 0u, EF_DEP(x855.lo[0]));
 #else // archsel_hip
   RkAcc x960 = rk_link_nf_kl(arg7, x608, 0u, EF_DEP(x949.lo[0]));
 #endif // archsel_hip
@@ -7847,14 +7839,14 @@ __device__ EF_CHAIN FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* arg0,
   auto x962 = x961 * x9;
   auto x963 = x53 - x19;
 #if defined(__GFX12__) // archsel_hip
-  FpExt x964 = rk_fin(rk_link_k(x960, x963, 1u));
+  FpExt x964 = rk_fin(rk_link_kl(x960, x963, 1u, EF_DEP(x857.elems[0].asRaw())));
 #else // archsel_hip
   FpExt x964 = rk_fin(rk_link_kl(x960, x963, 1u, EF_DEP(x950.lo[0])));
 #endif // archsel_hip
   auto x157 = ::risc0::Fp::fromRaw(efl_arg10_191_0);
   auto x965 = ef_lsub(x157, x962);
 #if defined(__GFX12__) // archsel_hip
-  FpExt x966 = rk_fin(rk_link_k(x964, x965, 2u));
+  FpExt x966 = rk_fin(rk_link_kl(x964, x965, 2u, EF_DEP(x922.lo[0])));
 #else // archsel_hip
   FpExt x966 = rk_fin(rk_link_kl(x964, x965, 2u, EF_DEP(x954.lo[0])));
 #endif // archsel_hip
@@ -7867,24 +7859,16 @@ __device__ EF_CHAIN FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* arg0,
   auto x971 = x970 * x9;
   auto x972 = ef_lsub(x157, x971);
 #if defined(__GFX12__) // archsel_hip
-  FpExt x973 = rk_fin(rk_link_k(x964, x972, 2u));
+  FpExt x973 = rk_fin(rk_link_kl(x964, x972, 2u, EF_DEP(x923.elems[0].asRaw())));
 #else // archsel_hip
   FpExt x973 = rk_fin(rk_link_kl(x964, x972, 2u, EF_DEP(x956.elems[0].asRaw())));
 #endif // archsel_hip
-  RkW _cx974 = _cx967; rk_cl_acc(_cx974, x957 * x973, 14u); FpExt x974 = rkw_fin(_cx974);
+  RkW _cx974 = _cx967; rk_cl_accl(_cx974, x957 * x973, 14u, EF_DEP(_cx967.lo[0])); FpExt x974 = rkw_fin(_cx974);
   auto x975 = (((Fp(1u) - ::risc0::Fp::fromRaw(efl_arg10_18_0)) * ::risc0::Fp::fromRaw(efl_arg10_17_4)) + ::risc0::Fp::fromRaw(efl_arg10_18_0));
   auto x976 = x106 - x975;
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x977 = rk_link_nf_k(x974, x870, 17u);
-#else // archsel_hip
   RkAcc x977 = rk_link_nf_kl(x974, x870, 17u, EF_DEP(x960.lo[0]));
-#endif // archsel_hip
   auto x978 = x976 - x153;
-#if defined(__GFX12__) // archsel_hip
-  FpExt x979 = rk_fin(rk_link_k(x977, x978, 18u));
-#else // archsel_hip
   FpExt x979 = rk_fin(rk_link_kl(x977, x978, 18u, EF_DEP(x964.elems[0].asRaw())));
-#endif // archsel_hip
   constexpr Fp x4(8);
   auto x980 = x107 * x4;
   auto x981 = x6 - x980;
@@ -8001,29 +7985,29 @@ __device__ EF_CHAIN FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* arg0,
   auto x1039 = x19 - x59;
   auto x2000400 = x215 - x988;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x2000399 = rk_link_nf_k(x1026, x2000400, 3u);
+  RkAcc x2000399 = rk_link_nf_kl(x1026, x2000400, 3u, EF_DEP(x966.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x2000399 = rk_link_nf_kl(x1026, x2000400, 3u, EF_DEP(x1023.lo[0]));
 #endif // archsel_hip
   auto x2000402 = x1035 - x997;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x2000401 = rk_link_k(x2000399, x2000402, 8u);
+  RkAcc x2000401 = rk_link_kl(x2000399, x2000402, 8u, EF_DEP(x973.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x2000401 = rk_link_kl(x2000399, x2000402, 8u, EF_DEP(x1024.lo[0]));
 #endif // archsel_hip
   auto x2000404 = x1037 - x999;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x2000403 = rk_link_nf_k(x2000401, x2000404, 9u);
+  RkAcc x2000403 = rk_link_nf_kl(x2000401, x2000404, 9u, EF_DEP(x977.lo[0]));
 #else // archsel_hip
   RkAcc x2000403 = rk_link_nf_kl(x2000401, x2000404, 9u, EF_DEP(x1025.lo[0]));
 #endif // archsel_hip
   auto x2000405 = x1039 - x229;
 #if defined(__GFX12__) // archsel_hip
-  FpExt x1065 = rk_fin(rk_link_k(x2000403, x2000405, 10u));
+  FpExt x1065 = rk_fin(rk_link_kl(x2000403, x2000405, 10u, EF_DEP(x979.elems[0].asRaw())));
 #else // archsel_hip
   FpExt x1065 = rk_fin(rk_link_kl(x2000403, x2000405, 10u, EF_DEP(x1026.elems[0].asRaw())));
 #endif // archsel_hip
-  RkW _cx1066 = _cx1027; rk_cl_acc(_cx1066, x132 * x1065, 55u); FpExt x1066 = rkw_fin(_cx1066);
+  RkW _cx1066 = _cx1027; rk_cl_accl(_cx1066, x132 * x1065, 55u, EF_DEP(_cx1027.lo[0])); FpExt x1066 = rkw_fin(_cx1066);
   constexpr Fp x0(1073741824);
   auto x1067 = x0 - x55;
   auto x1072 = x19 - x58;
@@ -8070,49 +8054,41 @@ __device__ EF_CHAIN FpExt rv32im_v2_11(uint32_t cycle, uint32_t steps, Fp* arg0,
 #else // archsel_hip
   EF_W((ef_wst(efw, 6u, x2000418); ef_wblk(efw, efd_84, 0u, efq_84_0); ef_wblk(efw, efd_84, 4u, efq_84_4); FpExt x1103 = ef_wfin(efw, efd_84, 0u, x1065);), FpExt x1103 = rk_fin(rk_link_kl(x2000416, x2000418, 10u, EF_DEP(x2000410.lo[0])));)
 #endif // archsel_hip
-  RkW _cx1104 = _cx1066; rk_cl_acc(_cx1104, x137 * x1103, 91u); FpExt x1104 = rkw_fin(_cx1104);
+  RkW _cx1104 = _cx1066; rk_cl_accl(_cx1104, x137 * x1103, 91u, EF_DEP(_cx1066.lo[0])); FpExt x1104 = rkw_fin(_cx1104);
   auto x160 = ::risc0::Fp::fromRaw(efl_arg10_34_0);
   auto x1106 = x18 - x160;
   auto x1112 = x17 - x59;
   auto x2000420 = x217 - x990;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x2000419 = rk_link_nf_k(x1065, x2000420, 4u);
+  RkAcc x2000419 = rk_link_nf_kl(x1065, x2000420, 4u, EF_DEP(x2000399.lo[0]));
 #else // archsel_hip
   RkAcc x2000419 = rk_link_nf_kl(x1065, x2000420, 4u, EF_DEP(x2000412.lo[0]));
 #endif // archsel_hip
   auto x2000422 = x1106 - x992;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x2000421 = rk_link_k(x2000419, x2000422, 5u);
+  RkAcc x2000421 = rk_link_kl(x2000419, x2000422, 5u, EF_DEP(x2000401.lo[0]));
 #else // archsel_hip
   RkAcc x2000421 = rk_link_kl(x2000419, x2000422, 5u, EF_DEP(x2000414.lo[0]));
 #endif // archsel_hip
   auto x2000423 = ef_lsub(x1112, x1039);
 #if defined(__GFX12__) // archsel_hip
-  FpExt x1138 = rk_fin(rk_link_k(x2000421, x2000423, 10u));
+  FpExt x1138 = rk_fin(rk_link_kl(x2000421, x2000423, 10u, EF_DEP(x2000403.lo[0])));
 #else // archsel_hip
   FpExt x1138 = rk_fin(rk_link_kl(x2000421, x2000423, 10u, EF_DEP(x2000416.lo[0])));
 #endif // archsel_hip
-  RkW _cx1139 = _cx1104; rk_cl_acc(_cx1139, x27 * x1138, 127u); FpExt x1139 = rkw_fin(_cx1139);
+  RkW _cx1139 = _cx1104; rk_cl_accl(_cx1139, x27 * x1138, 127u, EF_DEP(_cx1104.lo[0])); FpExt x1139 = rkw_fin(_cx1139);
   auto x1146 = x16 - x59;
   auto x2000425 = x217 - x990;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x2000424 = rk_link_nf_k(x1026, x2000425, 4u);
+  RkAcc x2000424 = rk_link_nf_kl(x1026, x2000425, 4u, EF_DEP(x1065.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x2000424 = rk_link_nf_kl(x1026, x2000425, 4u, EF_DEP(x1103.elems[0].asRaw()));
 #endif // archsel_hip
   auto x2000427 = x1106 - x992;
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x2000426 = rk_link_k(x2000424, x2000427, 5u);
-#else // archsel_hip
   RkAcc x2000426 = rk_link_kl(x2000424, x2000427, 5u, EF_DEP(x2000419.lo[0]));
-#endif // archsel_hip
   auto x2000428 = ef_lsub(x1146, x229);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x1172 = rk_fin(rk_link_k(x2000426, x2000428, 10u));
-#else // archsel_hip
   FpExt x1172 = rk_fin(rk_link_kl(x2000426, x2000428, 10u, EF_DEP(x2000421.lo[0])));
-#endif // archsel_hip
-  RkW _cx1173 = _cx1139; rk_cl_acc(_cx1173, x146 * x1172, 163u); FpExt x1173 = rkw_fin(_cx1173);
+  RkW _cx1173 = _cx1139; rk_cl_accl(_cx1173, x146 * x1172, 163u, EF_DEP(_cx1139.lo[0])); FpExt x1173 = rkw_fin(_cx1173);
   auto x1174 = x6 - x55;
   auto x1179 = x15 - x58;
   auto x1184 = x15 - x59;
@@ -8577,22 +8553,22 @@ __device__ EF_CHAIN FpExt rv32im_v2_7(uint32_t cycle, uint32_t steps, Fp* arg0, 
   auto x74 = ::risc0::Fp::fromRaw(efl_arg9_22_0);
   RkW _cx396 = rk_cl0(arg3, x74 * x395, 109u); FpExt x396 = rkw_fin(_cx396);
   auto x75 = ::risc0::Fp::fromRaw(efl_arg9_23_0);
-  RkW _cx397 = _cx396; rk_cl_acc(_cx397, x75 * arg4, 185u); FpExt x397 = rkw_fin(_cx397);
+  RkW _cx397 = _cx396; rk_cl_accl(_cx397, x75 * arg4, 185u, EF_DEP(_cx396.lo[0])); FpExt x397 = rkw_fin(_cx397);
   auto x76 = ::risc0::Fp::fromRaw(efl_arg9_24_0);
-  RkW _cx398 = _cx397; rk_cl_acc(_cx398, x76 * arg4, 215u); FpExt x398 = rkw_fin(_cx398);
+  RkW _cx398 = _cx397; rk_cl_accl(_cx398, x76 * arg4, 215u, EF_DEP(_cx397.lo[0])); FpExt x398 = rkw_fin(_cx398);
   auto x77 = ::risc0::Fp::fromRaw(efl_arg9_25_0);
-  RkW _cx399 = _cx398; rk_cl_acc(_cx399, x77 * arg4, 252u); FpExt x399 = rkw_fin(_cx399);
+  RkW _cx399 = _cx398; rk_cl_accl(_cx399, x77 * arg4, 252u, EF_DEP(_cx398.lo[0])); FpExt x399 = rkw_fin(_cx399);
   const uint32_t efl_arg9_20_0 = EF_LDCR(arg9, 20u, 0u);
   const uint32_t efl_arg9_18_0 = EF_LDCR(arg9, 18u, 0u);
   const uint32_t efl_arg9_16_4 = EF_LDCR(arg9, 16u, 4u);
   const uint32_t efl_arg9_0_0 = EF_LDCR(arg9, 0u, 0u);
   const uint32_t efl_arg9_188_0 = EF_LDCR(arg9, 188u, 0u);
   auto x78 = ::risc0::Fp::fromRaw(efl_arg9_26_0);
-  RkW _cx400 = _cx399; rk_cl_acc(_cx400, x78 * arg4, 273u); FpExt x400 = rkw_fin(_cx400);
+  RkW _cx400 = _cx399; rk_cl_accl(_cx400, x78 * arg4, 273u, EF_DEP(_cx399.lo[0])); FpExt x400 = rkw_fin(_cx400);
   auto x79 = ::risc0::Fp::fromRaw(efl_arg9_27_0);
-  RkW _cx401 = _cx400; rk_cl_acc(_cx401, x79 * arg4, 282u); FpExt x401 = rkw_fin(_cx401);
+  RkW _cx401 = _cx400; rk_cl_accl(_cx401, x79 * arg4, 282u, EF_DEP(_cx400.lo[0])); FpExt x401 = rkw_fin(_cx401);
   auto x80 = ::risc0::Fp::fromRaw(efl_arg9_28_0);
-  RkW _cx402 = _cx401; rk_cl_acc(_cx402, x80 * arg4, 298u); FpExt x402 = rkw_fin(_cx402);
+  RkW _cx402 = _cx401; rk_cl_accl(_cx402, x80 * arg4, 298u, EF_DEP(_cx401.lo[0])); FpExt x402 = rkw_fin(_cx402);
   auto x81 = ::risc0::Fp::fromRaw(efl_arg9_11_0);
   RkW _cx403 = rk_cl0(arg5, x81 * x402, 422u); FpExt x403 = rkw_fin(_cx403);
   const uint32_t efl_arg9_190_0 = EF_LDCR(arg9, 190u, 0u);
@@ -9064,29 +9040,25 @@ __device__ EF_CHAIN FpExt rv32im_v2_7(uint32_t cycle, uint32_t steps, Fp* arg0, 
   auto x540 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_191_0));
   auto x541 = x539 - x540;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x542 = rk_link_nf_k(x538, x541, 1u);
+  RkAcc x542 = rk_link_nf_kl(x538, x541, 1u, EF_DEP(x409.lo[0]));
 #else // archsel_hip
   RkAcc x542 = rk_link_nf_kl(x538, x541, 1u, EF_DEP(x530.lo[0]));
 #endif // archsel_hip
   auto x141 = ::risc0::Fp::fromRaw(efl_arg9_191_0);
   auto x543 = x141 * x536;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x544 = rk_link_k(x542, x543, 2u);
+  RkAcc x544 = rk_link_kl(x542, x543, 2u, EF_DEP(x412.lo[0]));
 #else // archsel_hip
   RkAcc x544 = rk_link_kl(x542, x543, 2u, EF_DEP(x532.lo[0]));
 #endif // archsel_hip
   auto x545 = x141 * x140;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x546 = rk_link_nf_k(x544, x545, 3u);
+  RkAcc x546 = rk_link_nf_kl(x544, x545, 3u, EF_DEP(x413.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x546 = rk_link_nf_kl(x544, x545, 3u, EF_DEP(x534.elems[0].asRaw()));
 #endif // archsel_hip
   auto x547 = (::risc0::Fp::fromRaw(efl_arg9_193_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_193_0)));
-#if defined(__GFX12__) // archsel_hip
-  FpExt x548 = rk_fin(rk_link_k(x546, x547, 4u));
-#else // archsel_hip
   FpExt x548 = rk_fin(rk_link_kl(x546, x547, 4u, EF_DEP(x538.elems[0].asRaw())));
-#endif // archsel_hip
   auto x142 = ::risc0::Fp::fromRaw(efl_arg9_32_4);
   auto x143 = ::risc0::Fp::fromRaw(efl_arg9_194_0);
   auto x549 = x142 * x143;
@@ -10139,7 +10111,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_7(uint32_t cycle, uint32_t steps, Fp* arg0, 
 #else // archsel_hip
   EF_W((efd_93[0] = efd_93[1] = efd_93[2] = efd_93[3] = ef_v4i{}; const int efq_93_144 = ef_wq4(efw, 153u, 153u, 153u, 153u, 1u); ef_wst(efw, 0u, x212); ef_wblk(efw, efd_93, 0u, efq_93_144); FpExt x935 = ef_wfin(efw, efd_93, 0u, efb_93);), FpExt x935 = rk_fin(rk_link_kl(x934, x212, 153u, EF_DEP(x931.lo[0])));)
 #endif // archsel_hip
-  RkW _cx936 = _cx535; rk_cl_acc(_cx936, x74 * x935, 55u); FpExt x936 = rkw_fin(_cx936);
+  RkW _cx936 = _cx535; rk_cl_accl(_cx936, x74 * x935, 55u, EF_DEP(_cx535.lo[0])); FpExt x936 = rkw_fin(_cx936);
   constexpr Fp x0(15);
   auto x937 = ef_lsub(x0, x139);
   auto x938 = x937 * x140;
@@ -11732,7 +11704,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_3(uint32_t cycle, uint32_t steps, Fp* arg0, 
   EF_W((ef_wst(efw, 22u, x517);), RkAcc x583 = rk_link_nf_kl(x582, x517, 67u, EF_DEP(x578.lo[0]));)
   EF_W((ef_wst(efw, 23u, x525); ef_wblk(efw, efd_98, 16u, efq_98_40); ef_wblk(efw, efd_98, 20u, efq_98_44); FpExt x584 = ef_wfin(efw, efd_98, 0u, x382);), FpExt x584 = rk_fin(rk_link_kl(x583, x525, 68u, EF_DEP(x580.lo[0])));)
 #endif // archsel_hip
-  RkW _cx585 = _cx527; rk_cl_acc(_cx585, x37 * x584, 119u); FpExt x585 = rkw_fin(_cx585);
+  RkW _cx585 = _cx527; rk_cl_accl(_cx585, x37 * x584, 119u, EF_DEP(_cx527.lo[0])); FpExt x585 = rkw_fin(_cx585);
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_99[4] = {}; const int efq_99_0 = ef_wq(efw, 0u); ef_wst(efw, 0u, x403);), RkAcc x586 = rk_link_nf_k(arg2, x403, 0u);)
   EF_W((ef_wst(efw, 1u, x405);), RkAcc x587 = rk_link_k(x586, x405, 1u);)
@@ -11835,7 +11807,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_3(uint32_t cycle, uint32_t steps, Fp* arg0, 
 #else // archsel_hip
   EF_W((ef_wst(efw, 5u, x106); ef_wblk(efw, efd_99, 0u, efq_99_24); ef_wblk(efw, efd_99, 4u, efq_99_28); FpExt x615 = ef_wfin(efw, efd_99, 0u, arg2);), FpExt x615 = rk_fin(rk_link_kl(x614, x106, 29u, EF_DEP(x611.lo[0])));)
 #endif // archsel_hip
-  RkW _cx616 = _cx585; rk_cl_acc(_cx616, x38 * x615, 186u); FpExt x616 = rkw_fin(_cx616);
+  RkW _cx616 = _cx585; rk_cl_accl(_cx616, x38 * x615, 186u, EF_DEP(_cx585.lo[0])); FpExt x616 = rkw_fin(_cx616);
   auto x697 = (::risc0::Fp::fromRaw(efl_arg7_186_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg7_186_0)));
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_100[4] = {}; const int efq_100_0 = ef_wq(efw, 209u); ef_wst(efw, 0u, x697);), RkAcc x698 = rk_link_nf_k(x616, x697, 209u);)
@@ -12440,19 +12412,19 @@ __device__ EF_CHAIN FpExt rv32im_v2_3(uint32_t cycle, uint32_t steps, Fp* arg0, 
   EF_W((ef_wst(efw, 15u, x46); ef_wblk(efw, efd_101, 8u, efq_101_56); ef_wblk(efw, efd_101, 12u, efq_101_60); FpExt x846 = ef_wfin(efw, efd_101, 0u, efb_101);), FpExt x846 = rk_fin(rk_link_kl(x845, x46, 64u, EF_DEP(x842.lo[0])));)
 #endif // archsel_hip
   auto x166 = ::risc0::Fp::fromRaw(efl_arg7_23_0);
-  RkW _cx847 = _cx761; rk_cl_acc(_cx847, x166 * x846, 278u); FpExt x847 = rkw_fin(_cx847);
+  RkW _cx847 = _cx761; rk_cl_accl(_cx847, x166 * x846, 278u, EF_DEP(_cx761.lo[0])); FpExt x847 = rkw_fin(_cx847);
   auto x167 = ::risc0::Fp::fromRaw(efl_arg7_24_0);
-  RkW _cx848 = _cx847; rk_cl_acc(_cx848, x167 * x846, 317u); FpExt x848 = rkw_fin(_cx848);
+  RkW _cx848 = _cx847; rk_cl_accl(_cx848, x167 * x846, 317u, EF_DEP(_cx847.lo[0])); FpExt x848 = rkw_fin(_cx848);
   auto x168 = ::risc0::Fp::fromRaw(efl_arg7_25_0);
-  RkW _cx849 = _cx848; rk_cl_acc(_cx849, x168 * x846, 348u); FpExt x849 = rkw_fin(_cx849);
+  RkW _cx849 = _cx848; rk_cl_accl(_cx849, x168 * x846, 348u, EF_DEP(_cx848.lo[0])); FpExt x849 = rkw_fin(_cx849);
   auto x169 = ::risc0::Fp::fromRaw(efl_arg7_26_0);
   const uint32_t efl_arg7_18_0 = EF_LDCR(arg7, 18u, 0u);
   const uint32_t efl_arg7_14_4 = EF_LDCR(arg7, 14u, 4u);
-  RkW _cx850 = _cx849; rk_cl_acc(_cx850, x169 * x846, 352u); FpExt x850 = rkw_fin(_cx850);
+  RkW _cx850 = _cx849; rk_cl_accl(_cx850, x169 * x846, 352u, EF_DEP(_cx849.lo[0])); FpExt x850 = rkw_fin(_cx850);
   auto x170 = ::risc0::Fp::fromRaw(efl_arg7_27_0);
-  RkW _cx851 = _cx850; rk_cl_acc(_cx851, x170 * x846, 354u); FpExt x851 = rkw_fin(_cx851);
+  RkW _cx851 = _cx850; rk_cl_accl(_cx851, x170 * x846, 354u, EF_DEP(_cx850.lo[0])); FpExt x851 = rkw_fin(_cx851);
   auto x171 = ::risc0::Fp::fromRaw(efl_arg7_28_0);
-  RkW _cx852 = _cx851; rk_cl_acc(_cx852, x171 * x846, 357u); FpExt x852 = rkw_fin(_cx852);
+  RkW _cx852 = _cx851; rk_cl_accl(_cx852, x171 * x846, 357u, EF_DEP(_cx851.lo[0])); FpExt x852 = rkw_fin(_cx852);
   auto x172 = ::risc0::Fp::fromRaw(efl_arg7_13_0);
   RkW _cx853 = rk_cl0(arg5, x172 * x852, 424u); FpExt x853 = rkw_fin(_cx853);
   auto x184 = ::risc0::Fp::fromRaw(efl_arg7_181_0);
@@ -13041,38 +13013,22 @@ __device__ EF_CHAIN FpExt rk_accblk(uint32_t cycle, uint32_t steps, Fp* arg0) {
   RkAcc x1213 = rk_link_nf_k(arg2, x1212, 0u);
   auto x1214 = x1116 - x1203;
   RK_ST4L(arg6, 32u, 33u, 34u, 35u, x1214);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x1215 = rk_link_k(x1213, x1214, 1u);
-#else // archsel_hip
   RkAcc x1215 = rk_link_kl(x1213, x1214, 1u, EF_DEP(x1110.elems[0].asRaw()));
-#endif // archsel_hip
   const uint32_t efl_arg8_22_0 = EF_LDCR(arg8, 22u, 0u);
   auto x1216 = x1124 - x1209;
   RK_ST4L(arg6, 36u, 37u, 38u, 39u, x1216);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x1217 = rk_fin(rk_link_k(x1215, x1216, 2u));
-#else // archsel_hip
   FpExt x1217 = rk_fin(rk_link_kl(x1215, x1216, 2u, EF_DEP(x1118.lo[0])));
-#endif // archsel_hip
   RkW _cx1218 = _cx1127;
-  rk_cl_acc(_cx1218, x225 * x1217, 439u);
+  rk_cl_accl(_cx1218, x225 * x1217, 439u, EF_DEP(_cx1127.lo[0]));
   FpExt x1218 = rkw_fin(_cx1218);
   auto x1219 = x1116 - x1210;
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x1220 = rk_link_nf_k(x1110, x1219, 1u);
-#else // archsel_hip
   RkAcc x1220 = rk_link_nf_kl(x1110, x1219, 1u, EF_DEP(x1126.elems[0].asRaw()));
-#endif // archsel_hip
   const uint32_t efl_arg8_21_0 = EF_LDCR(arg8, 21u, 0u);
   const uint32_t efl_arg8_20_0 = EF_LDCR(arg8, 20u, 0u);
   const uint32_t efl_arg8_19_0 = EF_LDCR(arg8, 19u, 0u);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x1221 = rk_fin(rk_link_k(x1220, x1216, 2u));
-#else // archsel_hip
   FpExt x1221 = rk_fin(rk_link_kl(x1220, x1216, 2u, EF_DEP(x1213.lo[0])));
-#endif // archsel_hip
   RkW _cx1222 = _cx1218;
-  rk_cl_acc(_cx1222, x226 * x1221, 440u);
+  rk_cl_accl(_cx1222, x226 * x1221, 440u, EF_DEP(_cx1218.lo[0]));
   FpExt x1222 = rkw_fin(_cx1222);
   auto x1223 = x1045 - x22;
   auto x1224 = x1223 + x2;
@@ -13088,28 +13044,15 @@ __device__ EF_CHAIN FpExt rk_accblk(uint32_t cycle, uint32_t steps, Fp* arg0) {
   auto x258 = ::risc0::Fp::fromRaw(efl_arg8_19_0);
   auto x1231 = x258 + x1230;
   auto x1232 = x1231 - x1225;
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x1233 = rk_link_nf_k(arg2, x1232, 0u);
-#else // archsel_hip
   RkAcc x1233 = rk_link_nf_kl(arg2, x1232, 0u, EF_DEP(x1215.lo[0]));
-#endif // archsel_hip
   auto x1234 = x1231 * x1210;
   auto x1235 = x1209 + x1234;
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x1236 = rk_link_k(x1233, x1109, 1u);
-  RkAcc x1237 = rk_link_nf_k(x1236, x1117, 2u);
-#else // archsel_hip
   RkAcc x1236 = rk_link_kl(x1233, x1109, 1u, EF_DEP(x1217.elems[0].asRaw()));
   RkAcc x1237 = rk_link_nf_kl(x1236, x1117, 2u, EF_DEP(x1220.lo[0]));
-#endif // archsel_hip
   auto x1238 = x1124 - x1235;
-#if defined(__GFX12__) // archsel_hip
-  FpExt x1239 = rk_fin(rk_link_k(x1237, x1238, 3u));
-#else // archsel_hip
   FpExt x1239 = rk_fin(rk_link_kl(x1237, x1238, 3u, EF_DEP(x1221.elems[0].asRaw())));
-#endif // archsel_hip
   RkW _cx1240 = _cx1222;
-  rk_cl_acc(_cx1240, x227 * x1239, 441u);
+  rk_cl_accl(_cx1240, x227 * x1239, 441u, EF_DEP(_cx1222.lo[0]));
   FpExt x1240 = rkw_fin(_cx1240);
   FpExt x1241 = EF_PM(581);
   FpExt x1242 = EF_PM(582);
@@ -14329,7 +14272,7 @@ __device__ FpExt poly_fp(uint32_t cycle, uint32_t steps, Fp** args) {
   EF_W((const int efq_113_4 = ef_wq4(efw, 6u, 7u, 6u, 6u, 2u); ef_wst(efw, 4u, x137);), RkAcc x681 = rk_link_nf_kl(x680, x137, 6u, EF_DEP(x677.lo[0]));)
   EF_W((ef_wst(efw, 5u, x138); ef_wblk(efw, efd_113, 0u, efq_113_0); ef_wblk(efw, efd_113, 4u, efq_113_4); FpExt x682 = ef_wfin(efw, efd_113, 0u, x668);), FpExt x682 = rk_fin(rk_link_kl(x681, x138, 7u, EF_DEP(x678.lo[0])));)
 #endif // archsel_hip
-  RkW _cx683 = _cx675; rk_cl_acc(_cx683, x45 * x682, 87u); FpExt x683 = rkw_fin(_cx683);
+  RkW _cx683 = _cx675; rk_cl_accl(_cx683, x45 * x682, 87u, EF_DEP(_cx675.lo[0])); FpExt x683 = rkw_fin(_cx683);
   auto x684 = x578 - x27;
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_114[4] = {}; FpExt efb_114 = x667; const int efq_114_0 = ef_wq(efw, 1u); ef_wst(efw, 0u, x684);), RkAcc x685 = rk_link_nf_k(x667, x684, 1u);)
@@ -15071,7 +15014,7 @@ __device__ FpExt poly_fp(uint32_t cycle, uint32_t steps, Fp** args) {
   EF_W((ef_wst(efw, 1u, x137);), RkAcc x1010 = rk_link_kl(x1009, x137, 74u, EF_DEP(x1006.lo[0]));)
   EF_W((ef_wst(efw, 2u, x138); ef_wblk(efw, efd_114, 20u, efq_114_68); ef_wblk(efw, efd_114, 0u, efq_114_72); FpExt x1011 = ef_wfin(efw, efd_114, 0u, efb_114);), FpExt x1011 = rk_fin(rk_link_kl(x1010, x138, 75u, EF_DEP(x1007.lo[0])));)
 #endif // archsel_hip
-  RkW _cx1012 = _cx683; rk_cl_acc(_cx1012, x46 * x1011, 95u); FpExt x1012 = rkw_fin(_cx1012);
+  RkW _cx1012 = _cx683; rk_cl_accl(_cx1012, x46 * x1011, 95u, EF_DEP(_cx683.lo[0])); FpExt x1012 = rkw_fin(_cx1012);
   auto x1013 = x578 - x29;
   auto x2000448 = ef_lsub(x1013, x684);
 #if defined(__GFX12__) // archsel_hip
@@ -15079,7 +15022,7 @@ __device__ FpExt poly_fp(uint32_t cycle, uint32_t steps, Fp** args) {
 #else // archsel_hip
   FpExt x1088 = rk_fin(rk_link_kl(x1011, x2000448, 1u, EF_DEP(x1008.lo[0])));
 #endif // archsel_hip
-  RkW _cx1089 = _cx1012; rk_cl_acc(_cx1089, x47 * x1088, 171u); FpExt x1089 = rkw_fin(_cx1089);
+  RkW _cx1089 = _cx1012; rk_cl_accl(_cx1089, x47 * x1088, 171u, EF_DEP(_cx1012.lo[0])); FpExt x1089 = rkw_fin(_cx1089);
   auto x1090 = x578 - x30;
   const uint32_t efl_args1_60_0 = EF_LDCR(args[1], 60u, 0u);
   const uint32_t efl_args1_61_0 = EF_LDCR(args[1], 61u, 0u);
@@ -16656,7 +16599,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_18(uint32_t cycle, uint32_t steps, Fp* arg0,
 #else // archsel_hip
   FpExt x826 = rk_fin(rk_link_kl(x2000449, x2000451, 9u, EF_DEP(x764.lo[0])));
 #endif // archsel_hip
-  RkW _cx827 = _cx771; rk_cl_acc(_cx827, x28 * x826, 132u); FpExt x827 = rkw_fin(_cx827);
+  RkW _cx827 = _cx771; rk_cl_accl(_cx827, x28 * x826, 132u, EF_DEP(_cx771.lo[0])); FpExt x827 = rkw_fin(_cx827);
   auto x828 = x469 - x26;
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_122[4] = {}; const int efq_122_0 = ef_wq(efw, 1u); ef_wst(efw, 0u, x471);), RkAcc x829 = rk_link_nf_k(x556, x471, 1u);)
@@ -16863,7 +16806,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_18(uint32_t cycle, uint32_t steps, Fp* arg0,
 #else // archsel_hip
   EF_W((ef_wst(efw, 18u, x149); ef_wblk(efw, efd_122, 12u, efq_122_36); ef_wblk(efw, efd_122, 16u, efq_122_40); FpExt x931 = ef_wfin(efw, efd_122, 0u, x556);), FpExt x931 = rk_fin(rk_link_kl(x930, x149, 43u, EF_DEP(x922.lo[0])));)
 #endif // archsel_hip
-  RkW _cx932 = _cx827; rk_cl_acc(_cx932, x29 * x931, 184u); FpExt x932 = rkw_fin(_cx932);
+  RkW _cx932 = _cx827; rk_cl_accl(_cx932, x29 * x931, 184u, EF_DEP(_cx827.lo[0])); FpExt x932 = rkw_fin(_cx932);
   auto x965 = x622 * x104;
   auto x966 = x901 - x965;
   auto x967 = x648 * x108;
@@ -16893,17 +16836,17 @@ __device__ EF_CHAIN FpExt rv32im_v2_18(uint32_t cycle, uint32_t steps, Fp* arg0,
 #endif // archsel_hip
   auto x2000455 = x977 - x916;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x2000454 = rk_link_k(x2000452, x2000455, 38u);
+  RkAcc x2000454 = rk_link_kl(x2000452, x2000455, 38u, EF_DEP(x556.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x2000454 = rk_link_kl(x2000452, x2000455, 38u, EF_DEP(x926.lo[0]));
 #endif // archsel_hip
   auto x2000456 = ef_lsub(x993, x929);
 #if defined(__GFX12__) // archsel_hip
-  FpExt x995 = rk_fin(rk_link_k(x2000454, x2000456, 42u));
+  FpExt x995 = rk_fin(rk_link_kl(x2000454, x2000456, 42u, EF_DEP(x2000449.lo[0])));
 #else // archsel_hip
   FpExt x995 = rk_fin(rk_link_kl(x2000454, x2000456, 42u, EF_DEP(x930.lo[0])));
 #endif // archsel_hip
-  RkW _cx996 = _cx932; rk_cl_acc(_cx996, x30 * x995, 220u); FpExt x996 = rkw_fin(_cx996);
+  RkW _cx996 = _cx932; rk_cl_accl(_cx996, x30 * x995, 220u, EF_DEP(_cx932.lo[0])); FpExt x996 = rkw_fin(_cx996);
   auto x997 = x471 - x23;
   auto x1031 = x901 - x967;
   auto x1032 = x1031 + x728;
@@ -16918,57 +16861,29 @@ __device__ EF_CHAIN FpExt rv32im_v2_18(uint32_t cycle, uint32_t steps, Fp* arg0,
   auto x1049 = x1046 - x928;
   auto x2000458 = x997 - x471;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x2000457 = rk_link_nf_k(x931, x2000458, 1u);
+  RkAcc x2000457 = rk_link_nf_kl(x931, x2000458, 1u, EF_DEP(x826.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x2000457 = rk_link_nf_kl(x931, x2000458, 1u, EF_DEP(x931.elems[0].asRaw()));
 #endif // archsel_hip
   auto x2000460 = x1040 - x916;
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x2000459 = rk_link_k(x2000457, x2000460, 38u);
-#else // archsel_hip
   RkAcc x2000459 = rk_link_kl(x2000457, x2000460, 38u, EF_DEP(x2000452.lo[0]));
-#endif // archsel_hip
   auto x2000461 = ef_lsub(x1049, x929);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x1051 = rk_fin(rk_link_k(x2000459, x2000461, 42u));
-#else // archsel_hip
   FpExt x1051 = rk_fin(rk_link_kl(x2000459, x2000461, 42u, EF_DEP(x2000454.lo[0])));
-#endif // archsel_hip
-  RkW _cx1052 = _cx996; rk_cl_acc(_cx1052, x31 * x1051, 264u); FpExt x1052 = rkw_fin(_cx1052);
+  RkW _cx1052 = _cx996; rk_cl_accl(_cx1052, x31 * x1051, 264u, EF_DEP(_cx996.lo[0])); FpExt x1052 = rkw_fin(_cx1052);
   auto x1053 = x471 - x22;
   auto x2000462 = ef_lsub(x1053, x471);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x1096 = rk_fin(rk_link_k(x931, x2000462, 1u));
-#else // archsel_hip
   FpExt x1096 = rk_fin(rk_link_kl(x931, x2000462, 1u, EF_DEP(x995.elems[0].asRaw())));
-#endif // archsel_hip
   auto x150 = ::risc0::Fp::fromRaw(efl_arg5_26_0);
-  RkW _cx1097 = _cx1052; rk_cl_acc(_cx1097, x150 * x1096, 276u); FpExt x1097 = rkw_fin(_cx1097);
+  RkW _cx1097 = _cx1052; rk_cl_accl(_cx1097, x150 * x1096, 276u, EF_DEP(_cx1052.lo[0])); FpExt x1097 = rkw_fin(_cx1097);
   FpExt x1098 = EF_PM(595);
   auto x151 = ::risc0::Fp::fromRaw(efl_arg5_29_0);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x1099 = rk_fin(rk_link_k(x1098, x151, 1u));
-#else // archsel_hip
   FpExt x1099 = rk_fin(rk_link_kl(x1098, x151, 1u, EF_DEP(x2000457.lo[0])));
-#endif // archsel_hip
   auto x152 = ::risc0::Fp::fromRaw(efl_arg5_31_0);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x1100 = rk_link_nf_k(x1099, x152, 2u);
-#else // archsel_hip
   RkAcc x1100 = rk_link_nf_kl(x1099, x152, 2u, EF_DEP(x2000459.lo[0]));
-#endif // archsel_hip
   auto x153 = ::risc0::Fp::fromRaw(efl_arg5_33_0);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x1101 = rk_link_k(x1100, x153, 3u);
-#else // archsel_hip
   RkAcc x1101 = rk_link_kl(x1100, x153, 3u, EF_DEP(x1051.elems[0].asRaw()));
-#endif // archsel_hip
   auto x154 = ::risc0::Fp::fromRaw(efl_arg5_35_0);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x1102 = rk_fin(rk_link_k(x1101, x154, 4u));
-#else // archsel_hip
   FpExt x1102 = rk_fin(rk_link_kl(x1101, x154, 4u, EF_DEP(x1096.elems[0].asRaw())));
-#endif // archsel_hip
   auto x155 = ::risc0::Fp::fromRaw(efl_arg5_37_0);
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_128[4] = {}; const int efq_128_0 = ef_wq(efw, 5u); ef_wst(efw, 0u, x155);), RkAcc x1103 = rk_link_nf_k(x1102, x155, 5u);)
@@ -17016,9 +16931,9 @@ __device__ EF_CHAIN FpExt rv32im_v2_18(uint32_t cycle, uint32_t steps, Fp* arg0,
   EF_W((ef_wst(efw, 14u, x141); ef_wblk(efw, efd_128, 8u, efq_128_8); ef_wblk(efw, efd_128, 12u, efq_128_12); FpExt x1117 = ef_wfin(efw, efd_128, 0u, x1102);), FpExt x1117 = rk_fin(rk_link_kl(x1116, x141, 19u, EF_DEP(x1113.lo[0])));)
 #endif // archsel_hip
   auto x159 = ::risc0::Fp::fromRaw(efl_arg5_27_0);
-  RkW _cx1118 = _cx1097; rk_cl_acc(_cx1118, x159 * x1117, 287u); FpExt x1118 = rkw_fin(_cx1118);
+  RkW _cx1118 = _cx1097; rk_cl_accl(_cx1118, x159 * x1117, 287u, EF_DEP(_cx1097.lo[0])); FpExt x1118 = rkw_fin(_cx1118);
   auto x160 = ::risc0::Fp::fromRaw(efl_arg5_28_0);
-  RkW _cx1119 = _cx1118; rk_cl_acc(_cx1119, x160 * x1117, 307u); FpExt x1119 = rkw_fin(_cx1119);
+  RkW _cx1119 = _cx1118; rk_cl_accl(_cx1119, x160 * x1117, 307u, EF_DEP(_cx1118.lo[0])); FpExt x1119 = rkw_fin(_cx1119);
   auto x2001995 = x30 + x31;
   auto x2001996 = ef_ladd(x2001995, x150);
   auto x163 = ::risc0::Fp::fromRaw(efl_arg5_36_0);
@@ -17696,7 +17611,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg0_e
   EF_W((ef_wst(efw, 15u, x67); ef_wblk(efw, efd_131, 8u, efq_131_56); ef_wblk(efw, efd_131, 12u, efq_131_60); FpExt x347 = ef_wfin(efw, efd_131, 0u, efb_131);), FpExt x347 = rk_fin(rk_link_kl(x346, x67, 86u, EF_DEP(x343.lo[0])));)
 #endif // archsel_hip
   auto x98 = ::risc0::Fp::fromRaw(efl_arg10_24_0);
-  RkW _cx348 = _cx258; rk_cl_acc(_cx348, x98 * x347, 292u); FpExt x348 = rkw_fin(_cx348);
+  RkW _cx348 = _cx258; rk_cl_accl(_cx348, x98 * x347, 292u, EF_DEP(_cx258.lo[0])); FpExt x348 = rkw_fin(_cx348);
   auto x349 = (::risc0::Fp::fromRaw(efl_arg10_182_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg10_182_0)));
 #if defined(__GFX12__) // archsel_hip
   RkAcc x350 = rk_link_nf_k(arg4, x349, 0u);
@@ -18418,7 +18333,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg0_e
   EF_W((ef_wst(efw, 11u, x93); ef_wblk(efw, efd_134, 4u, efq_134_28);), RkAcc x588 = rk_link_kl(x587, x93, 37u, EF_DEP(x584.lo[0]));)
   EF_W((const int efq_134_36 = ef_wq4(efw, 38u, 38u, 38u, 38u, 1u); ef_wst(efw, 12u, x94); ef_wblk(efw, efd_134, 8u, efq_134_32); ef_wblk(efw, efd_134, 12u, efq_134_36); FpExt x589 = ef_wfin(efw, efd_134, 0u, arg4);), FpExt x589 = rk_fin(rk_link_kl(x588, x94, 38u, EF_DEP(x585.lo[0])));)
 #endif // archsel_hip
-  RkW _cx590 = _cx533; rk_cl_acc(_cx590, x353 * x589, 97u); FpExt x590 = rkw_fin(_cx590);
+  RkW _cx590 = _cx533; rk_cl_accl(_cx590, x353 * x589, 97u, EF_DEP(_cx533.lo[0])); FpExt x590 = rkw_fin(_cx590);
   auto x143 = ::risc0::Fp::fromRaw(efl_arg10_117_0);
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_135[4] = {}; const int efq_135_0 = ef_wq(efw, 136u); ef_wst(efw, 0u, x143);), RkAcc x591 = rk_link_nf_k(x590, x143, 136u);)
@@ -18504,7 +18419,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg0_e
   EF_W((ef_wst(efw, 7u, x67); ef_wblk(efw, efd_135, 0u, efq_135_24); ef_wblk(efw, efd_135, 4u, efq_135_28); FpExt x622 = ef_wfin(efw, efd_135, 0u, x590);), FpExt x622 = rk_fin(rk_link_kl(x621, x67, 167u, EF_DEP(x618.lo[0])));)
 #endif // archsel_hip
   auto x147 = ::risc0::Fp::fromRaw(efl_arg10_25_0);
-  RkW _cx623 = _cx348; rk_cl_acc(_cx623, x147 * x622, 347u); FpExt x623 = rkw_fin(_cx623);
+  RkW _cx623 = _cx348; rk_cl_accl(_cx623, x147 * x622, 347u, EF_DEP(_cx348.lo[0])); FpExt x623 = rkw_fin(_cx623);
   auto x624 = RK_LD1M(arg3, 5u);
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_136[4] = {}; FpExt efb_136 = arg4; const int efq_136_0 = ef_wq(efw, 0u); ef_wst(efw, 0u, x624);), RkAcc x625 = rk_link_nf_k(arg4, x624, 0u);)
@@ -18832,23 +18747,23 @@ __device__ EF_CHAIN FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg0_e
   EF_W((efd_136[0] = efd_136[1] = efd_136[2] = efd_136[3] = ef_v4i{}; const int efq_136_96 = ef_wq4(efw, 104u, 104u, 104u, 104u, 1u); ef_wst(efw, 0u, x67); ef_wblk(efw, efd_136, 0u, efq_136_96); FpExt x753 = ef_wfin(efw, efd_136, 0u, efb_136);), FpExt x753 = rk_fin(rk_link_kl(x752, x67, 104u, EF_DEP(x749.lo[0])));)
 #endif // archsel_hip
   auto x180 = ::risc0::Fp::fromRaw(efl_arg10_26_0);
-  RkW _cx754 = _cx623; rk_cl_acc(_cx754, x180 * x753, 355u); FpExt x754 = rkw_fin(_cx754);
+  RkW _cx754 = _cx623; rk_cl_accl(_cx754, x180 * x753, 355u, EF_DEP(_cx623.lo[0])); FpExt x754 = rkw_fin(_cx754);
   auto x755 = RK_LD1M(arg3, 6u);
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x756 = rk_link_nf_k(arg4, x755, 0u);
+  RkAcc x756 = rk_link_nf_kl(arg4, x755, 0u, EF_DEP(x350.lo[0]));
 #else // archsel_hip
   RkAcc x756 = rk_link_nf_kl(arg4, x755, 0u, EF_DEP(x750.lo[0]));
 #endif // archsel_hip
   auto x757 = x553 - x99;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x758 = rk_link_k(x756, x757, 1u);
+  RkAcc x758 = rk_link_kl(x756, x757, 1u, EF_DEP(x355.lo[0]));
 #else // archsel_hip
   RkAcc x758 = rk_link_kl(x756, x757, 1u, EF_DEP(x751.lo[0]));
 #endif // archsel_hip
   auto x181 = ::risc0::Fp::fromRaw(efl_arg10_184_0);
   auto x759 = x568 - x181;
 #if defined(__GFX12__) // archsel_hip
-  FpExt x760 = rk_fin(rk_link_k(x758, x759, 2u));
+  FpExt x760 = rk_fin(rk_link_kl(x758, x759, 2u, EF_DEP(x357.lo[0])));
 #else // archsel_hip
   FpExt x760 = rk_fin(rk_link_kl(x758, x759, 2u, EF_DEP(x752.lo[0])));
 #endif // archsel_hip
@@ -19250,7 +19165,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg0_e
   EF_W((ef_wst(efw, 11u, x51); ef_wblk(efw, efd_139, 4u, efq_139_28); ef_wblk(efw, efd_139, 8u, efq_139_32); FpExt x892 = ef_wfin(efw, efd_139, 0u, arg4);), FpExt x892 = rk_fin(rk_link_kl(x891, x51, 35u, EF_DEP(x888.lo[0])));)
 #endif // archsel_hip
   auto x893 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg10_184_0));
-  RkW _cx894 = _cx836; rk_cl_acc(_cx894, x893 * x892, 39u); FpExt x894 = rkw_fin(_cx894);
+  RkW _cx894 = _cx836; rk_cl_accl(_cx894, x893 * x892, 39u, EF_DEP(_cx836.lo[0])); FpExt x894 = rkw_fin(_cx894);
   auto x212 = ::risc0::Fp::fromRaw(efl_arg10_29_0);
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_140[4] = {}; const int efq_140_0 = ef_wq(efw, 75u); ef_wst(efw, 0u, x212);), RkAcc x895 = rk_link_nf_k(x894, x212, 75u);)
@@ -19326,7 +19241,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg0_e
 #endif // archsel_hip
   const uint32_t efl_arg10_102_0 = EF_LDCR(arg10, 102u, 0u);
   auto x218 = ::risc0::Fp::fromRaw(efl_arg10_27_0);
-  RkW _cx919 = _cx754; rk_cl_acc(_cx919, x218 * x918, 383u); FpExt x919 = rkw_fin(_cx919);
+  RkW _cx919 = _cx754; rk_cl_accl(_cx919, x218 * x918, 383u, EF_DEP(_cx754.lo[0])); FpExt x919 = rkw_fin(_cx919);
   auto x920 = RK_LD1M(arg3, 7u);
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_141[4] = {}; const int efq_141_0 = ef_wq4(efw, 0u, 554u, 555u, 556u, 4u); ef_wst(efw, 0u, x920);), RkAcc x921 = rk_link_nf_k(arg4, x920, 0u);)
@@ -19479,7 +19394,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg0_e
   EF_W((ef_wst(efw, 10u, x67); ef_wblk(efw, efd_141, 4u, efq_141_52); ef_wblk(efw, efd_141, 8u, efq_141_56); FpExt x986 = ef_wfin(efw, efd_141, 0u, efb_141);), FpExt x986 = rk_fin(rk_link_kl(x985, x67, 58u, EF_DEP(x982.lo[0])));)
 #endif // archsel_hip
   auto x222 = ::risc0::Fp::fromRaw(efl_arg10_28_0);
-  RkW _cx987 = _cx919; rk_cl_acc(_cx987, x222 * x986, 388u); FpExt x987 = rkw_fin(_cx987);
+  RkW _cx987 = _cx919; rk_cl_accl(_cx987, x222 * x986, 388u, EF_DEP(_cx919.lo[0])); FpExt x987 = rkw_fin(_cx987);
   auto x223 = ::risc0::Fp::fromRaw(efl_arg10_8_0);
   RkW _cx988 = rk_cl0(arg5, x223 * x987, 419u); FpExt x988 = rkw_fin(_cx988);
   auto x989 = x534 - x12;
@@ -19866,7 +19781,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_14(uint32_t cycle, uint32_t steps, Fp arg0_e
 #else // archsel_hip
   EF_W((ef_wst(efw, 10u, x174); ef_wblk(efw, efd_144, 4u, efq_144_28); ef_wblk(efw, efd_144, 8u, efq_144_32); FpExt x1147 = ef_wfin(efw, efd_144, 0u, arg4);), FpExt x1147 = rk_fin(rk_link_kl(x1146, x174, 36u, EF_DEP(x1143.lo[0])));)
 #endif // archsel_hip
-  RkW _cx1148 = _cx1104; rk_cl_acc(_cx1148, x224 * x1147, 59u); FpExt x1148 = rkw_fin(_cx1148);
+  RkW _cx1148 = _cx1104; rk_cl_accl(_cx1148, x224 * x1147, 59u, EF_DEP(_cx1104.lo[0])); FpExt x1148 = rkw_fin(_cx1148);
   constexpr Fp x0(1073725452);
   auto x1172 = x102 - x0;
   auto x1176 = (::risc0::Fp::fromRaw(efl_arg10_69_0) - Fp(1u));
@@ -20485,7 +20400,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* arg0,
   auto x257 = ::risc0::Fp::fromRaw(efl_arg27_196_0);
   RkW _cx411 = rk_cl0(x410, x257 * arg6, 4u); FpExt x411 = rkw_fin(_cx411);
   auto x412 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg27_196_0));
-  RkW _cx413 = _cx411; rk_cl_acc(_cx413, x412 * arg7, 7u); FpExt x413 = rkw_fin(_cx413);
+  RkW _cx413 = _cx411; rk_cl_accl(_cx413, x412 * arg7, 7u, EF_DEP(_cx411.lo[0])); FpExt x413 = rkw_fin(_cx413);
   auto x414 = (::risc0::Fp::fromRaw(efl_arg27_68_0) - Fp(2013265920u));
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_149[4] = {}; const int efq_149_0 = ef_wq4(efw, 9u, 10u, 11u, 13u, 4u); ef_wst(efw, 0u, x414);), RkAcc x415 = rk_link_nf_k(x413, x414, 9u);)
@@ -20560,7 +20475,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* arg0,
   RkW _cx439 = rk_cl0(x438, x261 * arg8, 22u); FpExt x439 = rkw_fin(_cx439);
   auto x440 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg27_197_0));
   const uint32_t efl_arg27_58_4 = EF_LDCR(arg27, 58u, 4u);
-  RkW _cx441 = _cx439; rk_cl_acc(_cx441, x440 * arg9, 25u); FpExt x441 = rkw_fin(_cx441);
+  RkW _cx441 = _cx439; rk_cl_accl(_cx441, x440 * arg9, 25u, EF_DEP(_cx439.lo[0])); FpExt x441 = rkw_fin(_cx441);
   auto x442 = (::risc0::Fp::fromRaw(efl_arg27_77_0) - Fp(2013265920u));
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_150[4] = {}; const int efq_150_0 = ef_wq4(efw, 27u, 28u, 29u, 31u, 4u); ef_wst(efw, 0u, x442);), RkAcc x443 = rk_link_nf_k(x441, x442, 27u);)
@@ -20633,7 +20548,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* arg0,
   auto x265 = ::risc0::Fp::fromRaw(efl_arg27_198_0);
   RkW _cx467 = rk_cl0(x466, x265 * arg10, 40u); FpExt x467 = rkw_fin(_cx467);
   auto x468 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg27_198_0));
-  RkW _cx469 = _cx467; rk_cl_acc(_cx469, x468 * arg11, 43u); FpExt x469 = rkw_fin(_cx469);
+  RkW _cx469 = _cx467; rk_cl_accl(_cx469, x468 * arg11, 43u, EF_DEP(_cx467.lo[0])); FpExt x469 = rkw_fin(_cx469);
   auto x470 = (::risc0::Fp::fromRaw(efl_arg27_86_0) - Fp(2013265920u));
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_151[4] = {}; const int efq_151_0 = ef_wq4(efw, 45u, 46u, 47u, 49u, 4u); ef_wst(efw, 0u, x470);), RkAcc x471 = rk_link_nf_k(x469, x470, 45u);)
@@ -20707,7 +20622,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* arg0,
   const uint32_t efl_arg27_96_0 = EF_LDCR(arg27, 96u, 0u);
   RkW _cx495 = rk_cl0(x494, x269 * arg12, 58u); FpExt x495 = rkw_fin(_cx495);
   auto x496 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg27_199_0));
-  RkW _cx497 = _cx495; rk_cl_acc(_cx497, x496 * arg13, 61u); FpExt x497 = rkw_fin(_cx497);
+  RkW _cx497 = _cx495; rk_cl_accl(_cx497, x496 * arg13, 61u, EF_DEP(_cx495.lo[0])); FpExt x497 = rkw_fin(_cx497);
   auto x498 = (::risc0::Fp::fromRaw(efl_arg27_95_0) - Fp(2013265920u));
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_152[4] = {}; const int efq_152_0 = ef_wq4(efw, 63u, 64u, 65u, 67u, 4u); ef_wst(efw, 0u, x498);), RkAcc x499 = rk_link_nf_k(x497, x498, 63u);)
@@ -20781,7 +20696,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* arg0,
   auto x273 = ::risc0::Fp::fromRaw(efl_arg27_200_0);
   RkW _cx523 = rk_cl0(x522, x273 * arg14, 76u); FpExt x523 = rkw_fin(_cx523);
   auto x524 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg27_200_0));
-  RkW _cx525 = _cx523; rk_cl_acc(_cx525, x524 * arg15, 79u); FpExt x525 = rkw_fin(_cx525);
+  RkW _cx525 = _cx523; rk_cl_accl(_cx525, x524 * arg15, 79u, EF_DEP(_cx523.lo[0])); FpExt x525 = rkw_fin(_cx525);
   const uint32_t efl_arg27_61_4 = EF_LDCR(arg27, 61u, 4u);
   const uint32_t efl_arg27_120_0 = EF_LDCR(arg27, 120u, 0u);
   auto x526 = (::risc0::Fp::fromRaw(efl_arg27_104_0) - Fp(2013265920u));
@@ -20854,7 +20769,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* arg0,
   auto x277 = ::risc0::Fp::fromRaw(efl_arg27_201_0);
   RkW _cx551 = rk_cl0(x550, x277 * arg16, 94u); FpExt x551 = rkw_fin(_cx551);
   auto x552 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg27_201_0));
-  RkW _cx553 = _cx551; rk_cl_acc(_cx553, x552 * arg17, 97u); FpExt x553 = rkw_fin(_cx553);
+  RkW _cx553 = _cx551; rk_cl_accl(_cx553, x552 * arg17, 97u, EF_DEP(_cx551.lo[0])); FpExt x553 = rkw_fin(_cx553);
   auto x554 = (::risc0::Fp::fromRaw(efl_arg27_113_0) - Fp(2013265920u));
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_154[4] = {}; const int efq_154_0 = ef_wq4(efw, 99u, 100u, 101u, 103u, 4u); ef_wst(efw, 0u, x554);), RkAcc x555 = rk_link_nf_k(x553, x554, 99u);)
@@ -20931,7 +20846,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* arg0,
   const uint32_t efl_arg27_128_0 = EF_LDCR(arg27, 128u, 0u);
   const uint32_t efl_arg27_124_0 = EF_LDCR(arg27, 124u, 0u);
   auto x580 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg27_202_0));
-  RkW _cx581 = _cx579; rk_cl_acc(_cx581, x580 * arg19, 115u); FpExt x581 = rkw_fin(_cx581);
+  RkW _cx581 = _cx579; rk_cl_accl(_cx581, x580 * arg19, 115u, EF_DEP(_cx579.lo[0])); FpExt x581 = rkw_fin(_cx581);
   auto x582 = (::risc0::Fp::fromRaw(efl_arg27_122_0) - Fp(2013265920u));
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_155[4] = {}; const int efq_155_0 = ef_wq4(efw, 117u, 118u, 119u, 121u, 4u); ef_wst(efw, 0u, x582);), RkAcc x583 = rk_link_nf_k(x581, x582, 117u);)
@@ -21003,7 +20918,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* arg0,
 #endif // archsel_hip
   RkW _cx607 = rk_cl0(x606, x206 * arg20, 130u); FpExt x607 = rkw_fin(_cx607);
   auto x608 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg27_203_0));
-  RkW _cx609 = _cx607; rk_cl_acc(_cx609, x608 * arg21, 133u); FpExt x609 = rkw_fin(_cx609);
+  RkW _cx609 = _cx607; rk_cl_accl(_cx609, x608 * arg21, 133u, EF_DEP(_cx607.lo[0])); FpExt x609 = rkw_fin(_cx609);
   auto x610 = (::risc0::Fp::fromRaw(efl_arg27_131_0) - Fp(2013265920u));
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_156[4] = {}; RkAcc efs_156 = rk_acc(x609); const int efq_156_0 = ef_wq4(efw, 135u, 136u, 137u, 139u, 4u); ef_wst(efw, 0u, x610);), RkAcc x611 = rk_link_nf_k(x609, x610, 135u);)
@@ -21326,7 +21241,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* arg0,
 #endif // archsel_hip
   auto x288 = ::risc0::Fp::fromRaw(efl_arg27_28_0);
   const uint32_t efl_arg27_0_0 = EF_LDCR(arg27, 0u, 0u);
-  RkW _cx698 = _cx404; rk_cl_acc(_cx698, x288 * x697, 416u); FpExt x698 = rkw_fin(_cx698);
+  RkW _cx698 = _cx404; rk_cl_accl(_cx698, x288 * x697, 416u, EF_DEP(_cx404.lo[0])); FpExt x698 = rkw_fin(_cx698);
   auto x289 = ::risc0::Fp::fromRaw(efl_arg27_10_0);
   RkW _cx699 = rk_cl0(arg22, x289 * x698, 421u); FpExt x699 = rkw_fin(_cx699);
   constexpr Fp x202(24);
@@ -21347,7 +21262,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_10(uint32_t cycle, uint32_t steps, Fp* arg0,
   auto x706 = RK_LD1M(arg0, 26u);
 #if defined(__GFX12__) // archsel_hip
   RkAcc x707 = rk_link_k(x705, x706, 1u);
-  FpExt x708 = rk_fin(rk_link_k(x707, x702, 2u));
+  FpExt x708 = rk_fin(rk_link_kl(x707, x702, 2u, EF_DEP(x408.lo[0])));
 #else // archsel_hip
   RkAcc x707 = rk_link_kl(x705, x706, 1u, EF_DEP(x695.lo[0]));
   FpExt x708 = rk_fin(rk_link_kl(x707, x702, 2u, EF_DEP(x696.lo[0])));
@@ -24001,16 +23916,11 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_rkBA_10_4 = EF_LDCR(rkBA, 10u, 4u);
   auto x289 = x279 - x288;
   RkAcc x290 = rk_link_nf_k(arg1, x289, 0u);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x291 = rk_link_k(x290, x282, 1u);
-  FpExt x292 = rk_fin(rk_link_k(x291, x284, 2u));
-#else // archsel_hip
   RkAcc x291 = rk_link_kl(x290, x282, 1u, EF_DEP(x281.lo[0]));
   FpExt x292 = rk_fin(rk_link_kl(x291, x284, 2u, EF_DEP(x283.lo[0])));
-#endif // archsel_hip
   auto x5 = ::risc0::Fp::fromRaw(efl_arg4_17_0);
   RkW _cx293 = _cx286;
-  rk_cl_acc(_cx293, x5 * x292, 443u);
+  rk_cl_accl(_cx293, x5 * x292, 443u, EF_DEP(_cx286.lo[0]));
   FpExt x293 = rkw_fin(_cx293);
   const uint32_t efl_rkBA_9_4 = EF_LDCR(rkBA, 9u, 4u);
   const uint32_t efl_rkBA_8_4 = EF_LDCR(rkBA, 8u, 4u);
@@ -24031,11 +23941,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx299 = rkw_ee(x296, x295);
   rkw_v(_wx299, x298, false);
   auto x299 = rkw_fin(_wx299);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x300 = rk_link_nf_k(arg1, x299, 0u);
-#else // archsel_hip
   RkAcc x300 = rk_link_nf_kl(arg1, x299, 0u, EF_DEP(x285.elems[0].asRaw()));
-#endif // archsel_hip
   constexpr FpExt r7_x4(0,1,0,0);
   auto r7_x231 = ::risc0::Fp::fromRaw(efl_rkBA_3_0);
   auto r7_x1103 = r7_x231 * r7_x4;
@@ -24054,11 +23960,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   auto r7_x1109 = r7_x1108 - r7_x2;
   auto x301 = static_cast<const ::risc0::FpExt>(::risc0::FpExt(r7_x1109));
   const uint32_t efl_rkBA_4_0 = EF_LDCR(rkBA, 4u, 0u);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x302 = rk_link_k(x300, x301, 1u);
-#else // archsel_hip
   RkAcc x302 = rk_link_kl(x300, x301, 1u, EF_DEP(x290.lo[0]));
-#endif // archsel_hip
   constexpr FpExt r8_x4(0,1,0,0);
   auto r8_x235 = ::risc0::Fp::fromRaw(efl_rkBA_7_0);
   auto r8_x1111 = r8_x235 * r8_x4;
@@ -24076,11 +23978,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   constexpr FpExt r8_x1(1,0,0,0);
   auto r8_x1117 = r8_x1116 - r8_x1;
   auto x303 = static_cast<const ::risc0::FpExt>(::risc0::FpExt(r8_x1117));
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x304 = rk_link_nf_k(x302, x303, 2u);
-#else // archsel_hip
   RkAcc x304 = rk_link_nf_kl(x302, x303, 2u, EF_DEP(x291.lo[0]));
-#endif // archsel_hip
   const uint32_t efl_rkBA_8_0 = EF_LDCR(rkBA, 8u, 0u);
   const uint32_t efl_arg4_18_0 = EF_LDCR(arg4, 18u, 0u);
   constexpr FpExt r9_x4(0,1,0,0);
@@ -24097,16 +23995,12 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   auto r9_x1124 = r9_x242 + r9_x1123;
   auto r9_x1125 = r9_x1124 - r9_x2;
   auto x305 = static_cast<const ::risc0::FpExt>(::risc0::FpExt(r9_x1125));
-#if defined(__GFX12__) // archsel_hip
-  FpExt x306 = rk_fin(rk_link_k(x304, x305, 3u));
-#else // archsel_hip
   FpExt x306 = rk_fin(rk_link_kl(x304, x305, 3u, EF_DEP(x292.elems[0].asRaw())));
-#endif // archsel_hip
   auto x6 = ::risc0::Fp::fromRaw(efl_arg4_18_0);
   const uint32_t efl_arg4_102_4 = EF_LDCR(arg4, 102u, 4u);
   const uint32_t efl_arg4_101_4 = EF_LDCR(arg4, 101u, 4u);
   RkW _cx307 = _cx293;
-  rk_cl_acc(_cx307, x6 * x306, 444u);
+  rk_cl_accl(_cx307, x6 * x306, 444u, EF_DEP(_cx293.lo[0]));
   FpExt x307 = rkw_fin(_cx307);
   FpExt x313 = EF_PM(603);
   FpExt x319 = EF_PM(604);
@@ -24177,11 +24071,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2000890 = rkw_ee(x2000887, x364);
   rkw_ef(_wx2000890, x44, x360, true);
   auto x2000890 = rkw_fin(_wx2000890);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x380 = rk_link_nf_k(arg1, x2000890, 0u);
-#else // archsel_hip
   RkAcc x380 = rk_link_nf_kl(arg1, x2000890, 0u, EF_DEP(x300.lo[0]));
-#endif // archsel_hip
   const uint32_t efl_arg3_60_0 = EF_LDCR(arg3, 60u, 0u);
   auto x49 = ::risc0::Fp::fromRaw(efl_arg3_49_0);
   auto x381 = x49 * x313;
@@ -24241,11 +24131,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2000898 = rkw_ee(x2000895, x400);
   rkw_ef(_wx2000898, x59, x391, true);
   auto x2000898 = rkw_fin(_wx2000898);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x416 = rk_link_k(x380, x2000898, 1u);
-#else // archsel_hip
   RkAcc x416 = rk_link_kl(x380, x2000898, 1u, EF_DEP(x302.lo[0]));
-#endif // archsel_hip
   const uint32_t efl_arg3_68_0 = EF_LDCR(arg3, 68u, 0u);
   const uint32_t efl_arg4_34_0 = EF_LDCR(arg4, 34u, 0u);
   const uint32_t efl_arg4_33_0 = EF_LDCR(arg4, 33u, 0u);
@@ -24293,11 +24179,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2000906 = rkw_ee(x2000903, x425);
   rkw_ef(_wx2000906, x69, x421, true);
   auto x2000906 = rkw_fin(_wx2000906);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x441 = rk_link_nf_k(x416, x2000906, 2u);
-#else // archsel_hip
   RkAcc x441 = rk_link_nf_kl(x416, x2000906, 2u, EF_DEP(x304.lo[0]));
-#endif // archsel_hip
   auto x74 = ::risc0::Fp::fromRaw(efl_arg3_87_0);
   auto x442 = x74 * x313;
   auto x443 = x442 + x349;
@@ -24356,11 +24238,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_arg3_100_0 = EF_LDCR(arg3, 100u, 0u);
   rkw_ef(_wx2000914, x3000010, x446, true);
   auto x2000914 = rkw_fin(_wx2000914);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x472 = rk_link_k(x441, x2000914, 3u);
-#else // archsel_hip
   RkAcc x472 = rk_link_kl(x441, x2000914, 3u, EF_DEP(x306.elems[0].asRaw()));
-#endif // archsel_hip
   auto x87 = ::risc0::Fp::fromRaw(efl_arg3_98_0);
   auto x473 = x87 * x325;
   // remat_lu: store dropped
@@ -24428,11 +24306,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2000922 = rkw_ee(x2000919, x492);
   rkw_ef(_wx2000922, x97, x482, true);
   auto x2000922 = rkw_fin(_wx2000922);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x508 = rk_link_nf_k(x472, x2000922, 4u);
-#else // archsel_hip
   RkAcc x508 = rk_link_nf_kl(x472, x2000922, 4u, EF_DEP(x380.lo[0]));
-#endif // archsel_hip
   const uint32_t efl_arg3_113_0 = EF_LDCR(arg3, 113u, 0u);
   const uint32_t efl_arg3_114_0 = EF_LDCR(arg3, 114u, 0u);
   const uint32_t efl_arg3_115_0 = EF_LDCR(arg3, 115u, 0u);
@@ -24510,11 +24384,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_arg4_49_0 = EF_LDCR(arg4, 49u, 0u);
   rkw_ef(_wx2000930, x114, x524, true);
   auto x2000930 = rkw_fin(_wx2000930);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x549 = rk_link_k(x508, x2000930, 5u);
-#else // archsel_hip
   RkAcc x549 = rk_link_kl(x508, x2000930, 5u, EF_DEP(x416.lo[0]));
-#endif // archsel_hip
   auto x119 = ::risc0::Fp::fromRaw(efl_arg3_122_0);
   auto x550 = x119 * x343;
   auto x551 = x550 + x349;
@@ -24556,11 +24426,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2000938 = rkw_ee(x2000935, x558);
   rkw_ef(_wx2000938, x124, x554, true);
   auto x2000938 = rkw_fin(_wx2000938);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x574 = rk_link_nf_k(x549, x2000938, 6u);
-#else // archsel_hip
   RkAcc x574 = rk_link_nf_kl(x549, x2000938, 6u, EF_DEP(x441.lo[0]));
-#endif // archsel_hip
   auto x129 = ::risc0::Fp::fromRaw(efl_arg3_32_0);
   auto x575 = x129 * x313;
   auto x576 = x575 + x349;
@@ -24605,11 +24471,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2000946 = rkw_ee(x2000943, x583);
   rkw_ef(_wx2000946, x134, x579, true);
   auto x2000946 = rkw_fin(_wx2000946);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x599 = rk_link_k(x574, x2000946, 7u);
-#else // archsel_hip
   RkAcc x599 = rk_link_kl(x574, x2000946, 7u, EF_DEP(x472.lo[0]));
-#endif // archsel_hip
   const uint32_t efl_arg4_56_0 = EF_LDCR(arg4, 56u, 0u);
   const uint32_t efl_arg4_55_0 = EF_LDCR(arg4, 55u, 0u);
   auto x139 = ::risc0::Fp::fromRaw(efl_arg3_38_0);
@@ -24635,11 +24497,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_arg4_99_0 = EF_LDCR(arg4, 99u, 0u);
   auto x144 = ::risc0::Fp::fromRaw(efl_arg3_37_0);
   auto x610 = x609 - x144;
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x611 = rk_link_nf_k(x599, x610, 8u);
-#else // archsel_hip
   RkAcc x611 = rk_link_nf_kl(x599, x610, 8u, EF_DEP(x508.lo[0]));
-#endif // archsel_hip
   auto x145 = ::risc0::Fp::fromRaw(efl_arg4_102_0);
   auto x612 = x145 * x0;
   auto x146 = ::risc0::Fp::fromRaw(efl_arg4_101_0);
@@ -24657,23 +24515,19 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   RK_ST4L(arg0, 104u, 105u, 106u, 107u, x618);
   const uint32_t efl_arg3_3_0 = EF_LDCR(arg3, 3u, 0u);
   const uint32_t efl_arg3_70_0 = EF_LDCR(arg3, 70u, 0u);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x619 = rk_fin(rk_link_k(x611, x618, 9u));
-#else // archsel_hip
   FpExt x619 = rk_fin(rk_link_kl(x611, x618, 9u, EF_DEP(x549.lo[0])));
-#endif // archsel_hip
   auto x149 = ::risc0::Fp::fromRaw(efl_arg3_1_0);
   RkW _cx620 = _cx307;
-  rk_cl_acc(_cx620, x149 * x619, 445u);
+  rk_cl_accl(_cx620, x149 * x619, 445u, EF_DEP(_cx307.lo[0]));
   FpExt x620 = rkw_fin(_cx620);
   auto x150 = ::risc0::Fp::fromRaw(efl_arg3_2_0);
   RkW _cx621 = _cx620;
-  rk_cl_acc(_cx621, x150 * x619, 446u);
+  rk_cl_accl(_cx621, x150 * x619, 446u, EF_DEP(_cx620.lo[0]));
   const uint32_t efl_arg3_89_0 = EF_LDCR(arg3, 89u, 0u);
   FpExt x621 = rkw_fin(_cx621);
   auto x151 = ::risc0::Fp::fromRaw(efl_arg3_3_0);
   RkW _cx622 = _cx621;
-  rk_cl_acc(_cx622, x151 * x619, 447u);
+  rk_cl_accl(_cx622, x151 * x619, 447u, EF_DEP(_cx621.lo[0]));
   FpExt x622 = rkw_fin(_cx622);
   FpExt x628 = EF_PM(610);
   auto x156 = ::risc0::Fp::fromRaw(efl_arg3_70_0);
@@ -24696,11 +24550,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2000954 = rkw_ee(x2000951, x635);
   rkw_ef(_wx2000954, x159, x631, true);
   auto x2000954 = rkw_fin(_wx2000954);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x644 = rk_link_nf_k(arg1, x2000954, 0u);
-#else // archsel_hip
   RkAcc x644 = rk_link_nf_kl(arg1, x2000954, 0u, EF_DEP(x574.lo[0]));
-#endif // archsel_hip
   auto x82 = ::risc0::Fp::fromRaw(efl_arg3_93_0);
   auto x645 = x82 * x313;
   auto x646 = x645 + x349;
@@ -24729,11 +24579,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2000962 = rkw_ee(x2000959, x664);
   rkw_ef(_wx2000962, x88, x655, true);
   auto x2000962 = rkw_fin(_wx2000962);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x673 = rk_link_k(x644, x2000962, 1u);
-#else // archsel_hip
   RkAcc x673 = rk_link_kl(x644, x2000962, 1u, EF_DEP(x599.lo[0]));
-#endif // archsel_hip
   auto x674 = x93 * x343;
   auto x675 = x674 + x349;
   // remat_lu: store dropped
@@ -24764,11 +24610,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2000970 = rkw_ee(x2000967, x693);
   rkw_ef(_wx2000970, x3000013, x684, true);
   auto x2000970 = rkw_fin(_wx2000970);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x702 = rk_link_nf_k(x673, x2000970, 2u);
-#else // archsel_hip
   RkAcc x702 = rk_link_nf_kl(x673, x2000970, 2u, EF_DEP(x611.lo[0]));
-#endif // archsel_hip
   auto x703 = x107 * x319;
   auto x704 = x108 * x325;
   auto x705 = x703 + x704;
@@ -24798,11 +24640,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2000978 = rkw_ee(x2000975, x553);
   rkw_ef(_wx2000978, x121, x718, true);
   auto x2000978 = rkw_fin(_wx2000978);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x729 = rk_link_k(x702, x2000978, 3u);
-#else // archsel_hip
   RkAcc x729 = rk_link_kl(x702, x2000978, 3u, EF_DEP(x619.elems[0].asRaw()));
-#endif // archsel_hip
   auto x160 = ::risc0::Fp::fromRaw(efl_arg3_126_0);
   auto x730 = x160 * x343;
   auto x731 = x730 + x349;
@@ -24817,11 +24655,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2000986 = rkw_ee(x2000983, x576);
   rkw_ef(_wx2000986, x132, x732, true);
   auto x2000986 = rkw_fin(_wx2000986);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x743 = rk_link_nf_k(x729, x2000986, 4u);
-#else // archsel_hip
   RkAcc x743 = rk_link_nf_kl(x729, x2000986, 4u, EF_DEP(x644.lo[0]));
-#endif // archsel_hip
   const uint32_t efl_arg3_41_0 = EF_LDCR(arg3, 41u, 0u);
   const uint32_t efl_arg3_44_0 = EF_LDCR(arg3, 44u, 0u);
   auto x744 = x578 * x583;
@@ -24833,11 +24667,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2000994 = rkw_ee(x2000991, x601);
   rkw_ef(_wx2000994, x144, x744, true);
   auto x2000994 = rkw_fin(_wx2000994);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x755 = rk_link_k(x743, x2000994, 5u);
-#else // archsel_hip
   RkAcc x755 = rk_link_kl(x743, x2000994, 5u, EF_DEP(x673.lo[0]));
-#endif // archsel_hip
   auto x756 = x41 * x628;
   auto x757 = x756 + x349;
   auto x758 = x357 * x757;
@@ -24855,11 +24685,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   rkw_ef(_wx2001001, x40, x758, true);
   const uint32_t efl_arg3_47_0 = EF_LDCR(arg3, 47u, 0u);
   auto x2001001 = rkw_fin(_wx2001001);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x771 = rk_link_nf_k(x755, x2001001, 6u);
-#else // archsel_hip
   RkAcc x771 = rk_link_nf_kl(x755, x2001001, 6u, EF_DEP(x702.lo[0]));
-#endif // archsel_hip
   auto x772 = x43 * x628;
   auto x773 = x772 + x349;
   auto x774 = x55 * x628;
@@ -24880,11 +24706,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001009 = rkw_ee(x2001006, x780);
   rkw_ef(_wx2001009, x49, x776, true);
   auto x2001009 = rkw_fin(_wx2001009);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x789 = rk_link_k(x771, x2001009, 7u);
-#else // archsel_hip
   RkAcc x789 = rk_link_kl(x771, x2001009, 7u, EF_DEP(x729.lo[0]));
-#endif // archsel_hip
   auto x166 = ::risc0::Fp::fromRaw(efl_arg3_52_0);
   auto x790 = x166 * x628;
   auto x791 = x790 + x349;
@@ -24904,11 +24726,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001017 = rkw_ee(x2001014, x798);
   rkw_ef(_wx2001017, x54, x794, true);
   auto x2001017 = rkw_fin(_wx2001017);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x807 = rk_link_nf_k(x789, x2001017, 8u);
-#else // archsel_hip
   RkAcc x807 = rk_link_nf_kl(x789, x2001017, 8u, EF_DEP(x743.lo[0]));
-#endif // archsel_hip
   auto x808 = x53 * x628;
   const uint32_t efl_arg4_61_0 = EF_LDCR(arg4, 61u, 0u);
   const uint32_t efl_arg4_60_0 = EF_LDCR(arg4, 60u, 0u);
@@ -24944,11 +24762,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001025 = rkw_ee(x2001022, x816);
   rkw_ef(_wx2001025, x3000014, x812, true);
   auto x2001025 = rkw_fin(_wx2001025);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x832 = rk_link_k(x807, x2001025, 9u);
-#else // archsel_hip
   RkAcc x832 = rk_link_kl(x807, x2001025, 9u, EF_DEP(x755.lo[0]));
-#endif // archsel_hip
   auto x833 = x64 * x628;
   auto x834 = x833 + x349;
   auto x835 = x65 * x628;
@@ -24996,11 +24810,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_arg3_166_0 = EF_LDCR(arg3, 166u, 0u);
   rkw_ef(_wx2001031, x177, x837, true);
   auto x2001031 = rkw_fin(_wx2001031);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x863 = rk_link_nf_k(x832, x2001031, 10u);
-#else // archsel_hip
   RkAcc x863 = rk_link_nf_kl(x832, x2001031, 10u, EF_DEP(x771.lo[0]));
-#endif // archsel_hip
   auto x182 = ::risc0::Fp::fromRaw(efl_arg3_162_0);
   auto x183 = ::risc0::Fp::fromRaw(efl_arg3_163_0);
   auto x184 = ::risc0::Fp::fromRaw(efl_arg3_164_0);
@@ -25053,11 +24863,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_arg4_71_0 = EF_LDCR(arg4, 71u, 0u);
   rkw_ef(_wx2001039, x189, x873, true);
   auto x2001039 = rkw_fin(_wx2001039);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x893 = rk_link_k(x863, x2001039, 11u);
-#else // archsel_hip
   RkAcc x893 = rk_link_kl(x863, x2001039, 11u, EF_DEP(x789.lo[0]));
-#endif // archsel_hip
   auto x194 = ::risc0::Fp::fromRaw(efl_arg3_171_0);
   auto x894 = x194 * x313;
   auto x895 = x894 + x349;
@@ -25079,20 +24885,12 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   auto x903 = x902 * x895;
   auto x199 = ::risc0::Fp::fromRaw(efl_arg3_170_0);
   auto x904 = x903 - x199;
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x905 = rk_link_nf_k(x893, x904, 12u);
-#else // archsel_hip
   RkAcc x905 = rk_link_nf_kl(x893, x904, 12u, EF_DEP(x807.lo[0]));
-#endif // archsel_hip
   auto x906 = x617 - x901;
-#if defined(__GFX12__) // archsel_hip
-  FpExt x907 = rk_fin(rk_link_k(x905, x906, 13u));
-#else // archsel_hip
   FpExt x907 = rk_fin(rk_link_kl(x905, x906, 13u, EF_DEP(x832.lo[0])));
-#endif // archsel_hip
   auto x200 = ::risc0::Fp::fromRaw(efl_arg3_4_0);
   RkW _cx908 = _cx622;
-  rk_cl_acc(_cx908, x200 * x907, 448u);
+  rk_cl_accl(_cx908, x200 * x907, 448u, EF_DEP(_cx622.lo[0]));
   FpExt x908 = rkw_fin(_cx908);
   auto x909 = x159 * x343;
   auto x910 = x909 + x349;
@@ -25109,11 +24907,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001047 = rkw_ee(x2001044, x917);
   rkw_ef(_wx2001047, x110, x913, true);
   auto x2001047 = rkw_fin(_wx2001047);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x926 = rk_link_nf_k(arg1, x2001047, 0u);
-#else // archsel_hip
   RkAcc x926 = rk_link_nf_kl(arg1, x2001047, 0u, EF_DEP(x863.lo[0]));
-#endif // archsel_hip
   auto x927 = x105 * x313;
   auto x928 = x927 + x349;
   // remat_lu: store dropped
@@ -25140,11 +24934,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001055 = rkw_ee(x2001052, x940);
   rkw_ef(_wx2001055, x112, x934, true);
   auto x2001055 = rkw_fin(_wx2001055);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x949 = rk_link_k(x926, x2001055, 1u);
-#else // archsel_hip
   RkAcc x949 = rk_link_kl(x926, x2001055, 1u, EF_DEP(x893.lo[0]));
-#endif // archsel_hip
   auto x950 = x160 * x319;
   auto x201 = ::risc0::Fp::fromRaw(efl_arg3_127_0);
   auto x202 = ::risc0::Fp::fromRaw(efl_arg3_128_0);
@@ -25185,11 +24975,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001063 = rkw_ee(x2001060, x967);
   rkw_ef(_wx2001063, x207, x958, true);
   auto x2001063 = rkw_fin(_wx2001063);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x976 = rk_link_nf_k(x949, x2001063, 2u);
-#else // archsel_hip
   RkAcc x976 = rk_link_nf_kl(x949, x2001063, 2u, EF_DEP(x905.lo[0]));
-#endif // archsel_hip
   auto x208 = ::risc0::Fp::fromRaw(efl_arg3_135_0);
   auto x977 = x208 * x319;
   const uint32_t efl_arg3_140_0 = EF_LDCR(arg3, 140u, 0u);
@@ -25234,11 +25020,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001071 = rkw_ee(x2001068, x996);
   rkw_ef(_wx2001071, x218, x992, true);
   auto x2001071 = rkw_fin(_wx2001071);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x1005 = rk_link_k(x976, x2001071, 3u);
-#else // archsel_hip
   RkAcc x1005 = rk_link_kl(x976, x2001071, 3u, EF_DEP(x907.elems[0].asRaw()));
-#endif // archsel_hip
   auto x219 = ::risc0::Fp::fromRaw(efl_arg3_146_0);
   auto x1006 = x219 * x343;
   auto x1007 = x1006 + x349;
@@ -25252,13 +25034,8 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001079 = rkw_ee(x2001076, x576);
   rkw_ef(_wx2001079, x132, x1008, true);
   auto x2001079 = rkw_fin(_wx2001079);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x1019 = rk_link_nf_k(x1005, x2001079, 4u);
-  RkAcc x1020 = rk_link_k(x1019, x2000994, 5u);
-#else // archsel_hip
   RkAcc x1019 = rk_link_nf_kl(x1005, x2001079, 4u, EF_DEP(x926.lo[0]));
   RkAcc x1020 = rk_link_kl(x1019, x2000994, 5u, EF_DEP(x949.lo[0]));
-#endif // archsel_hip
   auto x1021 = x41 * x313;
   auto x1022 = x1021 + x349;
   auto x1023 = x357 * x1022;
@@ -25271,11 +25048,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001086 = rkw_ee(x2001083, x1026);
   rkw_ef(_wx2001086, x40, x1023, true);
   auto x2001086 = rkw_fin(_wx2001086);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x1035 = rk_link_nf_k(x1020, x2001086, 6u);
-#else // archsel_hip
   RkAcc x1035 = rk_link_nf_kl(x1020, x2001086, 6u, EF_DEP(x976.lo[0]));
-#endif // archsel_hip
   auto x1036 = x55 * x313;
   auto x1037 = x1036 + x349;
   auto x1038 = x364 * x1037;
@@ -25289,11 +25062,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001094 = rkw_ee(x2001091, x1042);
   rkw_ef(_wx2001094, x49, x1038, true);
   auto x2001094 = rkw_fin(_wx2001094);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x1051 = rk_link_k(x1035, x2001094, 7u);
-#else // archsel_hip
   RkAcc x1051 = rk_link_kl(x1035, x2001094, 7u, EF_DEP(x1005.lo[0]));
-#endif // archsel_hip
   auto x1052 = x166 * x313;
   auto x1053 = x1052 + x349;
   auto x1054 = x50 * x313;
@@ -25309,11 +25078,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001102 = rkw_ee(x2001099, x1060);
   rkw_ef(_wx2001102, x54, x1056, true);
   auto x2001102 = rkw_fin(_wx2001102);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x1069 = rk_link_nf_k(x1051, x2001102, 8u);
-#else // archsel_hip
   RkAcc x1069 = rk_link_nf_kl(x1051, x2001102, 8u, EF_DEP(x1019.lo[0]));
-#endif // archsel_hip
   auto x1070 = x53 * x313;
   auto x1071 = x1070 + x349;
   auto x1072 = x56 * x313;
@@ -25329,11 +25094,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_arg3_72_0 = EF_LDCR(arg3, 72u, 0u);
   rkw_ef(_wx2001110, x3000015, x1074, true);
   auto x2001110 = rkw_fin(_wx2001110);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x1085 = rk_link_k(x1069, x2001110, 9u);
-#else // archsel_hip
   RkAcc x1085 = rk_link_kl(x1069, x2001110, 9u, EF_DEP(x1020.lo[0]));
-#endif // archsel_hip
   auto x1086 = x68 * x628;
   auto x1087 = x1086 + x349;
   auto x2001111 = x858 * x837;
@@ -25344,11 +25105,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001116 = rkw_ee(x2001113, x1087);
   rkw_ef(_wx2001116, x69, x837, true);
   auto x2001116 = rkw_fin(_wx2001116);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x1096 = rk_link_nf_k(x1085, x2001116, 10u);
-#else // archsel_hip
   RkAcc x1096 = rk_link_nf_kl(x1085, x2001116, 10u, EF_DEP(x1035.lo[0]));
-#endif // archsel_hip
   auto x1097 = x156 * x628;
   auto x1098 = x1097 + x349;
   auto x221 = ::risc0::Fp::fromRaw(efl_arg3_72_0);
@@ -25372,11 +25129,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001124 = rkw_ee(x2001121, x1105);
   rkw_ef(_wx2001124, x224, x1101, true);
   auto x2001124 = rkw_fin(_wx2001124);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x1114 = rk_link_k(x1096, x2001124, 11u);
-#else // archsel_hip
   RkAcc x1114 = rk_link_kl(x1096, x2001124, 11u, EF_DEP(x1051.lo[0]));
-#endif // archsel_hip
   const uint32_t efl_arg3_75_0 = EF_LDCR(arg3, 75u, 0u);
   const uint32_t efl_arg3_77_0 = EF_LDCR(arg3, 77u, 0u);
   auto x225 = ::risc0::Fp::fromRaw(efl_arg3_76_0);
@@ -25403,11 +25156,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001132 = rkw_ee(x2001129, x1123);
   rkw_ef(_wx2001132, x230, x1119, true);
   auto x2001132 = rkw_fin(_wx2001132);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x1132 = rk_link_nf_k(x1114, x2001132, 12u);
-#else // archsel_hip
   RkAcc x1132 = rk_link_nf_kl(x1114, x2001132, 12u, EF_DEP(x1069.lo[0]));
-#endif // archsel_hip
   auto x231 = ::risc0::Fp::fromRaw(efl_arg3_82_0);
   auto x1133 = x231 * x628;
   const uint32_t efl_arg4_78_0 = EF_LDCR(arg4, 78u, 0u);
@@ -25454,11 +25203,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_2(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_arg3_192_0 = EF_LDCR(arg3, 192u, 0u);
   rkw_ef(_wx2001140, x235, x1137, true);
   auto x2001140 = rkw_fin(_wx2001140);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x1157 = rk_fin(rk_link_k(x1132, x2001140, 13u));
-#else // archsel_hip
   FpExt x1157 = rk_fin(rk_link_kl(x1132, x2001140, 13u, EF_DEP(x1085.lo[0])));
-#endif // archsel_hip
   auto x240 = ::risc0::Fp::fromRaw(efl_arg3_189_0);
   auto x1158 = x240 * x319;
   // remat_lu: store dropped
@@ -27130,31 +26875,27 @@ __device__ EF_CHAIN FpExt rv32im_v2_17(uint32_t cycle, uint32_t steps, Fp* arg0,
 #if defined(__GFX12__) // archsel_hip
   RkAcc x787 = rk_link_nf_k(arg3, x107, 0u);
   FpExt x788 = rk_fin(rk_link_k(x787, x108, 1u));
-  RkAcc x789 = rk_link_nf_k(x788, x783, 2u);
-  RkAcc x790 = rk_link_k(x789, x784, 3u);
-  RkAcc x791 = rk_link_nf_k(x790, x785, 4u);
-  FpExt x792 = rk_fin(rk_link_k(x791, x786, 5u));
+  RkAcc x789 = rk_link_nf_kl(x788, x783, 2u, EF_DEP(x479.elems[0].asRaw()));
+  RkAcc x790 = rk_link_kl(x789, x784, 3u, EF_DEP(x480.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x787 = rk_link_nf_kl(arg3, x107, 0u, EF_DEP(x771.lo[0]));
   FpExt x788 = rk_fin(rk_link_kl(x787, x108, 1u, EF_DEP(x774.lo[0])));
   RkAcc x789 = rk_link_nf_kl(x788, x783, 2u, EF_DEP(x776.lo[0]));
   RkAcc x790 = rk_link_kl(x789, x784, 3u, EF_DEP(x780.elems[0].asRaw()));
+#endif // archsel_hip
   RkAcc x791 = rk_link_nf_kl(x790, x785, 4u, EF_DEP(x787.lo[0]));
   FpExt x792 = rk_fin(rk_link_kl(x791, x786, 5u, EF_DEP(x788.elems[0].asRaw())));
-#endif // archsel_hip
   auto x158 = ::risc0::Fp::fromRaw(efl_arg8_181_0);
   RkW _cx793 = rk_cl0(x780, x158 * x792, 83u); FpExt x793 = rkw_fin(_cx793);
   auto x794 = x107 - x1;
   auto x795 = x108 - x1;
   auto x796 = x30 - x21;
+  RkAcc x797 = rk_link_nf_kl(arg4, x97, 1u, EF_DEP(x789.lo[0]));
+  FpExt x798 = rk_fin(rk_link_kl(x797, x478, 2u, EF_DEP(x790.lo[0])));
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x797 = rk_link_nf_k(arg4, x97, 1u);
-  FpExt x798 = rk_fin(rk_link_k(x797, x478, 2u));
   EF_W((ef_v4i efd_173[4] = {}; const int efq_173_0 = ef_wq(efw, 3u); ef_wst(efw, 0u, x794);), RkAcc x799 = rk_link_nf_k(x798, x794, 3u);)
   EF_W((ef_wst(efw, 1u, x795);), RkAcc x800 = rk_link_k(x799, x795, 4u);)
 #else // archsel_hip
-  RkAcc x797 = rk_link_nf_kl(arg4, x97, 1u, EF_DEP(x789.lo[0]));
-  FpExt x798 = rk_fin(rk_link_kl(x797, x478, 2u, EF_DEP(x790.lo[0])));
   EF_W((ef_v4i efd_173[4] = {}; const int efq_173_0 = ef_wq(efw, 3u); ef_wst(efw, 0u, x794);), RkAcc x799 = rk_link_nf_kl(x798, x794, 3u, EF_DEP(x791.lo[0]));)
   EF_W((ef_wst(efw, 1u, x795);), RkAcc x800 = rk_link_kl(x799, x795, 4u, EF_DEP(x792.elems[0].asRaw()));)
 #endif // archsel_hip
@@ -27171,20 +26912,20 @@ __device__ EF_CHAIN FpExt rv32im_v2_17(uint32_t cycle, uint32_t steps, Fp* arg0,
   EF_W((const int efq_173_4 = ef_wq4(efw, 7u, 8u, 7u, 7u, 2u); ef_wst(efw, 4u, x129);), RkAcc x803 = rk_link_nf_kl(x802, x129, 7u, EF_DEP(x799.lo[0]));)
   EF_W((ef_wst(efw, 5u, x128); ef_wblk(efw, efd_173, 0u, efq_173_0); ef_wblk(efw, efd_173, 4u, efq_173_4); FpExt x804 = ef_wfin(efw, efd_173, 0u, x798);), FpExt x804 = rk_fin(rk_link_kl(x803, x128, 8u, EF_DEP(x800.lo[0])));)
 #endif // archsel_hip
-  RkW _cx805 = _cx793; rk_cl_acc(_cx805, x157 * x804, 89u); FpExt x805 = rkw_fin(_cx805);
+  RkW _cx805 = _cx793; rk_cl_accl(_cx805, x157 * x804, 89u, EF_DEP(_cx793.lo[0])); FpExt x805 = rkw_fin(_cx805);
   auto x806 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg8_184_0));
   auto x807 = x806 - x28;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x808 = rk_link_nf_k(arg3, x142, 0u);
-  FpExt x809 = rk_fin(rk_link_k(x808, x807, 1u));
+  RkAcc x808 = rk_link_nf_kl(arg3, x142, 0u, EF_DEP(x791.lo[0]));
+  FpExt x809 = rk_fin(rk_link_kl(x808, x807, 1u, EF_DEP(x792.elems[0].asRaw())));
 #else // archsel_hip
   RkAcc x808 = rk_link_nf_kl(arg3, x142, 0u, EF_DEP(x801.lo[0]));
   FpExt x809 = rk_fin(rk_link_kl(x808, x807, 1u, EF_DEP(x802.lo[0])));
 #endif // archsel_hip
-  RkW _cx810 = _cx805; rk_cl_acc(_cx810, x782 * x809, 98u); FpExt x810 = rkw_fin(_cx810);
+  RkW _cx810 = _cx805; rk_cl_accl(_cx810, x782 * x809, 98u, EF_DEP(_cx805.lo[0])); FpExt x810 = rkw_fin(_cx810);
   auto x159 = ::risc0::Fp::fromRaw(efl_arg8_59_0);
 #if defined(__GFX12__) // archsel_hip
-  FpExt x811 = rk_fin(rk_link_k(x810, x159, 100u));
+  FpExt x811 = rk_fin(rk_link_kl(x810, x159, 100u, EF_DEP(x797.lo[0])));
 #else // archsel_hip
   FpExt x811 = rk_fin(rk_link_kl(x810, x159, 100u, EF_DEP(x803.lo[0])));
 #endif // archsel_hip
@@ -27327,16 +27068,13 @@ __device__ EF_CHAIN FpExt rv32im_v2_17(uint32_t cycle, uint32_t steps, Fp* arg0,
   auto x1000 = x161 - x841;
   auto x1001 = x31 - x1;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x1002 = rk_link_nf_k(x788, x999, 2u);
-  RkAcc x1003 = rk_link_k(x1002, x1000, 3u);
-  RkAcc x1004 = rk_link_nf_k(x1003, x786, 4u);
-  FpExt x1005 = rk_fin(rk_link_k(x1004, x1001, 5u));
+  RkAcc x1002 = rk_link_nf_kl(x788, x999, 2u, EF_DEP(x798.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x1002 = rk_link_nf_kl(x788, x999, 2u, EF_DEP(x804.elems[0].asRaw()));
+#endif // archsel_hip
   RkAcc x1003 = rk_link_kl(x1002, x1000, 3u, EF_DEP(x808.lo[0]));
   RkAcc x1004 = rk_link_nf_kl(x1003, x786, 4u, EF_DEP(x809.elems[0].asRaw()));
   FpExt x1005 = rk_fin(rk_link_kl(x1004, x1001, 5u, EF_DEP(x811.elems[0].asRaw())));
-#endif // archsel_hip
   auto x1007 = x841 - x21;
   auto x1008 = x31 - x21;
 #if defined(__GFX12__) // archsel_hip
@@ -27361,8 +27099,8 @@ __device__ EF_CHAIN FpExt rv32im_v2_17(uint32_t cycle, uint32_t steps, Fp* arg0,
   auto x1018 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg8_185_0));
   auto x1019 = x1018 - x28;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x1020 = rk_link_nf_k(arg3, x143, 0u);
-  FpExt x1021 = rk_fin(rk_link_k(x1020, x1019, 1u));
+  RkAcc x1020 = rk_link_nf_kl(arg3, x143, 0u, EF_DEP(x1002.lo[0]));
+  FpExt x1021 = rk_fin(rk_link_kl(x1020, x1019, 1u, EF_DEP(x1003.lo[0])));
 #else // archsel_hip
   RkAcc x1020 = rk_link_nf_kl(arg3, x143, 0u, EF_DEP(x1013.lo[0]));
   FpExt x1021 = rk_fin(rk_link_kl(x1020, x1019, 1u, EF_DEP(x1014.lo[0])));
@@ -27742,27 +27480,27 @@ __device__ EF_CHAIN FpExt rv32im_v2_17(uint32_t cycle, uint32_t steps, Fp* arg0,
   auto x2000641 = -x158;
   RkW _cx2000640 = rk_cl0(x2000639, x2000641 * x792, 83u); FpExt x2000640 = rkw_fin(_cx2000640);
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x2000642 = rk_link_nf_k(x2000640, x991, 84u);
-  FpExt x2000643 = rk_fin(rk_link_k(x2000642, x995, 85u));
+  RkAcc x2000642 = rk_link_nf_kl(x2000640, x991, 84u, EF_DEP(x1004.lo[0]));
+  FpExt x2000643 = rk_fin(rk_link_kl(x2000642, x995, 85u, EF_DEP(x1005.elems[0].asRaw())));
 #else // archsel_hip
   RkAcc x2000642 = rk_link_nf_kl(x2000640, x991, 84u, EF_DEP(x2000633.lo[0]));
   FpExt x2000643 = rk_fin(rk_link_kl(x2000642, x995, 85u, EF_DEP(x2000635.lo[0])));
 #endif // archsel_hip
   RkW _cx2000644 = rk_cl0(x2000643, x157 * x1005, 86u); FpExt x2000644 = rkw_fin(_cx2000644);
   auto x2000646 = -x157;
-  RkW _cx2000645 = _cx2000644; rk_cl_acc(_cx2000645, x2000646 * x804, 89u); FpExt x2000645 = rkw_fin(_cx2000645);
-  RkW _cx2000647 = _cx2000645; rk_cl_acc(_cx2000647, x153 * x1016, 92u); FpExt x2000647 = rkw_fin(_cx2000647);
+  RkW _cx2000645 = _cx2000644; rk_cl_accl(_cx2000645, x2000646 * x804, 89u, EF_DEP(_cx2000644.lo[0])); FpExt x2000645 = rkw_fin(_cx2000645);
+  RkW _cx2000647 = _cx2000645; rk_cl_accl(_cx2000647, x153 * x1016, 92u, EF_DEP(_cx2000645.lo[0])); FpExt x2000647 = rkw_fin(_cx2000647);
   auto x2000649 = -x782;
-  RkW _cx2000648 = _cx2000647; rk_cl_acc(_cx2000648, x2000649 * x809, 98u); FpExt x2000648 = rkw_fin(_cx2000648);
+  RkW _cx2000648 = _cx2000647; rk_cl_accl(_cx2000648, x2000649 * x809, 98u, EF_DEP(_cx2000647.lo[0])); FpExt x2000648 = rkw_fin(_cx2000648);
   auto x2000651 = -x159;
 #if defined(__GFX12__) // archsel_hip
-  FpExt x2000650 = rk_fin(rk_link_k(x2000648, x2000651, 100u));
+  FpExt x2000650 = rk_fin(rk_link_kl(x2000648, x2000651, 100u, EF_DEP(x1020.lo[0])));
 #else // archsel_hip
   FpExt x2000650 = rk_fin(rk_link_kl(x2000648, x2000651, 100u, EF_DEP(x2000637.lo[0])));
 #endif // archsel_hip
   RkW _cx1022 = rk_cl0(x2000650, x998 * x1021, 101u); FpExt x1022 = rkw_fin(_cx1022);
   auto x164 = ::risc0::Fp::fromRaw(efl_arg8_22_0);
-  RkW _cx1023 = _cx812; rk_cl_acc(_cx1023, x164 * x1022, 180u); FpExt x1023 = rkw_fin(_cx1023);
+  RkW _cx1023 = _cx812; rk_cl_accl(_cx1023, x164 * x1022, 180u, EF_DEP(_cx812.lo[0])); FpExt x1023 = rkw_fin(_cx1023);
   const uint32_t efl_arg8_23_0 = EF_LDCR(arg8, 23u, 0u);
   constexpr Fp x0(19);
   auto x1024 = x66 - x0;
@@ -27776,18 +27514,18 @@ __device__ EF_CHAIN FpExt rv32im_v2_17(uint32_t cycle, uint32_t steps, Fp* arg0,
   auto x1034 = x503 - x380;
   auto x2000653 = x1024 - x476;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x2000652 = rk_link_nf_k(x811, x2000653, 0u);
+  RkAcc x2000652 = rk_link_nf_kl(x811, x2000653, 0u, EF_DEP(x1021.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x2000652 = rk_link_nf_kl(x811, x2000653, 0u, EF_DEP(x2000643.elems[0].asRaw()));
 #endif // archsel_hip
   auto x2000654 = x1034 - x504;
 #if defined(__GFX12__) // archsel_hip
-  FpExt x1112 = rk_fin(rk_link_k(x2000652, x2000654, 9u));
+  FpExt x1112 = rk_fin(rk_link_kl(x2000652, x2000654, 9u, EF_DEP(x2000642.lo[0])));
 #else // archsel_hip
   FpExt x1112 = rk_fin(rk_link_kl(x2000652, x2000654, 9u, EF_DEP(x2000650.elems[0].asRaw())));
 #endif // archsel_hip
   auto x165 = ::risc0::Fp::fromRaw(efl_arg8_23_0);
-  RkW _cx1113 = _cx1023; rk_cl_acc(_cx1113, x165 * x1112, 272u); FpExt x1113 = rkw_fin(_cx1113);
+  RkW _cx1113 = _cx1023; rk_cl_accl(_cx1113, x165 * x1112, 272u, EF_DEP(_cx1023.lo[0])); FpExt x1113 = rkw_fin(_cx1113);
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_wst(efw, 2u, x813);), RkAcc x1114 = rk_link_nf_k(x1026, x813, 2u);)
   EF_W((ef_wst(efw, 3u, x482);), RkAcc x1115 = rk_link_k(x1114, x482, 3u);)
@@ -28316,7 +28054,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* arg0,
   EF_W((ef_wst(efw, 19u, x53); ef_wblk(efw, efd_185, 12u, efq_185_36); ef_wblk(efw, efd_185, 16u, efq_185_40); FpExt x366 = ef_wfin(efw, efd_185, 0u, arg3);), FpExt x366 = rk_fin(rk_link_kl(x365, x53, 47u, EF_DEP(x362.lo[0])));)
 #endif // archsel_hip
   auto x60 = ::risc0::Fp::fromRaw(efl_arg8_24_0);
-  RkW _cx367 = _cx283; rk_cl_acc(_cx367, x60 * x366, 169u); FpExt x367 = rkw_fin(_cx367);
+  RkW _cx367 = _cx283; rk_cl_accl(_cx367, x60 * x366, 169u, EF_DEP(_cx283.lo[0])); FpExt x367 = rkw_fin(_cx367);
   auto x368 = RK_LD1M(arg0, 4u);
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_186[4] = {}; const int efq_186_0 = ef_wq(efw, 0u); ef_wst(efw, 0u, x368);), RkAcc x369 = rk_link_nf_k(arg3, x368, 0u);)
@@ -28678,7 +28416,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* arg0,
   EF_W((ef_wst(efw, 11u, x59); ef_wblk(efw, efd_186, 4u, efq_186_52); ef_wblk(efw, efd_186, 8u, efq_186_56); FpExt x497 = ef_wfin(efw, efd_186, 0u, efb_186);), FpExt x497 = rk_fin(rk_link_kl(x496, x59, 61u, EF_DEP(x493.lo[0])));)
 #endif // archsel_hip
   auto x83 = ::risc0::Fp::fromRaw(efl_arg8_25_0);
-  RkW _cx498 = _cx367; rk_cl_acc(_cx498, x83 * x497, 208u); FpExt x498 = rkw_fin(_cx498);
+  RkW _cx498 = _cx367; rk_cl_accl(_cx498, x83 * x497, 208u, EF_DEP(_cx367.lo[0])); FpExt x498 = rkw_fin(_cx498);
   auto x499 = RK_LD1M(arg0, 5u);
   auto x502 = x61 - x373;
   auto x516 = (::risc0::Fp::fromRaw(efl_arg8_76_0) * Fp(4u));
@@ -29045,7 +28783,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* arg0,
   EF_W((ef_wst(efw, 7u, x2000752); ef_wblk(efw, efd_187, 0u, efq_187_48); ef_wblk(efw, efd_187, 4u, efq_187_52); FpExt x623 = ef_wfin(efw, efd_187, 0u, efb_187);), FpExt x623 = rk_fin(rk_link_kl(x2000750, x2000752, 564u, EF_DEP(x2000745.lo[0])));)
 #endif // archsel_hip
   auto x92 = ::risc0::Fp::fromRaw(efl_arg8_26_0);
-  RkW _cx624 = _cx498; rk_cl_acc(_cx624, x92 * x623, 270u); FpExt x624 = rkw_fin(_cx624);
+  RkW _cx624 = _cx498; rk_cl_accl(_cx624, x92 * x623, 270u, EF_DEP(_cx498.lo[0])); FpExt x624 = rkw_fin(_cx624);
   auto x93 = ::risc0::Fp::fromRaw(efl_arg8_34_0);
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_188[4] = {}; const int efq_188_0 = ef_wq(efw, 2u); ef_wst(efw, 0u, x93);), RkAcc x625 = rk_link_nf_k(arg4, x93, 2u);)
@@ -29111,9 +28849,9 @@ __device__ EF_CHAIN FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* arg0,
   EF_W((ef_wst(efw, 18u, x53); ef_wblk(efw, efd_188, 12u, efq_188_12); ef_wblk(efw, efd_188, 16u, efq_188_16); FpExt x643 = ef_wfin(efw, efd_188, 0u, arg4);), FpExt x643 = rk_fin(rk_link_kl(x642, x53, 20u, EF_DEP(x639.lo[0])));)
 #endif // archsel_hip
   auto x99 = ::risc0::Fp::fromRaw(efl_arg8_27_0);
-  RkW _cx644 = _cx624; rk_cl_acc(_cx644, x99 * x643, 284u); FpExt x644 = rkw_fin(_cx644);
+  RkW _cx644 = _cx624; rk_cl_accl(_cx644, x99 * x643, 284u, EF_DEP(_cx624.lo[0])); FpExt x644 = rkw_fin(_cx644);
   auto x100 = ::risc0::Fp::fromRaw(efl_arg8_28_0);
-  RkW _cx645 = _cx644; rk_cl_acc(_cx645, x100 * x643, 296u); FpExt x645 = rkw_fin(_cx645);
+  RkW _cx645 = _cx644; rk_cl_accl(_cx645, x100 * x643, 296u, EF_DEP(_cx644.lo[0])); FpExt x645 = rkw_fin(_cx645);
   constexpr Fp x26(9);
   auto x101 = ::risc0::Fp::fromRaw(efl_arg8_104_0);
   // lincombF: fused into a lazy Fp linear combination
@@ -29524,38 +29262,18 @@ __device__ EF_CHAIN FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* arg0,
   auto x838 = x837 * x142;
   auto x839 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg8_202_0));
   auto x840 = x838 - x839;
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x841 = rk_link_k(x836, x840, 1u);
-#else // archsel_hip
   RkAcc x841 = rk_link_kl(x836, x840, 1u, EF_DEP(x831.lo[0]));
-#endif // archsel_hip
   auto x143 = ::risc0::Fp::fromRaw(efl_arg8_202_0);
   auto x842 = x143 * x837;
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x843 = rk_link_nf_k(x841, x842, 2u);
-#else // archsel_hip
   RkAcc x843 = rk_link_nf_kl(x841, x842, 2u, EF_DEP(x833.lo[0]));
-#endif // archsel_hip
   auto x844 = x143 * x142;
-#if defined(__GFX12__) // archsel_hip
-  FpExt x845 = rk_fin(rk_link_k(x843, x844, 3u));
-#else // archsel_hip
   FpExt x845 = rk_fin(rk_link_kl(x843, x844, 3u, EF_DEP(x834.elems[0].asRaw())));
-#endif // archsel_hip
   constexpr Fp x33(0);
   auto x144 = ::risc0::Fp::fromRaw(efl_arg8_29_0);
   auto x846 = x33 - x144;
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x847 = rk_link_nf_k(arg3, x846, 0u);
-#else // archsel_hip
   RkAcc x847 = rk_link_nf_kl(arg3, x846, 0u, EF_DEP(x836.lo[0]));
-#endif // archsel_hip
   auto x848 = x33 - x66;
-#if defined(__GFX12__) // archsel_hip
-  FpExt x849 = rk_fin(rk_link_k(x847, x848, 1u));
-#else // archsel_hip
   FpExt x849 = rk_fin(rk_link_kl(x847, x848, 1u, EF_DEP(x841.lo[0])));
-#endif // archsel_hip
   auto x145 = ::risc0::Fp::fromRaw(efl_arg8_31_0);
   const uint32_t efl_arg8_35_0 = EF_LDCR(arg8, 35u, 0u);
   RkW1 _wx850 = rkw1_ff0(x824, x14, false); rkw1_ff(_wx850, x826, x13, false); rkw1_v(_wx850, x145, true); auto x850 = rkw1_fin(_wx850);
@@ -29861,20 +29579,20 @@ __device__ EF_CHAIN FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* arg0,
   constexpr Fp x9(2013265920);
   auto x937 = x164 - x9;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x938 = rk_link_nf_k(arg3, x937, 0u);
+  RkAcc x938 = rk_link_nf_kl(arg3, x937, 0u, EF_DEP(x843.lo[0]));
 #else // archsel_hip
   RkAcc x938 = rk_link_nf_kl(arg3, x937, 0u, EF_DEP(x932.lo[0]));
 #endif // archsel_hip
   const uint32_t efl_arg8_72_0 = EF_LDCR(arg8, 72u, 0u);
   const uint32_t efl_arg8_70_0 = EF_LDCR(arg8, 70u, 0u);
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x939 = rk_link_k(x938, x339, 1u);
+  RkAcc x939 = rk_link_kl(x938, x339, 1u, EF_DEP(x845.elems[0].asRaw()));
 #else // archsel_hip
   RkAcc x939 = rk_link_kl(x938, x339, 1u, EF_DEP(x933.lo[0]));
 #endif // archsel_hip
   auto x940 = x40 - x829;
 #if defined(__GFX12__) // archsel_hip
-  FpExt x941 = rk_fin(rk_link_k(x939, x940, 2u));
+  FpExt x941 = rk_fin(rk_link_kl(x939, x940, 2u, EF_DEP(x847.lo[0])));
 #else // archsel_hip
   FpExt x941 = rk_fin(rk_link_kl(x939, x940, 2u, EF_DEP(x934.lo[0])));
 #endif // archsel_hip
@@ -30317,7 +30035,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_13(uint32_t cycle, uint32_t steps, Fp* arg0,
   EF_W((ef_wst(efw, 2u, x914); ef_wblk(efw, efd_195, 20u, efq_195_68); ef_wblk(efw, efd_195, 0u, efq_195_72);), RkAcc x1101 = rk_link_nf_kl(x1100, x914, 81u, EF_DEP(x1097.lo[0]));)
   EF_W((efs_195 = rk_link_k(efs_195, x922, 82u); FpExt x1102 = ef_wfin(efw, efd_195, 0u, rk_fin(efs_195) + efb_195);), FpExt x1102 = rk_fin(rk_link_kl(x1101, x922, 82u, EF_DEP(x1098.lo[0])));)
 #endif // archsel_hip
-  RkW _cx1103 = _cx936; rk_cl_acc(_cx1103, x839 * x1102, 52u); FpExt x1103 = rkw_fin(_cx1103);
+  RkW _cx1103 = _cx936; rk_cl_accl(_cx1103, x839 * x1102, 52u, EF_DEP(_cx936.lo[0])); FpExt x1103 = rkw_fin(_cx1103);
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_196[4] = {}; const int efq_196_0 = ef_wq(efw, 135u); ef_wst(efw, 0u, x62);), RkAcc x1104 = rk_link_nf_k(x1103, x62, 135u);)
   EF_W((ef_wst(efw, 1u, x64);), RkAcc x1105 = rk_link_k(x1104, x64, 136u);)
@@ -34300,11 +34018,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_arg4_78_0 = EF_LDCR(arg4, 78u, 0u);
   const uint32_t efl_arg4_79_0 = EF_LDCR(arg4, 79u, 0u);
   auto x2001164 = rkw_fin(_wx2001164);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x303 = rk_fin(rk_link_k(x272, x2001164, 1u));
-#else // archsel_hip
   FpExt x303 = rk_fin(rk_link_kl(x272, x2001164, 1u, EF_DEP(x230.lo[0])));
-#endif // archsel_hip
   auto x39 = ::risc0::Fp::fromRaw(efl_arg4_74_0);
   auto x304 = x39 * x211;
   auto x305 = x304 + x196;
@@ -34350,11 +34064,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001172 = rkw_ee(x2001169, x323);
   rkw_ef(_wx2001172, x49, x314, true);
   auto x2001172 = rkw_fin(_wx2001172);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x333 = rk_link_nf_k(x303, x2001172, 2u);
-#else // archsel_hip
   RkAcc x333 = rk_link_nf_kl(x303, x2001172, 2u, EF_DEP(x249.lo[0]));
-#endif // archsel_hip
   const uint32_t efl_rkBD_91_0 = EF_LDCR(rkBD, 91u, 0u);
   const uint32_t efl_arg4_84_0 = EF_LDCR(arg4, 84u, 0u);
   const uint32_t efl_arg4_87_0 = EF_LDCR(arg4, 87u, 0u);
@@ -34389,11 +34099,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_arg4_103_0 = EF_LDCR(arg4, 103u, 0u);
   const uint32_t efl_arg4_104_0 = EF_LDCR(arg4, 104u, 0u);
   const uint32_t efl_arg4_105_0 = EF_LDCR(arg4, 105u, 0u);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x351 = rk_link_k(x333, x2001180, 3u);
-#else // archsel_hip
   RkAcc x351 = rk_link_kl(x333, x2001180, 3u, EF_DEP(x252.elems[0].asRaw()));
-#endif // archsel_hip
   auto x55 = ::risc0::Fp::fromRaw(efl_arg4_96_0);
   auto x352 = x55 * x231;
   auto x353 = x352 + x196;
@@ -34428,11 +34134,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001188 = rkw_ee(x2001185, x366);
   rkw_ef(_wx2001188, x3000033, x356, true);
   auto x2001188 = rkw_fin(_wx2001188);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x376 = rk_link_nf_k(x351, x2001188, 4u);
-#else // archsel_hip
   RkAcc x376 = rk_link_nf_kl(x351, x2001188, 4u, EF_DEP(x272.lo[0]));
-#endif // archsel_hip
   FpExt r20_x325 = EF_PM(605);
   const uint32_t efl_rkBD_109_0 = EF_LDCR(rkBD, 109u, 0u);
   const uint32_t efl_arg4_111_0 = EF_LDCR(arg4, 111u, 0u);
@@ -34478,11 +34180,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_arg4_31_0 = EF_LDCR(arg4, 31u, 0u);
   rkw_ef(_wx2001196, x68, x386, true);
   auto x2001196 = rkw_fin(_wx2001196);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x401 = rk_link_k(x376, x2001196, 5u);
-#else // archsel_hip
   RkAcc x401 = rk_link_kl(x376, x2001196, 5u, EF_DEP(x303.elems[0].asRaw()));
-#endif // archsel_hip
   auto x69 = ::risc0::Fp::fromRaw(efl_arg4_32_0);
   auto x402 = x69 * x389;
   auto x403 = x402 + x196;
@@ -34514,11 +34212,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001202 = rkw_ee(x2001199, x409);
   rkw_ef(_wx2001202, x73, x406, true);
   auto x2001202 = rkw_fin(_wx2001202);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x419 = rk_link_nf_k(x401, x2001202, 6u);
-#else // archsel_hip
   RkAcc x419 = rk_link_nf_kl(x401, x2001202, 6u, EF_DEP(x333.lo[0]));
-#endif // archsel_hip
   auto x74 = ::risc0::Fp::fromRaw(efl_arg4_116_0);
   auto x420 = x74 * x275;
   const uint32_t efl_rkBD_120_0 = EF_LDCR(rkBD, 120u, 0u);
@@ -34576,11 +34270,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001210 = rkw_ee(x2001207, x438);
   rkw_ef(_wx2001210, x80, x435, true);
   auto x2001210 = rkw_fin(_wx2001210);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x448 = rk_link_k(x419, x2001210, 7u);
-#else // archsel_hip
   RkAcc x448 = rk_link_kl(x419, x2001210, 7u, EF_DEP(x351.lo[0]));
-#endif // archsel_hip
   auto x81 = ::risc0::Fp::fromRaw(efl_arg4_128_0);
   auto x449 = x81 * x231;
   auto x450 = x449 + x196;
@@ -34596,20 +34286,12 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   rkw_ef(_wx459, x84, x452, true);
   rkw_ef(_wx459, x83, x450, true);
   auto x459 = rkw_fin(_wx459);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x460 = rk_link_nf_k(x448, x459, 8u);
-#else // archsel_hip
   RkAcc x460 = rk_link_nf_kl(x448, x459, 8u, EF_DEP(x376.lo[0]));
-#endif // archsel_hip
   auto x461 = RK_LD4L(arg0, 104u, 105u, 106u, 107u);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x462 = rk_fin(rk_link_k(x460, x461, 9u));
-#else // archsel_hip
   FpExt x462 = rk_fin(rk_link_kl(x460, x461, 9u, EF_DEP(x401.lo[0])));
-#endif // archsel_hip
   auto x85 = ::risc0::Fp::fromRaw(efl_arg4_6_0);
   RkW _cx463 = _cx253;
-  rk_cl_acc(_cx463, x85 * x462, 450u);
+  rk_cl_accl(_cx463, x85 * x462, 450u, EF_DEP(_cx253.lo[0]));
   FpExt x463 = rkw_fin(_cx463);
   auto x44 = ::risc0::Fp::fromRaw(efl_arg4_76_0);
   auto x464 = x44 * x275;
@@ -34632,11 +34314,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001218 = rkw_ee(x2001215, x475);
   rkw_ef(_wx2001218, x49, x469, true);
   auto x2001218 = rkw_fin(_wx2001218);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x484 = rk_link_nf_k(x303, x2001218, 2u);
-#else // archsel_hip
   RkAcc x484 = rk_link_nf_kl(x303, x2001218, 2u, EF_DEP(x419.lo[0]));
-#endif // archsel_hip
   auto x485 = x50 * x275;
   auto x86 = ::risc0::Fp::fromRaw(efl_arg4_86_0);
   RkW _wx492 = rkw_ef0(x86, x198, false);
@@ -34672,11 +34350,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_arg4_107_0 = EF_LDCR(arg4, 107u, 0u);
   rkw_ef(_wx2001226, x3000036, x500, true);
   auto x2001226 = rkw_fin(_wx2001226);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x513 = rk_link_k(x484, x2001226, 3u);
-#else // archsel_hip
   RkAcc x513 = rk_link_kl(x484, x2001226, 3u, EF_DEP(x448.lo[0]));
-#endif // archsel_hip
   auto x514 = x55 * x211;
   auto x515 = x514 + x196;
   auto x516 = x62 * x231;
@@ -34695,11 +34369,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001234 = rkw_ee(x2001231, x522);
   rkw_ef(_wx2001234, x93, x518, true);
   auto x2001234 = rkw_fin(_wx2001234);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x531 = rk_link_nf_k(x513, x2001234, 4u);
-#else // archsel_hip
   RkAcc x531 = rk_link_nf_kl(x513, x2001234, 4u, EF_DEP(x460.lo[0]));
-#endif // archsel_hip
   auto x532 = x79 * x231;
   auto x533 = x532 + x196;
   FpExt r33_x313 = EF_PM(603);
@@ -34741,11 +34411,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001242 = rkw_ee(x2001239, x545);
   rkw_ef(_wx2001242, x96, x535, true);
   auto x2001242 = rkw_fin(_wx2001242);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x554 = rk_link_k(x531, x2001242, 5u);
-#else // archsel_hip
   RkAcc x554 = rk_link_kl(x531, x2001242, 5u, EF_DEP(x462.elems[0].asRaw()));
-#endif // archsel_hip
   auto x555 = x77 * x198;
   // remat_lu: store dropped
   auto x556 = x538 + x555;
@@ -34768,11 +34434,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001250 = rkw_ee(x2001247, x391);
   rkw_ef(_wx2001250, x68, x564, true);
   auto x2001250 = rkw_fin(_wx2001250);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x575 = rk_link_nf_k(x554, x2001250, 6u);
-#else // archsel_hip
   RkAcc x575 = rk_link_nf_kl(x554, x2001250, 6u, EF_DEP(x484.lo[0]));
-#endif // archsel_hip
   auto x98 = ::risc0::Fp::fromRaw(efl_arg4_36_0);
   const uint32_t efl_arg4_129_0 = EF_LDCR(arg4, 129u, 0u);
   const uint32_t efl_rkBD_131_0 = EF_LDCR(rkBD, 131u, 0u);
@@ -34787,11 +34449,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_rkBD_132_0 = EF_LDCR(rkBD, 132u, 0u);
   const uint32_t efl_rkBD_133_0 = EF_LDCR(rkBD, 133u, 0u);
   auto x2001256 = rkw_fin(_wx2001256);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x585 = rk_link_k(x575, x2001256, 7u);
-#else // archsel_hip
   RkAcc x585 = rk_link_kl(x575, x2001256, 7u, EF_DEP(x513.lo[0]));
-#endif // archsel_hip
   auto x99 = ::risc0::Fp::fromRaw(efl_arg4_129_0);
   auto x586 = x99 * x275;
   FpExt r37_x325 = EF_PM(605);
@@ -34842,11 +34500,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_arg4_140_0 = EF_LDCR(arg4, 140u, 0u);
   rkw_ef(_wx2001264, x105, x601, true);
   auto x2001264 = rkw_fin(_wx2001264);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x614 = rk_link_nf_k(x585, x2001264, 8u);
-#else // archsel_hip
   RkAcc x614 = rk_link_nf_kl(x585, x2001264, 8u, EF_DEP(x531.lo[0]));
-#endif // archsel_hip
   auto x106 = ::risc0::Fp::fromRaw(efl_arg4_141_0);
   auto x615 = x106 * x231;
   auto x616 = x615 + x196;
@@ -34866,11 +34520,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_rkBA_59_0 = EF_LDCR(rkBA, 59u, 0u);
   rkw_ef(_wx625, x108, x616, true);
   auto x625 = rkw_fin(_wx625);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x626 = rk_link_k(x614, x625, 9u);
-#else // archsel_hip
   RkAcc x626 = rk_link_kl(x614, x625, 9u, EF_DEP(x554.lo[0]));
-#endif // archsel_hip
   constexpr FpExt r41_x0(0,1,0,0);
   auto r41_x169 = ::risc0::Fp::fromRaw(efl_rkBA_62_0);
   auto r41_x821 = r41_x169 * r41_x0;
@@ -34887,14 +34537,10 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   auto x627 = static_cast<const ::risc0::FpExt>(::risc0::FpExt(r41_x826));
   auto x628 = x250 - x627;
   const uint32_t efl_arg4_191_0 = EF_LDCR(arg4, 191u, 0u);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x629 = rk_fin(rk_link_k(x626, x628, 10u));
-#else // archsel_hip
   FpExt x629 = rk_fin(rk_link_kl(x626, x628, 10u, EF_DEP(x575.lo[0])));
-#endif // archsel_hip
   auto x110 = ::risc0::Fp::fromRaw(efl_arg4_7_0);
   RkW _cx630 = _cx463;
-  rk_cl_acc(_cx630, x110 * x629, 451u);
+  rk_cl_accl(_cx630, x110 * x629, 451u, EF_DEP(_cx463.lo[0]));
   FpExt x630 = rkw_fin(_cx630);
   auto x111 = ::risc0::Fp::fromRaw(efl_arg4_189_0);
   auto x631 = x111 * x211;
@@ -34921,11 +34567,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001272 = rkw_ee(x2001269, x645);
   rkw_ef(_wx2001272, x68, x635, true);
   auto x2001272 = rkw_fin(_wx2001272);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x654 = rk_link_nf_k(arg3, x2001272, 0u);
-#else // archsel_hip
   RkAcc x654 = rk_link_nf_kl(arg3, x2001272, 0u, EF_DEP(x585.lo[0]));
-#endif // archsel_hip
   RkW _wx661 = rkw_ef0(x73, x198, false);
   rkw_v(_wx661, x638, false);
   rkw_ef(_wx661, x98, x202, false);
@@ -34967,11 +34609,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001280 = rkw_ee(x2001277, x679);
   rkw_ef(_wx2001280, x119, x670, true);
   auto x2001280 = rkw_fin(_wx2001280);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x688 = rk_link_k(x654, x2001280, 1u);
-#else // archsel_hip
   RkAcc x688 = rk_link_kl(x654, x2001280, 1u, EF_DEP(x614.lo[0]));
-#endif // archsel_hip
   auto x120 = ::risc0::Fp::fromRaw(efl_arg4_48_0);
   auto x689 = x120 * x275;
   const uint32_t efl_arg4_53_0 = EF_LDCR(arg4, 53u, 0u);
@@ -35024,11 +34662,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001288 = rkw_ee(x2001285, x714);
   rkw_ef(_wx2001288, x131, x704, true);
   auto x2001288 = rkw_fin(_wx2001288);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x723 = rk_link_nf_k(x688, x2001288, 2u);
-#else // archsel_hip
   RkAcc x723 = rk_link_nf_kl(x688, x2001288, 2u, EF_DEP(x626.lo[0]));
-#endif // archsel_hip
   auto x724 = x34 * x198;
   // remat_lu: store dropped
   auto x725 = x707 + x724;
@@ -35066,11 +34700,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001296 = rkw_ee(x2001293, x748);
   rkw_ef(_wx2001296, x35, x739, true);
   auto x2001296 = rkw_fin(_wx2001296);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x757 = rk_link_k(x723, x2001296, 3u);
-#else // archsel_hip
   RkAcc x757 = rk_link_kl(x723, x2001296, 3u, EF_DEP(x629.elems[0].asRaw()));
-#endif // archsel_hip
   RkW _wx764 = rkw_ef0(x44, x198, false);
   rkw_v(_wx764, x306, false);
   rkw_ef(_wx764, x41, x202, false);
@@ -35105,11 +34735,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001304 = rkw_ee(x2001301, x782);
   rkw_ef(_wx2001304, x3000039, x772, true);
   auto x2001304 = rkw_fin(_wx2001304);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x791 = rk_link_nf_k(x757, x2001304, 4u);
-#else // archsel_hip
   RkAcc x791 = rk_link_nf_kl(x757, x2001304, 4u, EF_DEP(x654.lo[0]));
-#endif // archsel_hip
   auto x792 = x89 * x198;
   // remat_lu: store dropped
   auto x793 = x775 + x792;
@@ -35173,11 +34799,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   rkw_ef(_wx2001312, x133, x807, true);
   const uint32_t efl_rkBD_104_0 = EF_LDCR(rkBD, 104u, 0u);
   auto x2001312 = rkw_fin(_wx2001312);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x825 = rk_link_k(x791, x2001312, 5u);
-#else // archsel_hip
   RkAcc x825 = rk_link_kl(x791, x2001312, 5u, EF_DEP(x688.lo[0]));
-#endif // archsel_hip
   FpExt r48_x343 = EF_PM(608);
   FpExt r48_x349 = EF_PM(609);
   auto r48_x90 = ::risc0::Fp::fromRaw(efl_rkBD_102_0);
@@ -35203,11 +34825,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_arg4_109_0 = EF_LDCR(arg4, 109u, 0u);
   rkw_ef(_wx2001320, x62, x828, true);
   auto x2001320 = rkw_fin(_wx2001320);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x841 = rk_link_nf_k(x825, x2001320, 6u);
-#else // archsel_hip
   RkAcc x841 = rk_link_nf_kl(x825, x2001320, 6u, EF_DEP(x723.lo[0]));
-#endif // archsel_hip
   auto x842 = x92 * x211;
   auto x843 = x842 + x196;
   auto x65 = ::risc0::Fp::fromRaw(efl_arg4_110_0);
@@ -35237,11 +34855,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   rkw_ef(_wx2001328, x3000042, x846, true);
   rkw_ee_acc(_wx2001328, x2001323, x850, true);
   auto x2001328 = rkw_fin(_wx2001328);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x859 = rk_link_k(x841, x2001328, 7u);
-#else // archsel_hip
   RkAcc x859 = rk_link_kl(x841, x2001328, 7u, EF_DEP(x757.lo[0]));
-#endif // archsel_hip
   auto x135 = ::risc0::Fp::fromRaw(efl_arg4_114_0);
   const uint32_t efl_arg4_113_0 = EF_LDCR(arg4, 113u, 0u);
   auto x860 = x135 * x211;
@@ -35268,11 +34882,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001334 = rkw_ee(x2001331, x868);
   rkw_ef(_wx2001334, x79, x864, true);
   auto x2001334 = rkw_fin(_wx2001334);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x877 = rk_link_nf_k(x859, x2001334, 8u);
-#else // archsel_hip
   RkAcc x877 = rk_link_nf_kl(x859, x2001334, 8u, EF_DEP(x791.lo[0]));
-#endif // archsel_hip
   auto x138 = ::risc0::Fp::fromRaw(efl_arg4_120_0);
   auto x878 = x138 * x231;
   auto x879 = x878 + x196;
@@ -35289,11 +34899,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001342 = rkw_ee(x2001339, x886);
   rkw_ef(_wx2001342, x76, x882, true);
   auto x2001342 = rkw_fin(_wx2001342);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x895 = rk_link_k(x877, x2001342, 9u);
-#else // archsel_hip
   RkAcc x895 = rk_link_kl(x877, x2001342, 9u, EF_DEP(x825.lo[0]));
-#endif // archsel_hip
   auto x896 = x97 * x231;
   auto x897 = x896 + x196;
   auto x898 = x897 * x450;
@@ -35311,11 +34917,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   rkw_ef(_wx2001350, x3000043, x898, true);
   auto x2001350 = rkw_fin(_wx2001350);
   const uint32_t efl_arg4_133_0 = EF_LDCR(arg4, 133u, 0u);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x912 = rk_link_nf_k(x895, x2001350, 10u);
-#else // archsel_hip
   RkAcc x912 = rk_link_nf_kl(x895, x2001350, 10u, EF_DEP(x841.lo[0]));
-#endif // archsel_hip
   auto x139 = ::risc0::Fp::fromRaw(efl_arg4_132_0);
   auto x913 = x139 * x231;
   auto x914 = x913 + x196;
@@ -35334,11 +34936,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_arg4_142_0 = EF_LDCR(arg4, 142u, 0u);
   rkw_ef(_wx2001358, x100, x917, true);
   auto x2001358 = rkw_fin(_wx2001358);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x931 = rk_link_k(x912, x2001358, 11u);
-#else // archsel_hip
   RkAcc x931 = rk_link_kl(x912, x2001358, 11u, EF_DEP(x859.lo[0]));
-#endif // archsel_hip
   auto x932 = x105 * x231;
   auto x933 = x932 + x196;
   // remat_lu: store dropped
@@ -35359,11 +34957,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001366 = rkw_ee(x2001363, x940);
   rkw_ef(_wx2001366, x106, x936, true);
   auto x2001366 = rkw_fin(_wx2001366);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x950 = rk_link_nf_k(x931, x2001366, 12u);
-#else // archsel_hip
   RkAcc x950 = rk_link_nf_kl(x931, x2001366, 12u, EF_DEP(x877.lo[0]));
-#endif // archsel_hip
   auto x142 = ::risc0::Fp::fromRaw(efl_arg4_146_0);
   auto x951 = x142 * x231;
   auto x952 = x951 + x196;
@@ -35385,11 +34979,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001374 = rkw_ee(x2001371, x957);
   rkw_ef(_wx2001374, x145, x953, true);
   auto x2001374 = rkw_fin(_wx2001374);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x967 = rk_link_k(x950, x2001374, 13u);
-#else // archsel_hip
   RkAcc x967 = rk_link_kl(x950, x2001374, 13u, EF_DEP(x895.lo[0]));
-#endif // archsel_hip
   auto x146 = ::risc0::Fp::fromRaw(efl_arg4_150_0);
   const uint32_t efl_arg4_149_0 = EF_LDCR(arg4, 149u, 0u);
   const uint32_t efl_arg4_154_0 = EF_LDCR(arg4, 154u, 0u);
@@ -35424,11 +35014,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_arg4_155_0 = EF_LDCR(arg4, 155u, 0u);
   rkw_ef(_wx2001380, x151, x972, true);
   auto x2001380 = rkw_fin(_wx2001380);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x985 = rk_link_nf_k(x967, x2001380, 14u);
-#else // archsel_hip
   RkAcc x985 = rk_link_nf_kl(x967, x2001380, 14u, EF_DEP(x912.lo[0]));
-#endif // archsel_hip
   auto x152 = ::risc0::Fp::fromRaw(efl_arg4_156_0);
   auto x986 = x152 * x389;
   auto x987 = x986 + x196;
@@ -35457,11 +35043,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_arg4_166_0 = EF_LDCR(arg4, 166u, 0u);
   const uint32_t efl_arg5_90_0 = EF_LDCR(arg5, 90u, 0u);
   const uint32_t efl_arg5_89_0 = EF_LDCR(arg5, 89u, 0u);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x1003 = rk_link_k(x985, x2001388, 15u);
-#else // archsel_hip
   RkAcc x1003 = rk_link_kl(x985, x2001388, 15u, EF_DEP(x931.lo[0]));
-#endif // archsel_hip
   auto x158 = ::risc0::Fp::fromRaw(efl_arg4_162_0);
   auto x1004 = x158 * x389;
   auto x1005 = x1004 + x196;
@@ -35505,11 +35087,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_arg5_93_0 = EF_LDCR(arg5, 93u, 0u);
   rkw_ef(_wx2001396, x163, x1008, true);
   auto x2001396 = rkw_fin(_wx2001396);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x1028 = rk_link_nf_k(x1003, x2001396, 16u);
-#else // archsel_hip
   RkAcc x1028 = rk_link_nf_kl(x1003, x2001396, 16u, EF_DEP(x950.lo[0]));
-#endif // archsel_hip
   auto x168 = ::risc0::Fp::fromRaw(efl_arg4_168_0);
   auto x1029 = x168 * x389;
   auto x1030 = x1029 + x196;
@@ -35552,11 +35130,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001404 = rkw_ee(x2001401, x1037);
   rkw_ef(_wx2001404, x173, x1033, true);
   auto x2001404 = rkw_fin(_wx2001404);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x1053 = rk_link_k(x1028, x2001404, 17u);
-#else // archsel_hip
   RkAcc x1053 = rk_link_kl(x1028, x2001404, 17u, EF_DEP(x967.lo[0]));
-#endif // archsel_hip
   auto x178 = ::risc0::Fp::fromRaw(efl_arg4_174_0);
   auto x1054 = x178 * x389;
   const uint32_t efl_arg5_98_0 = EF_LDCR(arg5, 98u, 0u);
@@ -35599,11 +35173,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001412 = rkw_ee(x2001409, x1062);
   rkw_ef(_wx2001412, x183, x1058, true);
   auto x2001412 = rkw_fin(_wx2001412);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x1078 = rk_link_nf_k(x1053, x2001412, 18u);
-#else // archsel_hip
   RkAcc x1078 = rk_link_nf_kl(x1053, x2001412, 18u, EF_DEP(x985.lo[0]));
-#endif // archsel_hip
   auto x188 = ::risc0::Fp::fromRaw(efl_arg4_180_0);
   auto x1079 = x188 * x389;
   auto x1080 = x1079 + x196;
@@ -35611,14 +35181,10 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   auto x1082 = x1081 * x1080;
   auto x189 = ::risc0::Fp::fromRaw(efl_arg4_179_0);
   auto x1083 = x1082 - x189;
-#if defined(__GFX12__) // archsel_hip
-  FpExt x1084 = rk_fin(rk_link_k(x1078, x1083, 19u));
-#else // archsel_hip
   FpExt x1084 = rk_fin(rk_link_kl(x1078, x1083, 19u, EF_DEP(x1003.lo[0])));
-#endif // archsel_hip
   auto x190 = ::risc0::Fp::fromRaw(efl_arg4_8_0);
   RkW _cx1085 = _cx630;
-  rk_cl_acc(_cx1085, x190 * x1084, 452u);
+  rk_cl_accl(_cx1085, x190 * x1084, 452u, EF_DEP(_cx630.lo[0]));
   FpExt x1085 = rkw_fin(_cx1085);
   auto x1086 = x91 * x211;
   auto x1087 = x1086 + x196;
@@ -35638,11 +35204,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001420 = rkw_ee(x2001417, x1094);
   rkw_ef(_wx2001420, x191, x1090, true);
   auto x2001420 = rkw_fin(_wx2001420);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x1103 = rk_link_nf_k(arg3, x2001420, 0u);
-#else // archsel_hip
   RkAcc x1103 = rk_link_nf_kl(arg3, x2001420, 0u, EF_DEP(x1028.lo[0]));
-#endif // archsel_hip
   auto x1104 = x60 * x231;
   auto x1105 = x1104 + x196;
   // remat_lu: store dropped
@@ -35655,11 +35217,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001428 = rkw_ee(x2001425, x661);
   rkw_ef(_wx2001428, x70, x1106, true);
   auto x2001428 = rkw_fin(_wx2001428);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x1117 = rk_link_k(x1103, x2001428, 1u);
-#else // archsel_hip
   RkAcc x1117 = rk_link_kl(x1103, x2001428, 1u, EF_DEP(x1053.lo[0]));
-#endif // archsel_hip
   auto x1118 = x669 * x679;
   RkW _wx2001433 = rkw_ee(x328, x1118);
   rkw_ef(_wx2001433, x22, x679, true);
@@ -35668,11 +35226,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_1(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001436 = rkw_ee(x2001433, x696);
   rkw_ef(_wx2001436, x128, x1118, true);
   auto x2001436 = rkw_fin(_wx2001436);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x1129 = rk_fin(rk_link_k(x1117, x2001436, 2u));
-#else // archsel_hip
   FpExt x1129 = rk_fin(rk_link_kl(x1117, x2001436, 2u, EF_DEP(x1078.lo[0])));
-#endif // archsel_hip
   auto x1130 = x703 * x714;
   auto x1131 = x703 * x131;
   auto x132 = ::risc0::Fp::fromRaw(efl_arg4_61_0);
@@ -36101,11 +35655,11 @@ __device__ EF_CHAIN FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* arg0,
   auto x28 = ::risc0::Fp::fromRaw(efl_arg15_182_0);
   RkW _cx263 = rk_cl0(x262, x28 * arg2, 86u); FpExt x263 = rkw_fin(_cx263);
   auto x29 = ::risc0::Fp::fromRaw(efl_arg15_183_0);
-  RkW _cx264 = _cx263; rk_cl_acc(_cx264, x29 * arg3, 92u); FpExt x264 = rkw_fin(_cx264);
+  RkW _cx264 = _cx263; rk_cl_accl(_cx264, x29 * arg3, 92u, EF_DEP(_cx263.lo[0])); FpExt x264 = rkw_fin(_cx264);
   const uint32_t efl_arg15_152_0 = EF_LDCR(arg15, 152u, 0u);
   const uint32_t efl_arg15_153_0 = EF_LDCR(arg15, 153u, 0u);
   auto x265 = RK_LD1M(arg0, 18u);
-  RkW _cx266 = _cx264; rk_cl_acc(_cx266, x265 * arg4, 101u); FpExt x266 = rkw_fin(_cx266);
+  RkW _cx266 = _cx264; rk_cl_accl(_cx266, x265 * arg4, 101u, EF_DEP(_cx264.lo[0])); FpExt x266 = rkw_fin(_cx266);
   auto x30 = ::risc0::Fp::fromRaw(efl_arg15_24_0);
   RkW _cx267 = rk_cl0(arg5, x30 * x266, 310u); FpExt x267 = rkw_fin(_cx267);
   auto x268 = ((::risc0::Fp::fromRaw(efl_arg15_101_0) * Fp(4u)) + ::risc0::Fp::fromRaw(efl_arg15_102_0));
@@ -36749,7 +36303,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* arg0,
   EF_W((ef_wst(efw, 6u, x41);), RkAcc x539 = rk_link_nf_kl(x538, x41, 6u, EF_DEP(x535.lo[0]));)
   EF_W((ef_wst(efw, 7u, x40); ef_wblk(efw, efd_211, 0u, efq_211_0); ef_wblk(efw, efd_211, 4u, efq_211_4); FpExt x540 = ef_wfin(efw, efd_211, 0u, arg7);), FpExt x540 = rk_fin(rk_link_kl(x539, x40, 7u, EF_DEP(x536.lo[0])));)
 #endif // archsel_hip
-  RkW _cx541 = _cx530; rk_cl_acc(_cx541, x75 * x540, 79u); FpExt x541 = rkw_fin(_cx541);
+  RkW _cx541 = _cx530; rk_cl_accl(_cx541, x75 * x540, 79u, EF_DEP(_cx530.lo[0])); FpExt x541 = rkw_fin(_cx541);
   const uint32_t efl_arg15_25_0 = EF_LDCR(arg15, 25u, 0u);
   auto x542 = x61 - x62;
   auto x543 = (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg15_176_0));
@@ -36761,7 +36315,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* arg0,
   RkAcc x545 = rk_link_nf_kl(arg7, x542, 0u, EF_DEP(x537.lo[0]));
   FpExt x546 = rk_fin(rk_link_kl(x545, x544, 1u, EF_DEP(x538.lo[0])));
 #endif // archsel_hip
-  RkW _cx547 = _cx541; rk_cl_acc(_cx547, x519 * x546, 87u); FpExt x547 = rkw_fin(_cx547);
+  RkW _cx547 = _cx541; rk_cl_accl(_cx547, x519 * x546, 87u, EF_DEP(_cx541.lo[0])); FpExt x547 = rkw_fin(_cx547);
   auto x77 = ::risc0::Fp::fromRaw(efl_arg15_57_0);
 #if defined(__GFX12__) // archsel_hip
   RkAcc x548 = rk_link_nf_k(x547, x77, 89u);
@@ -36775,7 +36329,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* arg0,
   FpExt x549 = rk_fin(rk_link_kl(x548, x78, 90u, EF_DEP(x540.elems[0].asRaw())));
 #endif // archsel_hip
   auto x79 = ::risc0::Fp::fromRaw(efl_arg15_25_0);
-  RkW _cx550 = _cx267; rk_cl_acc(_cx550, x79 * x549, 350u); FpExt x550 = rkw_fin(_cx550);
+  RkW _cx550 = _cx267; rk_cl_accl(_cx550, x79 * x549, 350u, EF_DEP(_cx267.lo[0])); FpExt x550 = rkw_fin(_cx550);
   auto x585 = x386 + x18;
   auto x586 = x585 + x394;
   auto x587 = x586 + x396;
@@ -36800,8 +36354,8 @@ __device__ EF_CHAIN FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* arg0,
   EF_W((ef_wst(efw, 3u, x531);), RkAcc x643 = rk_link_k(x642, x531, 6u);)
   EF_W((const int efq_214_4 = ef_wq4(efw, 7u, 8u, 7u, 7u, 2u); ef_wst(efw, 4u, x41);), RkAcc x644 = rk_link_nf_k(x643, x41, 7u);)
   EF_W((ef_wst(efw, 5u, x40); ef_wblk(efw, efd_214, 0u, efq_214_0); ef_wblk(efw, efd_214, 4u, efq_214_4); FpExt x645 = ef_wfin(efw, efd_214, 0u, arg9);), FpExt x645 = rk_fin(rk_link_k(x644, x40, 8u));)
-  RkAcc x647 = rk_link_nf_k(arg7, x61, 0u);
-  FpExt x648 = rk_fin(rk_link_k(x647, x544, 1u));
+  RkAcc x647 = rk_link_nf_kl(arg7, x61, 0u, EF_DEP(x545.lo[0]));
+  FpExt x648 = rk_fin(rk_link_kl(x647, x544, 1u, EF_DEP(x546.elems[0].asRaw())));
 #else // archsel_hip
   EF_W((ef_v4i efd_214[4] = {}; const int efq_214_0 = ef_wq(efw, 3u); ef_wst(efw, 0u, x274);), RkAcc x640 = rk_link_nf_kl(arg9, x274, 3u, EF_DEP(x545.lo[0]));)
   EF_W((ef_wst(efw, 1u, x275);), RkAcc x641 = rk_link_kl(x640, x275, 4u, EF_DEP(x546.elems[0].asRaw()));)
@@ -36858,50 +36412,46 @@ __device__ EF_CHAIN FpExt rv32im_v2_16(uint32_t cycle, uint32_t steps, Fp* arg0,
 #endif // archsel_hip
   RkW _cx2000769 = rk_cl0(x2000767, x75 * x645, 79u); FpExt x2000769 = rkw_fin(_cx2000769);
   auto x2000771 = -x75;
-  RkW _cx2000770 = _cx2000769; rk_cl_acc(_cx2000770, x2000771 * x540, 79u); FpExt x2000770 = rkw_fin(_cx2000770);
+  RkW _cx2000770 = _cx2000769; rk_cl_accl(_cx2000770, x2000771 * x540, 79u, EF_DEP(_cx2000769.lo[0])); FpExt x2000770 = rkw_fin(_cx2000770);
   const uint32_t efl_arg15_26_0 = EF_LDCR(arg15, 26u, 0u);
   const uint32_t efl_arg15_27_0 = EF_LDCR(arg15, 27u, 0u);
   auto x2000773 = -x519;
-  RkW _cx2000772 = _cx2000770; rk_cl_acc(_cx2000772, x2000773 * x546, 87u); FpExt x2000772 = rkw_fin(_cx2000772);
-  RkW _cx2000774 = _cx2000772; rk_cl_acc(_cx2000774, x519 * x648, 88u); FpExt x2000774 = rkw_fin(_cx2000774);
+  RkW _cx2000772 = _cx2000770; rk_cl_accl(_cx2000772, x2000773 * x546, 87u, EF_DEP(_cx2000770.lo[0])); FpExt x2000772 = rkw_fin(_cx2000772);
+  RkW _cx2000774 = _cx2000772; rk_cl_accl(_cx2000774, x519 * x648, 88u, EF_DEP(_cx2000772.lo[0])); FpExt x2000774 = rkw_fin(_cx2000774);
   auto x2000776 = -x77;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x2000775 = rk_link_nf_k(x2000774, x2000776, 89u);
+  RkAcc x2000775 = rk_link_nf_kl(x2000774, x2000776, 89u, EF_DEP(x548.lo[0]));
 #else // archsel_hip
   RkAcc x2000775 = rk_link_nf_kl(x2000774, x2000776, 89u, EF_DEP(x2000761.lo[0]));
 #endif // archsel_hip
   auto x2000778 = x77 - x78;
 #if defined(__GFX12__) // archsel_hip
-  RkAcc x2000777 = rk_link_k(x2000775, x2000778, 90u);
-  FpExt x651 = rk_fin(rk_link_k(x2000777, x78, 91u));
+  RkAcc x2000777 = rk_link_kl(x2000775, x2000778, 90u, EF_DEP(x549.elems[0].asRaw()));
+  FpExt x651 = rk_fin(rk_link_kl(x2000777, x78, 91u, EF_DEP(x647.lo[0])));
 #else // archsel_hip
   RkAcc x2000777 = rk_link_kl(x2000775, x2000778, 90u, EF_DEP(x2000763.lo[0]));
   FpExt x651 = rk_fin(rk_link_kl(x2000777, x78, 91u, EF_DEP(x2000765.lo[0])));
 #endif // archsel_hip
   const uint32_t efl_arg15_28_0 = EF_LDCR(arg15, 28u, 0u);
   auto x80 = ::risc0::Fp::fromRaw(efl_arg15_26_0);
-  RkW _cx652 = _cx550; rk_cl_acc(_cx652, x80 * x651, 353u); FpExt x652 = rkw_fin(_cx652);
+  RkW _cx652 = _cx550; rk_cl_accl(_cx652, x80 * x651, 353u, EF_DEP(_cx550.lo[0])); FpExt x652 = rkw_fin(_cx652);
   constexpr Fp x15(6);
   auto x653 = x268 - x15;
   auto x2000779 = x653 - x269;
 #if defined(__GFX12__) // archsel_hip
-  FpExt x730 = rk_fin(rk_link_k(x549, x2000779, 1u));
+  FpExt x730 = rk_fin(rk_link_kl(x549, x2000779, 1u, EF_DEP(x648.elems[0].asRaw())));
 #else // archsel_hip
   FpExt x730 = rk_fin(rk_link_kl(x549, x2000779, 1u, EF_DEP(x2000767.elems[0].asRaw())));
 #endif // archsel_hip
   auto x81 = ::risc0::Fp::fromRaw(efl_arg15_27_0);
-  RkW _cx731 = _cx652; rk_cl_acc(_cx731, x81 * x730, 359u); FpExt x731 = rkw_fin(_cx731);
+  RkW _cx731 = _cx652; rk_cl_accl(_cx731, x81 * x730, 359u, EF_DEP(_cx652.lo[0])); FpExt x731 = rkw_fin(_cx731);
   constexpr Fp x14(7);
   auto x732 = x268 - x14;
   auto x2000780 = x651 - arg8;
   auto x2000781 = x2000780 + arg6;
-#if defined(__GFX12__) // archsel_hip
-  FpExt x809 = rk_fin(rk_link_k(x2000781, x732, 1u));
-#else // archsel_hip
   FpExt x809 = rk_fin(rk_link_kl(x2000781, x732, 1u, EF_DEP(x2000775.lo[0])));
-#endif // archsel_hip
   auto x82 = ::risc0::Fp::fromRaw(efl_arg15_28_0);
-  RkW _cx810 = _cx731; rk_cl_acc(_cx810, x82 * x809, 387u); FpExt x810 = rkw_fin(_cx810);
+  RkW _cx810 = _cx731; rk_cl_accl(_cx810, x82 * x809, 387u, EF_DEP(_cx731.lo[0])); FpExt x810 = rkw_fin(_cx810);
   auto x85 = ::risc0::Fp::fromRaw(efl_arg15_163_0);
   const uint32_t efl_arg15_186_0 = EF_LDCR(arg15, 186u, 0u);
   const uint32_t efl_arg15_103_0 = EF_LDCR(arg15, 103u, 0u);
@@ -38506,11 +38056,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* arg0,
   auto x395 = x102 * x7;
   auto x396 = x104 + x395;
   auto x397 = ef_lsub(x396, x383);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x398 = rk_fin(rk_link_k(x394, x397, 4u));
-#else // archsel_hip
   FpExt x398 = rk_fin(rk_link_kl(x394, x397, 4u, EF_DEP(x385.lo[0])));
-#endif // archsel_hip
   const uint32_t efl_arg9_56_4 = EF_LDCR(arg9, 56u, 4u);
   const uint32_t efl_arg9_57_4 = EF_LDCR(arg9, 57u, 4u);
   const uint32_t efl_arg9_58_4 = EF_LDCR(arg9, 58u, 4u);
@@ -38567,26 +38113,14 @@ __device__ EF_CHAIN FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* arg0,
   auto x429 = x424 + x428;
   auto x430 = x422 + x426;
   auto x431 = (::risc0::Fp::fromRaw(efl_arg9_196_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_196_0)));
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x432 = rk_link_nf_k(arg4, x431, 0u);
-#else // archsel_hip
   RkAcc x432 = rk_link_nf_kl(arg4, x431, 0u, EF_DEP(x387.lo[0]));
-#endif // archsel_hip
   auto x113 = ::risc0::Fp::fromRaw(efl_arg9_197_0);
   auto x433 = ef_lsub(x14, x113);
   const uint32_t efl_arg9_69_0 = EF_LDCR(arg9, 69u, 0u);
   auto x434 = x113 * x433;
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x435 = rk_link_k(x432, x434, 1u);
-#else // archsel_hip
   RkAcc x435 = rk_link_kl(x432, x434, 1u, EF_DEP(x390.lo[0]));
-#endif // archsel_hip
   auto x436 = (::risc0::Fp::fromRaw(efl_arg9_198_0) * (Fp(1u) - ::risc0::Fp::fromRaw(efl_arg9_198_0)));
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x437 = rk_link_nf_k(x435, x436, 2u);
-#else // archsel_hip
   RkAcc x437 = rk_link_nf_kl(x435, x436, 2u, EF_DEP(x394.lo[0]));
-#endif // archsel_hip
   auto x114 = ::risc0::Fp::fromRaw(efl_arg9_196_0);
   auto x438 = x114 + x113;
   auto x115 = ::risc0::Fp::fromRaw(efl_arg9_198_0);
@@ -38598,66 +38132,29 @@ __device__ EF_CHAIN FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* arg0,
   const uint32_t efl_arg9_74_0 = EF_LDCR(arg9, 74u, 0u);
   const uint32_t efl_arg9_70_0 = EF_LDCR(arg9, 70u, 0u);
   auto x440 = x439 - x14;
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x441 = rk_link_k(x437, x440, 3u);
-#else // archsel_hip
   RkAcc x441 = rk_link_kl(x437, x440, 3u, EF_DEP(x398.elems[0].asRaw()));
-#endif // archsel_hip
   auto x442 = x115 * x7;
   auto x443 = x113 + x442;
   auto x444 = ef_lsub(x443, x53);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x445 = rk_fin(rk_link_k(x441, x444, 4u));
-#else // archsel_hip
   FpExt x445 = rk_fin(rk_link_kl(x441, x444, 4u, EF_DEP(x432.lo[0])));
-#endif // archsel_hip
   auto x116 = ::risc0::Fp::fromRaw(efl_arg9_69_0);
   auto x446 = ef_lsub(x116, x56);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x447 = rk_fin(rk_link_k(arg5, x446, 4u));
-#else // archsel_hip
   FpExt x447 = rk_fin(rk_link_kl(arg5, x446, 4u, EF_DEP(x435.lo[0])));
-#endif // archsel_hip
   auto x448 = (::risc0::Fp::fromRaw(efl_arg9_71_0) - ::risc0::Fp::fromRaw(efl_arg9_75_0));
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x449 = rk_link_nf_k(x447, x448, 5u);
-#else // archsel_hip
   RkAcc x449 = rk_link_nf_kl(x447, x448, 5u, EF_DEP(x437.lo[0]));
-#endif // archsel_hip
   auto x450 = (::risc0::Fp::fromRaw(efl_arg9_72_0) - ::risc0::Fp::fromRaw(efl_arg9_76_0));
-#if defined(__GFX12__) // archsel_hip
-  FpExt x451 = rk_fin(rk_link_k(x449, x450, 6u));
-#else // archsel_hip
   FpExt x451 = rk_fin(rk_link_kl(x449, x450, 6u, EF_DEP(x441.lo[0])));
-#endif // archsel_hip
   auto x452 = (::risc0::Fp::fromRaw(efl_arg9_140_0) - Fp(1u));
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x453 = rk_link_nf_k(x451, x452, 7u);
-#else // archsel_hip
   RkAcc x453 = rk_link_nf_kl(x451, x452, 7u, EF_DEP(x445.elems[0].asRaw()));
-#endif // archsel_hip
   auto x454 = (::risc0::Fp::fromRaw(efl_arg9_141_0) - ((::risc0::Fp::fromRaw(efl_arg9_74_0) - Fp(1u)) - ::risc0::Fp::fromRaw(efl_arg9_70_0)));
-#if defined(__GFX12__) // archsel_hip
-  FpExt x455 = rk_fin(rk_link_k(x453, x454, 8u));
-#else // archsel_hip
   FpExt x455 = rk_fin(rk_link_kl(x453, x454, 8u, EF_DEP(x447.elems[0].asRaw())));
-#endif // archsel_hip
   RkW _cx456 = rk_cl0(x445, x114 * x455, 5u); FpExt x456 = rkw_fin(_cx456);
   auto x117 = ::risc0::Fp::fromRaw(efl_arg9_140_0);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x457 = rk_fin(rk_link_k(x451, x117, 7u));
-#else // archsel_hip
   FpExt x457 = rk_fin(rk_link_kl(x451, x117, 7u, EF_DEP(x449.lo[0])));
-#endif // archsel_hip
-  RkW _cx458 = _cx456; rk_cl_acc(_cx458, x113 * x457, 14u); FpExt x458 = rkw_fin(_cx458);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x459 = rk_link_nf_k(x447, x452, 5u);
-  FpExt x460 = rk_fin(rk_link_k(x459, x454, 6u));
-#else // archsel_hip
+  RkW _cx458 = _cx456; rk_cl_accl(_cx458, x113 * x457, 14u, EF_DEP(_cx456.lo[0])); FpExt x458 = rkw_fin(_cx458);
   RkAcc x459 = rk_link_nf_kl(x447, x452, 5u, EF_DEP(x451.elems[0].asRaw()));
   FpExt x460 = rk_fin(rk_link_kl(x459, x454, 6u, EF_DEP(x453.lo[0])));
-#endif // archsel_hip
-  RkW _cx461 = _cx458; rk_cl_acc(_cx461, x115 * x460, 22u); FpExt x461 = rkw_fin(_cx461);
+  RkW _cx461 = _cx458; rk_cl_accl(_cx461, x115 * x460, 22u, EF_DEP(_cx458.lo[0])); FpExt x461 = rkw_fin(_cx461);
   auto x2002576 = ef_ladd(x114, x113);
   auto x118 = ::risc0::Fp::fromRaw(efl_arg9_75_0);
   // lincombF: fused into a lazy Fp linear combination
@@ -38688,70 +38185,29 @@ __device__ EF_CHAIN FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* arg0,
   const uint32_t efl_arg9_80_0 = EF_LDCR(arg9, 80u, 0u);
   const uint32_t efl_arg9_81_0 = EF_LDCR(arg9, 81u, 0u);
   const uint32_t efl_arg9_142_0 = EF_LDCR(arg9, 142u, 0u);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x481 = rk_link_nf_k(arg4, x480, 0u);
-#else // archsel_hip
   RkAcc x481 = rk_link_nf_kl(arg4, x480, 0u, EF_DEP(x455.elems[0].asRaw()));
-#endif // archsel_hip
   auto x482 = (::risc0::Fp::fromRaw(efl_arg9_82_0) - Fp(1u));
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x483 = rk_link_k(x481, x482, 1u);
-#else // archsel_hip
   RkAcc x483 = rk_link_kl(x481, x482, 1u, EF_DEP(x457.elems[0].asRaw()));
-#endif // archsel_hip
   auto x484 = RK_LD1M(arg0, 10u);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x485 = rk_link_nf_k(x483, x484, 2u);
-#else // archsel_hip
   RkAcc x485 = rk_link_nf_kl(x483, x484, 2u, EF_DEP(x459.lo[0]));
-#endif // archsel_hip
   auto x124 = ::risc0::Fp::fromRaw(efl_arg9_78_0);
   auto x487 = x124 - x399;
-#if defined(__GFX12__) // archsel_hip
-  FpExt x488 = rk_fin(rk_link_k(x485, x487, 4u));
-#else // archsel_hip
   FpExt x488 = rk_fin(rk_link_kl(x485, x487, 4u, EF_DEP(x460.elems[0].asRaw())));
-#endif // archsel_hip
   auto x489 = (::risc0::Fp::fromRaw(efl_arg9_80_0) - ::risc0::Fp::fromRaw(efl_arg9_84_0));
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x490 = rk_link_nf_k(x488, x489, 5u);
-#else // archsel_hip
   RkAcc x490 = rk_link_nf_kl(x488, x489, 5u, EF_DEP(x481.lo[0]));
-#endif // archsel_hip
   auto x491 = (::risc0::Fp::fromRaw(efl_arg9_81_0) - ::risc0::Fp::fromRaw(efl_arg9_85_0));
-#if defined(__GFX12__) // archsel_hip
-  FpExt x492 = rk_fin(rk_link_k(x490, x491, 6u));
-#else // archsel_hip
   FpExt x492 = rk_fin(rk_link_kl(x490, x491, 6u, EF_DEP(x483.lo[0])));
-#endif // archsel_hip
   auto x493 = (::risc0::Fp::fromRaw(efl_arg9_142_0) - Fp(1u));
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x494 = rk_link_nf_k(x492, x493, 7u);
-#else // archsel_hip
   RkAcc x494 = rk_link_nf_kl(x492, x493, 7u, EF_DEP(x485.lo[0]));
-#endif // archsel_hip
   auto x495 = RK_LD1M(arg0, 11u);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x496 = rk_fin(rk_link_k(x494, x495, 8u));
-#else // archsel_hip
   FpExt x496 = rk_fin(rk_link_kl(x494, x495, 8u, EF_DEP(x488.elems[0].asRaw())));
-#endif // archsel_hip
-  RkW _cx497 = _cx461; rk_cl_acc(_cx497, x114 * x496, 29u); FpExt x497 = rkw_fin(_cx497);
+  RkW _cx497 = _cx461; rk_cl_accl(_cx497, x114 * x496, 29u, EF_DEP(_cx461.lo[0])); FpExt x497 = rkw_fin(_cx497);
   auto x125 = ::risc0::Fp::fromRaw(efl_arg9_142_0);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x498 = rk_fin(rk_link_k(x492, x125, 7u));
-#else // archsel_hip
   FpExt x498 = rk_fin(rk_link_kl(x492, x125, 7u, EF_DEP(x490.lo[0])));
-#endif // archsel_hip
-  RkW _cx499 = _cx497; rk_cl_acc(_cx499, x113 * x498, 38u); FpExt x499 = rkw_fin(_cx499);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x500 = rk_link_nf_k(x488, x493, 5u);
-  FpExt x501 = rk_fin(rk_link_k(x500, x495, 6u));
-#else // archsel_hip
+  RkW _cx499 = _cx497; rk_cl_accl(_cx499, x113 * x498, 38u, EF_DEP(_cx497.lo[0])); FpExt x499 = rkw_fin(_cx499);
   RkAcc x500 = rk_link_nf_kl(x488, x493, 5u, EF_DEP(x492.elems[0].asRaw()));
   FpExt x501 = rk_fin(rk_link_kl(x500, x495, 6u, EF_DEP(x494.lo[0])));
-#endif // archsel_hip
-  RkW _cx502 = _cx499; rk_cl_acc(_cx502, x115 * x501, 46u); FpExt x502 = rkw_fin(_cx502);
+  RkW _cx502 = _cx499; rk_cl_accl(_cx502, x115 * x501, 46u, EF_DEP(_cx499.lo[0])); FpExt x502 = rkw_fin(_cx502);
   auto x2002584 = ef_ladd(x114, x113);
   const uint32_t efl_arg9_83_0 = EF_LDCR(arg9, 83u, 0u);
   const uint32_t efl_arg9_79_0 = EF_LDCR(arg9, 79u, 0u);
@@ -38782,72 +38238,31 @@ __device__ EF_CHAIN FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* arg0,
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx520 = rkw1_ff0(x515, x113, false); rkw1_v(_wx520, x114, false); rkw1_ff(_wx520, x517, x115, false); auto x520 = rkw1_fin(_wx520);
   auto x521 = (::risc0::Fp::fromRaw(efl_arg9_86_0) - Fp(2013265920u));
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x522 = rk_link_nf_k(arg4, x521, 0u);
-#else // archsel_hip
   RkAcc x522 = rk_link_nf_kl(arg4, x521, 0u, EF_DEP(x496.elems[0].asRaw()));
-#endif // archsel_hip
   const uint32_t efl_arg9_90_0 = EF_LDCR(arg9, 90u, 0u);
   const uint32_t efl_arg9_144_0 = EF_LDCR(arg9, 144u, 0u);
   auto x523 = (::risc0::Fp::fromRaw(efl_arg9_91_0) - Fp(1u));
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x524 = rk_link_k(x522, x523, 1u);
-#else // archsel_hip
   RkAcc x524 = rk_link_kl(x522, x523, 1u, EF_DEP(x498.elems[0].asRaw()));
-#endif // archsel_hip
   auto x525 = RK_LD1M(arg0, 12u);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x526 = rk_link_nf_k(x524, x525, 2u);
-#else // archsel_hip
   RkAcc x526 = rk_link_nf_kl(x524, x525, 2u, EF_DEP(x500.lo[0]));
-#endif // archsel_hip
   auto x132 = ::risc0::Fp::fromRaw(efl_arg9_87_0);
   auto x528 = x132 - x400;
-#if defined(__GFX12__) // archsel_hip
-  FpExt x529 = rk_fin(rk_link_k(x526, x528, 4u));
-#else // archsel_hip
   FpExt x529 = rk_fin(rk_link_kl(x526, x528, 4u, EF_DEP(x501.elems[0].asRaw())));
-#endif // archsel_hip
   auto x530 = (::risc0::Fp::fromRaw(efl_arg9_89_0) - ::risc0::Fp::fromRaw(efl_arg9_93_0));
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x531 = rk_link_nf_k(x529, x530, 5u);
-#else // archsel_hip
   RkAcc x531 = rk_link_nf_kl(x529, x530, 5u, EF_DEP(x522.lo[0]));
-#endif // archsel_hip
   auto x532 = (::risc0::Fp::fromRaw(efl_arg9_90_0) - ::risc0::Fp::fromRaw(efl_arg9_94_0));
-#if defined(__GFX12__) // archsel_hip
-  FpExt x533 = rk_fin(rk_link_k(x531, x532, 6u));
-#else // archsel_hip
   FpExt x533 = rk_fin(rk_link_kl(x531, x532, 6u, EF_DEP(x524.lo[0])));
-#endif // archsel_hip
   auto x534 = (::risc0::Fp::fromRaw(efl_arg9_144_0) - Fp(1u));
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x535 = rk_link_nf_k(x533, x534, 7u);
-#else // archsel_hip
   RkAcc x535 = rk_link_nf_kl(x533, x534, 7u, EF_DEP(x526.lo[0]));
-#endif // archsel_hip
   auto x536 = RK_LD1M(arg0, 13u);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x537 = rk_fin(rk_link_k(x535, x536, 8u));
-#else // archsel_hip
   FpExt x537 = rk_fin(rk_link_kl(x535, x536, 8u, EF_DEP(x529.elems[0].asRaw())));
-#endif // archsel_hip
-  RkW _cx538 = _cx502; rk_cl_acc(_cx538, x114 * x537, 53u); FpExt x538 = rkw_fin(_cx538);
+  RkW _cx538 = _cx502; rk_cl_accl(_cx538, x114 * x537, 53u, EF_DEP(_cx502.lo[0])); FpExt x538 = rkw_fin(_cx538);
   auto x133 = ::risc0::Fp::fromRaw(efl_arg9_144_0);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x539 = rk_fin(rk_link_k(x533, x133, 7u));
-#else // archsel_hip
   FpExt x539 = rk_fin(rk_link_kl(x533, x133, 7u, EF_DEP(x531.lo[0])));
-#endif // archsel_hip
-  RkW _cx540 = _cx538; rk_cl_acc(_cx540, x113 * x539, 62u); FpExt x540 = rkw_fin(_cx540);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x541 = rk_link_nf_k(x529, x534, 5u);
-  FpExt x542 = rk_fin(rk_link_k(x541, x536, 6u));
-#else // archsel_hip
+  RkW _cx540 = _cx538; rk_cl_accl(_cx540, x113 * x539, 62u, EF_DEP(_cx538.lo[0])); FpExt x540 = rkw_fin(_cx540);
   RkAcc x541 = rk_link_nf_kl(x529, x534, 5u, EF_DEP(x533.elems[0].asRaw()));
   FpExt x542 = rk_fin(rk_link_kl(x541, x536, 6u, EF_DEP(x535.lo[0])));
-#endif // archsel_hip
-  RkW _cx543 = _cx540; rk_cl_acc(_cx543, x115 * x542, 70u); FpExt x543 = rkw_fin(_cx543);
+  RkW _cx543 = _cx540; rk_cl_accl(_cx543, x115 * x542, 70u, EF_DEP(_cx540.lo[0])); FpExt x543 = rkw_fin(_cx543);
   auto x2002592 = ef_ladd(x114, x113);
   const uint32_t efl_arg9_92_0 = EF_LDCR(arg9, 92u, 0u);
   const uint32_t efl_arg9_88_0 = EF_LDCR(arg9, 88u, 0u);
@@ -38879,72 +38294,31 @@ __device__ EF_CHAIN FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* arg0,
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx561 = rkw1_ff0(x556, x113, false); rkw1_v(_wx561, x114, false); rkw1_ff(_wx561, x558, x115, false); auto x561 = rkw1_fin(_wx561);
   auto x562 = (::risc0::Fp::fromRaw(efl_arg9_95_0) - Fp(2013265920u));
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x563 = rk_link_nf_k(arg4, x562, 0u);
-#else // archsel_hip
   RkAcc x563 = rk_link_nf_kl(arg4, x562, 0u, EF_DEP(x537.elems[0].asRaw()));
-#endif // archsel_hip
   const uint32_t efl_arg9_99_0 = EF_LDCR(arg9, 99u, 0u);
   const uint32_t efl_arg9_146_0 = EF_LDCR(arg9, 146u, 0u);
   auto x564 = (::risc0::Fp::fromRaw(efl_arg9_100_0) - Fp(1u));
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x565 = rk_link_k(x563, x564, 1u);
-#else // archsel_hip
   RkAcc x565 = rk_link_kl(x563, x564, 1u, EF_DEP(x539.elems[0].asRaw()));
-#endif // archsel_hip
   auto x566 = RK_LD1M(arg0, 14u);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x567 = rk_link_nf_k(x565, x566, 2u);
-#else // archsel_hip
   RkAcc x567 = rk_link_nf_kl(x565, x566, 2u, EF_DEP(x541.lo[0]));
-#endif // archsel_hip
   auto x140 = ::risc0::Fp::fromRaw(efl_arg9_96_0);
   auto x569 = x140 - x401;
-#if defined(__GFX12__) // archsel_hip
-  FpExt x570 = rk_fin(rk_link_k(x567, x569, 4u));
-#else // archsel_hip
   FpExt x570 = rk_fin(rk_link_kl(x567, x569, 4u, EF_DEP(x542.elems[0].asRaw())));
-#endif // archsel_hip
   auto x571 = (::risc0::Fp::fromRaw(efl_arg9_98_0) - ::risc0::Fp::fromRaw(efl_arg9_102_0));
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x572 = rk_link_nf_k(x570, x571, 5u);
-#else // archsel_hip
   RkAcc x572 = rk_link_nf_kl(x570, x571, 5u, EF_DEP(x563.lo[0]));
-#endif // archsel_hip
   auto x573 = (::risc0::Fp::fromRaw(efl_arg9_99_0) - ::risc0::Fp::fromRaw(efl_arg9_103_0));
-#if defined(__GFX12__) // archsel_hip
-  FpExt x574 = rk_fin(rk_link_k(x572, x573, 6u));
-#else // archsel_hip
   FpExt x574 = rk_fin(rk_link_kl(x572, x573, 6u, EF_DEP(x565.lo[0])));
-#endif // archsel_hip
   auto x575 = (::risc0::Fp::fromRaw(efl_arg9_146_0) - Fp(1u));
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x576 = rk_link_nf_k(x574, x575, 7u);
-#else // archsel_hip
   RkAcc x576 = rk_link_nf_kl(x574, x575, 7u, EF_DEP(x567.lo[0]));
-#endif // archsel_hip
   auto x577 = RK_LD1M(arg0, 15u);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x578 = rk_fin(rk_link_k(x576, x577, 8u));
-#else // archsel_hip
   FpExt x578 = rk_fin(rk_link_kl(x576, x577, 8u, EF_DEP(x570.elems[0].asRaw())));
-#endif // archsel_hip
-  RkW _cx579 = _cx543; rk_cl_acc(_cx579, x114 * x578, 77u); FpExt x579 = rkw_fin(_cx579);
+  RkW _cx579 = _cx543; rk_cl_accl(_cx579, x114 * x578, 77u, EF_DEP(_cx543.lo[0])); FpExt x579 = rkw_fin(_cx579);
   auto x141 = ::risc0::Fp::fromRaw(efl_arg9_146_0);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x580 = rk_fin(rk_link_k(x574, x141, 7u));
-#else // archsel_hip
   FpExt x580 = rk_fin(rk_link_kl(x574, x141, 7u, EF_DEP(x572.lo[0])));
-#endif // archsel_hip
-  RkW _cx581 = _cx579; rk_cl_acc(_cx581, x113 * x580, 86u); FpExt x581 = rkw_fin(_cx581);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x582 = rk_link_nf_k(x570, x575, 5u);
-  FpExt x583 = rk_fin(rk_link_k(x582, x577, 6u));
-#else // archsel_hip
+  RkW _cx581 = _cx579; rk_cl_accl(_cx581, x113 * x580, 86u, EF_DEP(_cx579.lo[0])); FpExt x581 = rkw_fin(_cx581);
   RkAcc x582 = rk_link_nf_kl(x570, x575, 5u, EF_DEP(x574.elems[0].asRaw()));
   FpExt x583 = rk_fin(rk_link_kl(x582, x577, 6u, EF_DEP(x576.lo[0])));
-#endif // archsel_hip
-  RkW _cx584 = _cx581; rk_cl_acc(_cx584, x115 * x583, 94u); FpExt x584 = rkw_fin(_cx584);
+  RkW _cx584 = _cx581; rk_cl_accl(_cx584, x115 * x583, 94u, EF_DEP(_cx581.lo[0])); FpExt x584 = rkw_fin(_cx584);
   auto x2002600 = ef_ladd(x114, x113);
   const uint32_t efl_arg9_101_0 = EF_LDCR(arg9, 101u, 0u);
   const uint32_t efl_arg9_97_0 = EF_LDCR(arg9, 97u, 0u);
@@ -38975,72 +38349,31 @@ __device__ EF_CHAIN FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* arg0,
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx602 = rkw1_ff0(x597, x113, false); rkw1_v(_wx602, x114, false); rkw1_ff(_wx602, x599, x115, false); auto x602 = rkw1_fin(_wx602);
   auto x603 = (::risc0::Fp::fromRaw(efl_arg9_104_0) - Fp(2013265920u));
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x604 = rk_link_nf_k(arg4, x603, 0u);
-#else // archsel_hip
   RkAcc x604 = rk_link_nf_kl(arg4, x603, 0u, EF_DEP(x578.elems[0].asRaw()));
-#endif // archsel_hip
   auto x605 = (::risc0::Fp::fromRaw(efl_arg9_109_0) - Fp(1u));
   const uint32_t efl_arg9_108_0 = EF_LDCR(arg9, 108u, 0u);
   const uint32_t efl_arg9_148_0 = EF_LDCR(arg9, 148u, 0u);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x606 = rk_link_k(x604, x605, 1u);
-#else // archsel_hip
   RkAcc x606 = rk_link_kl(x604, x605, 1u, EF_DEP(x580.elems[0].asRaw()));
-#endif // archsel_hip
   auto x607 = RK_LD1M(arg0, 16u);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x608 = rk_link_nf_k(x606, x607, 2u);
-#else // archsel_hip
   RkAcc x608 = rk_link_nf_kl(x606, x607, 2u, EF_DEP(x582.lo[0]));
-#endif // archsel_hip
   auto x148 = ::risc0::Fp::fromRaw(efl_arg9_105_0);
   auto x610 = x148 - x402;
-#if defined(__GFX12__) // archsel_hip
-  FpExt x611 = rk_fin(rk_link_k(x608, x610, 4u));
-#else // archsel_hip
   FpExt x611 = rk_fin(rk_link_kl(x608, x610, 4u, EF_DEP(x583.elems[0].asRaw())));
-#endif // archsel_hip
   auto x612 = (::risc0::Fp::fromRaw(efl_arg9_107_0) - ::risc0::Fp::fromRaw(efl_arg9_111_0));
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x613 = rk_link_nf_k(x611, x612, 5u);
-#else // archsel_hip
   RkAcc x613 = rk_link_nf_kl(x611, x612, 5u, EF_DEP(x604.lo[0]));
-#endif // archsel_hip
   auto x614 = (::risc0::Fp::fromRaw(efl_arg9_108_0) - ::risc0::Fp::fromRaw(efl_arg9_112_0));
-#if defined(__GFX12__) // archsel_hip
-  FpExt x615 = rk_fin(rk_link_k(x613, x614, 6u));
-#else // archsel_hip
   FpExt x615 = rk_fin(rk_link_kl(x613, x614, 6u, EF_DEP(x606.lo[0])));
-#endif // archsel_hip
   auto x616 = (::risc0::Fp::fromRaw(efl_arg9_148_0) - Fp(1u));
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x617 = rk_link_nf_k(x615, x616, 7u);
-#else // archsel_hip
   RkAcc x617 = rk_link_nf_kl(x615, x616, 7u, EF_DEP(x608.lo[0]));
-#endif // archsel_hip
   auto x618 = RK_LD1M(arg0, 17u);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x619 = rk_fin(rk_link_k(x617, x618, 8u));
-#else // archsel_hip
   FpExt x619 = rk_fin(rk_link_kl(x617, x618, 8u, EF_DEP(x611.elems[0].asRaw())));
-#endif // archsel_hip
-  RkW _cx620 = _cx584; rk_cl_acc(_cx620, x114 * x619, 101u); FpExt x620 = rkw_fin(_cx620);
+  RkW _cx620 = _cx584; rk_cl_accl(_cx620, x114 * x619, 101u, EF_DEP(_cx584.lo[0])); FpExt x620 = rkw_fin(_cx620);
   auto x149 = ::risc0::Fp::fromRaw(efl_arg9_148_0);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x621 = rk_fin(rk_link_k(x615, x149, 7u));
-#else // archsel_hip
   FpExt x621 = rk_fin(rk_link_kl(x615, x149, 7u, EF_DEP(x613.lo[0])));
-#endif // archsel_hip
-  RkW _cx622 = _cx620; rk_cl_acc(_cx622, x113 * x621, 110u); FpExt x622 = rkw_fin(_cx622);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x623 = rk_link_nf_k(x611, x616, 5u);
-  FpExt x624 = rk_fin(rk_link_k(x623, x618, 6u));
-#else // archsel_hip
+  RkW _cx622 = _cx620; rk_cl_accl(_cx622, x113 * x621, 110u, EF_DEP(_cx620.lo[0])); FpExt x622 = rkw_fin(_cx622);
   RkAcc x623 = rk_link_nf_kl(x611, x616, 5u, EF_DEP(x615.elems[0].asRaw()));
   FpExt x624 = rk_fin(rk_link_kl(x623, x618, 6u, EF_DEP(x617.lo[0])));
-#endif // archsel_hip
-  RkW _cx625 = _cx622; rk_cl_acc(_cx625, x115 * x624, 118u); FpExt x625 = rkw_fin(_cx625);
+  RkW _cx625 = _cx622; rk_cl_accl(_cx625, x115 * x624, 118u, EF_DEP(_cx622.lo[0])); FpExt x625 = rkw_fin(_cx625);
   auto x2002608 = ef_ladd(x114, x113);
   const uint32_t efl_arg9_110_0 = EF_LDCR(arg9, 110u, 0u);
   const uint32_t efl_arg9_106_0 = EF_LDCR(arg9, 106u, 0u);
@@ -39069,48 +38402,22 @@ __device__ EF_CHAIN FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* arg0,
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx643 = rkw1_ff0(x638, x113, false); rkw1_v(_wx643, x114, false); rkw1_ff(_wx643, x640, x115, false); auto x643 = rkw1_fin(_wx643);
   auto x644 = (::risc0::Fp::fromRaw(efl_arg9_113_0) - Fp(2013265920u));
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x645 = rk_link_nf_k(arg4, x644, 0u);
-#else // archsel_hip
   RkAcc x645 = rk_link_nf_kl(arg4, x644, 0u, EF_DEP(x619.elems[0].asRaw()));
-#endif // archsel_hip
   auto x646 = (::risc0::Fp::fromRaw(efl_arg9_118_0) - Fp(1u));
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x647 = rk_link_k(x645, x646, 1u);
-  RkAcc x648 = rk_link_nf_k(x647, x211, 2u);
-#else // archsel_hip
   RkAcc x647 = rk_link_kl(x645, x646, 1u, EF_DEP(x621.elems[0].asRaw()));
   RkAcc x648 = rk_link_nf_kl(x647, x211, 2u, EF_DEP(x623.lo[0]));
-#endif // archsel_hip
   auto x650 = x16 - x403;
-#if defined(__GFX12__) // archsel_hip
-  FpExt x651 = rk_fin(rk_link_k(x648, x650, 4u));
-  RkAcc x652 = rk_link_nf_k(x651, x217, 5u);
-  FpExt x653 = rk_fin(rk_link_k(x652, x219, 6u));
-  RkAcc x654 = rk_link_nf_k(x653, x223, 7u);
-  FpExt x655 = rk_fin(rk_link_k(x654, x225, 8u));
-#else // archsel_hip
   FpExt x651 = rk_fin(rk_link_kl(x648, x650, 4u, EF_DEP(x624.elems[0].asRaw())));
   RkAcc x652 = rk_link_nf_kl(x651, x217, 5u, EF_DEP(x645.lo[0]));
   FpExt x653 = rk_fin(rk_link_kl(x652, x219, 6u, EF_DEP(x647.lo[0])));
   RkAcc x654 = rk_link_nf_kl(x653, x223, 7u, EF_DEP(x648.lo[0]));
   FpExt x655 = rk_fin(rk_link_kl(x654, x225, 8u, EF_DEP(x651.elems[0].asRaw())));
-#endif // archsel_hip
-  RkW _cx656 = _cx625; rk_cl_acc(_cx656, x114 * x655, 125u); FpExt x656 = rkw_fin(_cx656);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x657 = rk_fin(rk_link_k(x653, x18, 7u));
-#else // archsel_hip
+  RkW _cx656 = _cx625; rk_cl_accl(_cx656, x114 * x655, 125u, EF_DEP(_cx625.lo[0])); FpExt x656 = rkw_fin(_cx656);
   FpExt x657 = rk_fin(rk_link_kl(x653, x18, 7u, EF_DEP(x652.lo[0])));
-#endif // archsel_hip
-  RkW _cx658 = _cx656; rk_cl_acc(_cx658, x113 * x657, 134u); FpExt x658 = rkw_fin(_cx658);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x659 = rk_link_nf_k(x651, x223, 5u);
-  FpExt x660 = rk_fin(rk_link_k(x659, x225, 6u));
-#else // archsel_hip
+  RkW _cx658 = _cx656; rk_cl_accl(_cx658, x113 * x657, 134u, EF_DEP(_cx656.lo[0])); FpExt x658 = rkw_fin(_cx658);
   RkAcc x659 = rk_link_nf_kl(x651, x223, 5u, EF_DEP(x653.elems[0].asRaw()));
   FpExt x660 = rk_fin(rk_link_kl(x659, x225, 6u, EF_DEP(x654.lo[0])));
-#endif // archsel_hip
-  RkW _cx661 = _cx658; rk_cl_acc(_cx661, x115 * x660, 142u); FpExt x661 = rkw_fin(_cx661);
+  RkW _cx661 = _cx658; rk_cl_accl(_cx661, x115 * x660, 142u, EF_DEP(_cx658.lo[0])); FpExt x661 = rkw_fin(_cx661);
   auto x2002616 = ef_ladd(x114, x113);
   auto x156 = ::risc0::Fp::fromRaw(efl_arg9_120_0);
   // lincombF: fused into a lazy Fp linear combination
@@ -39133,44 +38440,21 @@ __device__ EF_CHAIN FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* arg0,
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx679 = rkw1_ff0(x674, x113, false); rkw1_v(_wx679, x114, false); rkw1_ff(_wx679, x676, x115, false); auto x679 = rkw1_fin(_wx679);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x680 = rk_link_nf_k(arg4, x230, 0u);
-  RkAcc x681 = rk_link_k(x680, x232, 1u);
-  RkAcc x682 = rk_link_nf_k(x681, x235, 2u);
-#else // archsel_hip
   RkAcc x680 = rk_link_nf_kl(arg4, x230, 0u, EF_DEP(x655.elems[0].asRaw()));
   RkAcc x681 = rk_link_kl(x680, x232, 1u, EF_DEP(x657.elems[0].asRaw()));
   RkAcc x682 = rk_link_nf_kl(x681, x235, 2u, EF_DEP(x659.lo[0]));
-#endif // archsel_hip
   auto x684 = x25 - x404;
-#if defined(__GFX12__) // archsel_hip
-  FpExt x685 = rk_fin(rk_link_k(x682, x684, 4u));
-  RkAcc x686 = rk_link_nf_k(x685, x240, 5u);
-  FpExt x687 = rk_fin(rk_link_k(x686, x242, 6u));
-  RkAcc x688 = rk_link_nf_k(x687, x246, 7u);
-  FpExt x689 = rk_fin(rk_link_k(x688, x248, 8u));
-#else // archsel_hip
   FpExt x685 = rk_fin(rk_link_kl(x682, x684, 4u, EF_DEP(x660.elems[0].asRaw())));
   RkAcc x686 = rk_link_nf_kl(x685, x240, 5u, EF_DEP(x680.lo[0]));
   FpExt x687 = rk_fin(rk_link_kl(x686, x242, 6u, EF_DEP(x681.lo[0])));
   RkAcc x688 = rk_link_nf_kl(x687, x246, 7u, EF_DEP(x682.lo[0]));
   FpExt x689 = rk_fin(rk_link_kl(x688, x248, 8u, EF_DEP(x685.elems[0].asRaw())));
-#endif // archsel_hip
-  RkW _cx690 = _cx661; rk_cl_acc(_cx690, x114 * x689, 149u); FpExt x690 = rkw_fin(_cx690);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x691 = rk_fin(rk_link_k(x687, x31, 7u));
-#else // archsel_hip
+  RkW _cx690 = _cx661; rk_cl_accl(_cx690, x114 * x689, 149u, EF_DEP(_cx661.lo[0])); FpExt x690 = rkw_fin(_cx690);
   FpExt x691 = rk_fin(rk_link_kl(x687, x31, 7u, EF_DEP(x686.lo[0])));
-#endif // archsel_hip
-  RkW _cx692 = _cx690; rk_cl_acc(_cx692, x113 * x691, 158u); FpExt x692 = rkw_fin(_cx692);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x693 = rk_link_nf_k(x685, x246, 5u);
-  FpExt x694 = rk_fin(rk_link_k(x693, x248, 6u));
-#else // archsel_hip
+  RkW _cx692 = _cx690; rk_cl_accl(_cx692, x113 * x691, 158u, EF_DEP(_cx690.lo[0])); FpExt x692 = rkw_fin(_cx692);
   RkAcc x693 = rk_link_nf_kl(x685, x246, 5u, EF_DEP(x687.elems[0].asRaw()));
   FpExt x694 = rk_fin(rk_link_kl(x693, x248, 6u, EF_DEP(x688.lo[0])));
-#endif // archsel_hip
-  RkW _cx695 = _cx692; rk_cl_acc(_cx695, x115 * x694, 166u); FpExt x695 = rkw_fin(_cx695);
+  RkW _cx695 = _cx692; rk_cl_accl(_cx695, x115 * x694, 166u, EF_DEP(_cx692.lo[0])); FpExt x695 = rkw_fin(_cx695);
   auto x2002624 = ef_ladd(x114, x113);
   auto x3000053 = ::risc0::Fp::fromRaw(efl_arg9_129_0);
   // lincombF: fused into a lazy Fp linear combination
@@ -39194,44 +38478,21 @@ __device__ EF_CHAIN FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* arg0,
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx713 = rkw1_ff0(x708, x113, false); rkw1_v(_wx713, x114, false); rkw1_ff(_wx713, x710, x115, false); auto x713 = rkw1_fin(_wx713);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x714 = rk_link_nf_k(arg4, x253, 0u);
-  RkAcc x715 = rk_link_k(x714, x255, 1u);
-  RkAcc x716 = rk_link_nf_k(x715, x257, 2u);
-#else // archsel_hip
   RkAcc x714 = rk_link_nf_kl(arg4, x253, 0u, EF_DEP(x689.elems[0].asRaw()));
   RkAcc x715 = rk_link_kl(x714, x255, 1u, EF_DEP(x691.elems[0].asRaw()));
   RkAcc x716 = rk_link_nf_kl(x715, x257, 2u, EF_DEP(x693.lo[0]));
-#endif // archsel_hip
   auto x718 = x36 - x405;
-#if defined(__GFX12__) // archsel_hip
-  FpExt x719 = rk_fin(rk_link_k(x716, x718, 4u));
-  RkAcc x720 = rk_link_nf_k(x719, x262, 5u);
-  FpExt x721 = rk_fin(rk_link_k(x720, x264, 6u));
-  RkAcc x722 = rk_link_nf_k(x721, x268, 7u);
-  FpExt x723 = rk_fin(rk_link_k(x722, x270, 8u));
-#else // archsel_hip
   FpExt x719 = rk_fin(rk_link_kl(x716, x718, 4u, EF_DEP(x694.elems[0].asRaw())));
   RkAcc x720 = rk_link_nf_kl(x719, x262, 5u, EF_DEP(x714.lo[0]));
   FpExt x721 = rk_fin(rk_link_kl(x720, x264, 6u, EF_DEP(x715.lo[0])));
   RkAcc x722 = rk_link_nf_kl(x721, x268, 7u, EF_DEP(x716.lo[0]));
   FpExt x723 = rk_fin(rk_link_kl(x722, x270, 8u, EF_DEP(x719.elems[0].asRaw())));
-#endif // archsel_hip
-  RkW _cx724 = _cx695; rk_cl_acc(_cx724, x114 * x723, 173u); FpExt x724 = rkw_fin(_cx724);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x725 = rk_fin(rk_link_k(x721, x42, 7u));
-#else // archsel_hip
+  RkW _cx724 = _cx695; rk_cl_accl(_cx724, x114 * x723, 173u, EF_DEP(_cx695.lo[0])); FpExt x724 = rkw_fin(_cx724);
   FpExt x725 = rk_fin(rk_link_kl(x721, x42, 7u, EF_DEP(x720.lo[0])));
-#endif // archsel_hip
-  RkW _cx726 = _cx724; rk_cl_acc(_cx726, x113 * x725, 182u); FpExt x726 = rkw_fin(_cx726);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x727 = rk_link_nf_k(x719, x268, 5u);
-  FpExt x728 = rk_fin(rk_link_k(x727, x270, 6u));
-#else // archsel_hip
+  RkW _cx726 = _cx724; rk_cl_accl(_cx726, x113 * x725, 182u, EF_DEP(_cx724.lo[0])); FpExt x726 = rkw_fin(_cx726);
   RkAcc x727 = rk_link_nf_kl(x719, x268, 5u, EF_DEP(x721.elems[0].asRaw()));
   FpExt x728 = rk_fin(rk_link_kl(x727, x270, 6u, EF_DEP(x722.lo[0])));
-#endif // archsel_hip
-  RkW _cx729 = _cx726; rk_cl_acc(_cx729, x115 * x728, 187u); FpExt x729 = rkw_fin(_cx729);
+  RkW _cx729 = _cx726; rk_cl_accl(_cx729, x115 * x728, 187u, EF_DEP(_cx726.lo[0])); FpExt x729 = rkw_fin(_cx729);
   auto x2002632 = ef_ladd(x114, x113);
   auto x168 = ::risc0::Fp::fromRaw(efl_arg9_138_0);
   // lincombF: fused into a lazy Fp linear combination
@@ -39833,7 +39094,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_12(uint32_t cycle, uint32_t steps, Fp* arg0,
 #else // archsel_hip
   EF_W((ef_wst(efw, 1u, x2000832); ef_wblk(efw, efd_267, 20u, efq_267_20); ef_wblk(efw, efd_267, 0u, efq_267_24); FpExt x1047 = ef_wfin(efw, efd_267, 0u, x975);), FpExt x1047 = rk_fin(rk_link_kl(x2000830, x2000832, 222u, EF_DEP(x2000824.lo[0])));)
 #endif // archsel_hip
-  RkW _cx1048 = _cx976; rk_cl_acc(_cx1048, x104 * x1047, 229u); FpExt x1048 = rkw_fin(_cx1048);
+  RkW _cx1048 = _cx976; rk_cl_accl(_cx1048, x104 * x1047, 229u, EF_DEP(_cx976.lo[0])); FpExt x1048 = rkw_fin(_cx1048);
   auto x203 = ::risc0::Fp::fromRaw(efl_arg9_40_4);
   auto x204 = ::risc0::Fp::fromRaw(efl_arg9_41_4);
   const uint32_t efl_arg9_44_4 = EF_LDCR(arg9, 44u, 4u);
@@ -43369,7 +42630,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_4(uint32_t cycle, uint32_t steps, Fp* arg0, 
   EF_W((ef_wst(efw, 18u, x121); ef_wblk(efw, efd_271, 12u, efq_271_108); ef_wblk(efw, efd_271, 16u, efq_271_112); FpExt x1225 = ef_wfin(efw, efd_271, 0u, efb_271);), FpExt x1225 = rk_fin(rk_link_kl(x1224, x121, 121u, EF_DEP(x1221.lo[0])));)
 #endif // archsel_hip
   auto x204 = ::risc0::Fp::fromRaw(efl_arg9_25_0);
-  RkW _cx1226 = _cx917; rk_cl_acc(_cx1226, x204 * x1225, 351u); FpExt x1226 = rkw_fin(_cx1226);
+  RkW _cx1226 = _cx917; rk_cl_accl(_cx1226, x204 * x1225, 351u, EF_DEP(_cx917.lo[0])); FpExt x1226 = rkw_fin(_cx1226);
   auto x1227 = (Fp(48u) - ::risc0::Fp::fromRaw(efl_arg9_35_0));
 #if defined(__GFX12__) // archsel_hip
   EF_W((ef_v4i efd_272[4] = {}; const int efq_272_0 = ef_wq(efw, 7u); ef_wst(efw, 0u, x1227);), RkAcc x1228 = rk_link_nf_k(arg4, x1227, 7u);)
@@ -43432,12 +42693,12 @@ __device__ EF_CHAIN FpExt rv32im_v2_4(uint32_t cycle, uint32_t steps, Fp* arg0, 
   EF_W((ef_wst(efw, 15u, x121); ef_wblk(efw, efd_272, 8u, efq_272_8); ef_wblk(efw, efd_272, 12u, efq_272_12); FpExt x1243 = ef_wfin(efw, efd_272, 0u, arg4);), FpExt x1243 = rk_fin(rk_link_kl(x1242, x121, 22u, EF_DEP(x1239.lo[0])));)
 #endif // archsel_hip
   auto x208 = ::risc0::Fp::fromRaw(efl_arg9_26_0);
-  RkW _cx1244 = _cx1226; rk_cl_acc(_cx1244, x208 * x1243, 356u); FpExt x1244 = rkw_fin(_cx1244);
+  RkW _cx1244 = _cx1226; rk_cl_accl(_cx1244, x208 * x1243, 356u, EF_DEP(_cx1226.lo[0])); FpExt x1244 = rkw_fin(_cx1244);
   auto x209 = ::risc0::Fp::fromRaw(efl_arg9_27_0);
-  RkW _cx1245 = _cx1244; rk_cl_acc(_cx1245, x209 * x1243, 358u); FpExt x1245 = rkw_fin(_cx1245);
+  RkW _cx1245 = _cx1244; rk_cl_accl(_cx1245, x209 * x1243, 358u, EF_DEP(_cx1244.lo[0])); FpExt x1245 = rkw_fin(_cx1245);
   auto x210 = ::risc0::Fp::fromRaw(efl_arg9_28_0);
   const uint32_t efl_arg9_162_0 = EF_LDCR(arg9, 162u, 0u);
-  RkW _cx1246 = _cx1245; rk_cl_acc(_cx1246, x210 * x1243, 360u); FpExt x1246 = rkw_fin(_cx1246);
+  RkW _cx1246 = _cx1245; rk_cl_accl(_cx1246, x210 * x1243, 360u, EF_DEP(_cx1245.lo[0])); FpExt x1246 = rkw_fin(_cx1246);
   auto x211 = ::risc0::Fp::fromRaw(efl_arg9_12_0);
   RkW _cx1247 = rk_cl0(arg5, x211 * x1246, 423u); FpExt x1247 = rkw_fin(_cx1247);
   constexpr Fp x5(40);
@@ -43471,18 +42732,10 @@ __device__ EF_CHAIN FpExt rv32im_v2_4(uint32_t cycle, uint32_t steps, Fp* arg0, 
 #endif // archsel_hip
   auto x215 = ::risc0::Fp::fromRaw(efl_arg9_56_0);
   auto x1259 = x215 - x11;
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x1260 = rk_link_k(x1258, x1259, 1u);
-#else // archsel_hip
   RkAcc x1260 = rk_link_kl(x1258, x1259, 1u, EF_DEP(x1253.lo[0]));
-#endif // archsel_hip
   auto x216 = ::risc0::Fp::fromRaw(efl_arg9_57_0);
   auto x1261 = x216 - x1251;
-#if defined(__GFX12__) // archsel_hip
-  FpExt x1262 = rk_fin(rk_link_k(x1260, x1261, 2u));
-#else // archsel_hip
   FpExt x1262 = rk_fin(rk_link_kl(x1260, x1261, 2u, EF_DEP(x1255.lo[0])));
-#endif // archsel_hip
   constexpr Fp x3(1073725445);
   auto x217 = ::risc0::Fp::fromRaw(efl_arg9_52_0);
   auto x1264 = x217 - x3;
@@ -44156,11 +43409,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001472 = rkw_ee(x2001469, x211);
   rkw_ef(_wx2001472, x17, x206, true);
   auto x2001472 = rkw_fin(_wx2001472);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x221 = rk_link_nf_k(x203, x2001472, 7u);
-#else // archsel_hip
   RkAcc x221 = rk_link_nf_kl(x203, x2001472, 7u, EF_DEP(x147.lo[0]));
-#endif // archsel_hip
   auto r67_x196 = EF_PM(609);
   auto r67_x231 = EF_PM(603);
   auto r67_x105 = ::risc0::Fp::fromRaw(efl_rkBD_138_0);
@@ -44186,17 +43435,9 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   rkw_ef(_wx230, x18, x222, true);
   auto x230 = rkw_fin(_wx230);
   const uint32_t efl_arg4_195_0 = EF_LDCR(arg4, 195u, 0u);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x231 = rk_link_k(x221, x230, 8u);
-#else // archsel_hip
   RkAcc x231 = rk_link_kl(x221, x230, 8u, EF_DEP(x163.lo[0]));
-#endif // archsel_hip
   auto x232 = RK_LD4L(arg0, 104u, 105u, 106u, 107u);
-#if defined(__GFX12__) // archsel_hip
-  FpExt x233 = rk_fin(rk_link_k(x231, x232, 9u));
-#else // archsel_hip
   FpExt x233 = rk_fin(rk_link_kl(x231, x232, 9u, EF_DEP(x185.lo[0])));
-#endif // archsel_hip
   auto x20 = ::risc0::Fp::fromRaw(efl_arg4_9_0);
   RkW _cx234 = rk_cl0(arg2, x20 * x233, 453u);
   FpExt x234 = rkw_fin(_cx234);
@@ -44241,11 +43482,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001480 = rkw_ee(x2001477, x250);
   rkw_ef(_wx2001480, x25, x239, true);
   auto x2001480 = rkw_fin(_wx2001480);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x260 = rk_link_nf_k(arg3, x2001480, 0u);
-#else // archsel_hip
   RkAcc x260 = rk_link_nf_kl(arg3, x2001480, 0u, EF_DEP(x203.lo[0]));
-#endif // archsel_hip
   auto x261 = EF_PM(605);
   auto x264 = EF_PM(606);
   auto x267 = EF_PM(607);
@@ -44285,11 +43522,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001488 = rkw_ee(x2001485, x288);
   rkw_ef(_wx2001488, x27, x279, true);
   auto x2001488 = rkw_fin(_wx2001488);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x298 = rk_link_k(x260, x2001488, 1u);
-#else // archsel_hip
   RkAcc x298 = rk_link_kl(x260, x2001488, 1u, EF_DEP(x221.lo[0]));
-#endif // archsel_hip
   auto x299 = x17 * x242;
   auto x28 = ::risc0::Fp::fromRaw(efl_arg4_89_0);
   const uint32_t efl_arg4_93_0 = EF_LDCR(arg4, 93u, 0u);
@@ -44343,11 +43576,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001496 = rkw_ee(x2001493, x324);
   rkw_ef(_wx2001496, x39, x314, true);
   auto x2001496 = rkw_fin(_wx2001496);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x334 = rk_link_nf_k(x298, x2001496, 2u);
-#else // archsel_hip
   RkAcc x334 = rk_link_nf_kl(x298, x2001496, 2u, EF_DEP(x231.lo[0]));
-#endif // archsel_hip
   const uint32_t efl_arg4_105_0 = EF_LDCR(arg4, 105u, 0u);
   const uint32_t efl_arg4_106_0 = EF_LDCR(arg4, 106u, 0u);
   const uint32_t efl_arg4_107_0 = EF_LDCR(arg4, 107u, 0u);
@@ -44404,11 +43633,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_arg4_117_0 = EF_LDCR(arg4, 117u, 0u);
   const uint32_t efl_arg4_119_0 = EF_LDCR(arg4, 119u, 0u);
   auto x2001504 = rkw_fin(_wx2001504);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x369 = rk_link_k(x334, x2001504, 3u);
-#else // archsel_hip
   RkAcc x369 = rk_link_kl(x334, x2001504, 3u, EF_DEP(x233.elems[0].asRaw()));
-#endif // archsel_hip
   auto x53 = ::risc0::Fp::fromRaw(efl_arg4_115_0);
   FpExt r78_x319 = EF_PM(604);
   auto r78_x106 = ::risc0::Fp::fromRaw(efl_rkBD_114_0);
@@ -44473,11 +43698,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001512 = rkw_ee(x2001509, x395);
   rkw_ef(_wx2001512, x62, x385, true);
   auto x2001512 = rkw_fin(_wx2001512);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x404 = rk_link_nf_k(x369, x2001512, 4u);
-#else // archsel_hip
   RkAcc x404 = rk_link_nf_kl(x369, x2001512, 4u, EF_DEP(x260.lo[0]));
-#endif // archsel_hip
   auto x63 = ::risc0::Fp::fromRaw(efl_arg4_128_0);
   auto x64 = ::risc0::Fp::fromRaw(efl_arg4_129_0);
   const uint32_t efl_arg4_133_0 = EF_LDCR(arg4, 133u, 0u);
@@ -44528,11 +43749,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001520 = rkw_ee(x2001517, x429);
   rkw_ef(_wx2001520, x74, x420, true);
   auto x2001520 = rkw_fin(_wx2001520);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x438 = rk_link_k(x404, x2001520, 5u);
-#else // archsel_hip
   RkAcc x438 = rk_link_kl(x404, x2001520, 5u, EF_DEP(x298.lo[0]));
-#endif // archsel_hip
   auto x75 = ::risc0::Fp::fromRaw(efl_arg4_141_0);
   auto x439 = x75 * x164;
   const uint32_t efl_arg4_142_0 = EF_LDCR(arg4, 142u, 0u);
@@ -44559,11 +43776,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_arg4_146_0 = EF_LDCR(arg4, 146u, 0u);
   const uint32_t efl_arg4_148_0 = EF_LDCR(arg4, 148u, 0u);
   auto x2001528 = rkw_fin(_wx2001528);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x456 = rk_link_nf_k(x438, x2001528, 6u);
-#else // archsel_hip
   RkAcc x456 = rk_link_nf_kl(x438, x2001528, 6u, EF_DEP(x334.lo[0]));
-#endif // archsel_hip
   auto x80 = ::risc0::Fp::fromRaw(efl_arg4_147_0);
   auto x457 = x80 * x164;
   auto x458 = x457 + x166;
@@ -44587,11 +43800,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001536 = rkw_ee(x2001533, x465);
   rkw_ef(_wx2001536, x85, x461, true);
   auto x2001536 = rkw_fin(_wx2001536);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x474 = rk_link_k(x456, x2001536, 7u);
-#else // archsel_hip
   RkAcc x474 = rk_link_kl(x456, x2001536, 7u, EF_DEP(x369.lo[0]));
-#endif // archsel_hip
   auto x86 = ::risc0::Fp::fromRaw(efl_arg4_153_0);
   const uint32_t efl_arg4_152_0 = EF_LDCR(arg4, 152u, 0u);
   const uint32_t efl_arg4_154_0 = EF_LDCR(arg4, 154u, 0u);
@@ -44617,11 +43826,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_arg4_158_0 = EF_LDCR(arg4, 158u, 0u);
   rkw_ef(_wx2001544, x90, x479, true);
   auto x2001544 = rkw_fin(_wx2001544);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x492 = rk_link_nf_k(x474, x2001544, 8u);
-#else // archsel_hip
   RkAcc x492 = rk_link_nf_kl(x474, x2001544, 8u, EF_DEP(x404.lo[0]));
-#endif // archsel_hip
   auto x91 = ::risc0::Fp::fromRaw(efl_arg4_159_0);
   auto x493 = x91 * x168;
   auto x494 = x493 + x166;
@@ -44642,11 +43847,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001552 = rkw_ee(x2001549, x499);
   rkw_ef(_wx2001552, x94, x495, true);
   auto x2001552 = rkw_fin(_wx2001552);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x509 = rk_link_k(x492, x2001552, 9u);
-#else // archsel_hip
   RkAcc x509 = rk_link_kl(x492, x2001552, 9u, EF_DEP(x438.lo[0]));
-#endif // archsel_hip
   auto x510 = x14 * x168;
   auto x511 = x510 + x166;
   auto x95 = ::risc0::Fp::fromRaw(efl_arg4_163_0);
@@ -44676,11 +43877,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001560 = rkw_ee(x2001557, x517);
   rkw_ef(_wx2001560, x98, x514, true);
   auto x2001560 = rkw_fin(_wx2001560);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x527 = rk_link_nf_k(x509, x2001560, 10u);
-#else // archsel_hip
   RkAcc x527 = rk_link_nf_kl(x509, x2001560, 10u, EF_DEP(x456.lo[0]));
-#endif // archsel_hip
   auto x528 = x32 * x168;
   auto x529 = x528 + x166;
   auto x99 = ::risc0::Fp::fromRaw(efl_arg4_167_0);
@@ -44703,11 +43900,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   rkw_ef(_wx2001568, x102, x532, true);
   auto x2001568 = rkw_fin(_wx2001568);
   const uint32_t efl_rkBD_171_0 = EF_LDCR(rkBD, 171u, 0u);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x546 = rk_link_k(x527, x2001568, 11u);
-#else // archsel_hip
   RkAcc x546 = rk_link_kl(x527, x2001568, 11u, EF_DEP(x474.lo[0]));
-#endif // archsel_hip
   auto r86_x196 = EF_PM(609);
   auto r86_x231 = EF_PM(603);
   auto r86_x60 = ::risc0::Fp::fromRaw(efl_rkBD_103_0);
@@ -44739,11 +43932,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001576 = rkw_ee(x2001573, x553);
   rkw_ef(_wx2001576, x105, x549, true);
   auto x2001576 = rkw_fin(_wx2001576);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x563 = rk_link_nf_k(x546, x2001576, 12u);
-#else // archsel_hip
   RkAcc x563 = rk_link_nf_kl(x546, x2001576, 12u, EF_DEP(x492.lo[0]));
-#endif // archsel_hip
   auto x564 = x51 * x168;
   auto x565 = x564 + x166;
   auto x106 = ::risc0::Fp::fromRaw(efl_arg4_175_0);
@@ -44773,11 +43962,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001584 = rkw_ee(x2001581, x571);
   rkw_ef(_wx2001584, x109, x568, true);
   auto x2001584 = rkw_fin(_wx2001584);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x581 = rk_link_k(x563, x2001584, 13u);
-#else // archsel_hip
   RkAcc x581 = rk_link_kl(x563, x2001584, 13u, EF_DEP(x509.lo[0]));
-#endif // archsel_hip
   auto x582 = x58 * x168;
   auto x583 = x582 + x166;
   auto x110 = ::risc0::Fp::fromRaw(efl_arg4_179_0);
@@ -44800,11 +43985,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001592 = rkw_ee(x2001589, x590);
   rkw_ef(_wx2001592, x113, x586, true);
   auto x2001592 = rkw_fin(_wx2001592);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x600 = rk_link_nf_k(x581, x2001592, 14u);
-#else // archsel_hip
   RkAcc x600 = rk_link_nf_kl(x581, x2001592, 14u, EF_DEP(x527.lo[0]));
-#endif // archsel_hip
   const uint32_t efl_arg4_181_0 = EF_LDCR(arg4, 181u, 0u);
   const uint32_t efl_arg4_182_0 = EF_LDCR(arg4, 182u, 0u);
   auto x114 = ::risc0::Fp::fromRaw(efl_arg4_183_0);
@@ -44831,11 +44012,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001600 = rkw_ee(x2001597, x222);
   rkw_ef(_wx2001600, x117, x604, true);
   auto x2001600 = rkw_fin(_wx2001600);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x616 = rk_link_k(x600, x2001600, 15u);
-#else // archsel_hip
   RkAcc x616 = rk_link_kl(x600, x2001600, 15u, EF_DEP(x546.lo[0]));
-#endif // archsel_hip
   auto x617 = x73 * x168;
   auto x618 = x617 + x166;
   const uint32_t efl_arg4_185_0 = EF_LDCR(arg4, 185u, 0u);
@@ -44863,11 +44040,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_rkBA_101_0 = EF_LDCR(rkBA, 101u, 0u);
   rkw_ef(_wx2001608, x122, x621, true);
   auto x2001608 = rkw_fin(_wx2001608);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x635 = rk_link_nf_k(x616, x2001608, 16u);
-#else // archsel_hip
   RkAcc x635 = rk_link_nf_kl(x616, x2001608, 16u, EF_DEP(x563.lo[0]));
-#endif // archsel_hip
   auto x123 = ::risc0::Fp::fromRaw(efl_arg4_191_0);
   auto x636 = x123 * x209;
   auto x637 = x636 + x166;
@@ -44877,11 +44050,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_rkBA_99_0 = EF_LDCR(rkBA, 99u, 0u);
   auto x124 = ::risc0::Fp::fromRaw(efl_arg4_190_0);
   auto x640 = x639 - x124;
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x641 = rk_link_k(x635, x640, 17u);
-#else // archsel_hip
   RkAcc x641 = rk_link_kl(x635, x640, 17u, EF_DEP(x581.lo[0]));
-#endif // archsel_hip
   constexpr FpExt r96_x0(0,1,0,0);
   auto r96_x145 = ::risc0::Fp::fromRaw(efl_rkBA_102_0);
   auto r96_x612 = r96_x145 * r96_x0;
@@ -44913,14 +44082,10 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   auto r97_x1047 = r97_x177 + r97_x1046;
   auto x643 = static_cast<const ::risc0::FpExt>(::risc0::FpExt(r97_x1047));
   auto x644 = x642 - x643;
-#if defined(__GFX12__) // archsel_hip
-  FpExt x645 = rk_fin(rk_link_k(x641, x644, 18u));
-#else // archsel_hip
   FpExt x645 = rk_fin(rk_link_kl(x641, x644, 18u, EF_DEP(x600.lo[0])));
-#endif // archsel_hip
   auto x125 = ::risc0::Fp::fromRaw(efl_arg4_10_0);
   RkW _cx646 = _cx234;
-  rk_cl_acc(_cx646, x125 * x645, 454u);
+  rk_cl_accl(_cx646, x125 * x645, 454u, EF_DEP(_cx234.lo[0]));
   const uint32_t efl_rkBA_26_0 = EF_LDCR(rkBA, 26u, 0u);
   const uint32_t efl_rkBA_25_0 = EF_LDCR(rkBA, 25u, 0u);
   FpExt x646 = rkw_fin(_cx646);
@@ -44936,11 +44101,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   rkw_ef(_wx656, x25, x650, true);
   rkw_ef(_wx656, x126, x648, true);
   auto x656 = rkw_fin(_wx656);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x657 = rk_link_nf_k(arg3, x656, 0u);
-#else // archsel_hip
   RkAcc x657 = rk_link_nf_kl(arg3, x656, 0u, EF_DEP(x616.lo[0]));
-#endif // archsel_hip
   constexpr FpExt r98_x0(0,1,0,0);
   auto r98_x45 = ::risc0::Fp::fromRaw(efl_rkBA_26_0);
   auto r98_x369 = r98_x45 * r98_x0;
@@ -44955,14 +44116,10 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   auto r98_x374 = r98_x48 + r98_x373;
   auto x658 = static_cast<const ::risc0::FpExt>(::risc0::FpExt(r98_x374));
   auto x659 = x642 - x658;
-#if defined(__GFX12__) // archsel_hip
-  FpExt x660 = rk_fin(rk_link_k(x657, x659, 1u));
-#else // archsel_hip
   FpExt x660 = rk_fin(rk_link_kl(x657, x659, 1u, EF_DEP(x635.lo[0])));
-#endif // archsel_hip
   auto x127 = ::risc0::Fp::fromRaw(efl_arg4_11_0);
   RkW _cx661 = _cx646;
-  rk_cl_acc(_cx661, x127 * x660, 455u);
+  rk_cl_accl(_cx661, x127 * x660, 455u, EF_DEP(_cx646.lo[0]));
   FpExt x661 = rkw_fin(_cx661);
   auto x662 = x122 * x164;
   auto x663 = x662 + x166;
@@ -44983,11 +44140,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001616 = rkw_ee(x2001613, x676);
   rkw_ef(_wx2001616, x66, x666, true);
   auto x2001616 = rkw_fin(_wx2001616);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x685 = rk_link_nf_k(arg3, x2001616, 0u);
-#else // archsel_hip
   RkAcc x685 = rk_link_nf_kl(arg3, x2001616, 0u, EF_DEP(x641.lo[0]));
-#endif // archsel_hip
   RkW _wx692 = rkw_ef0(x72, x261, false);
   rkw_v(_wx692, x669, false);
   rkw_ef(_wx692, x73, x264, false);
@@ -45015,11 +44168,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001624 = rkw_ee(x2001621, x710);
   rkw_ef(_wx2001624, x83, x701, true);
   auto x2001624 = rkw_fin(_wx2001624);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x719 = rk_link_k(x685, x2001624, 1u);
-#else // archsel_hip
   RkAcc x719 = rk_link_kl(x685, x2001624, 1u, EF_DEP(x645.elems[0].asRaw()));
-#endif // archsel_hip
   auto x720 = x84 * x242;
   RkW _wx727 = rkw_ef0(x89, x261, false);
   rkw_v(_wx727, x720, false);
@@ -45049,11 +44198,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_arg4_171_0 = EF_LDCR(arg4, 171u, 0u);
   rkw_ef(_wx2001632, x91, x735, true);
   auto x2001632 = rkw_fin(_wx2001632);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x754 = rk_link_nf_k(x719, x2001632, 2u);
-#else // archsel_hip
   RkAcc x754 = rk_link_nf_kl(x719, x2001632, 2u, EF_DEP(x657.lo[0]));
-#endif // archsel_hip
   RkW _wx761 = rkw_ef0(x101, x261, false);
   rkw_v(_wx761, x738, false);
   rkw_ef(_wx761, x100, x264, false);
@@ -45082,11 +44227,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001640 = rkw_ee(x2001637, x779);
   rkw_ef(_wx2001640, x108, x770, true);
   auto x2001640 = rkw_fin(_wx2001640);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x788 = rk_link_k(x754, x2001640, 3u);
-#else // archsel_hip
   RkAcc x788 = rk_link_kl(x754, x2001640, 3u, EF_DEP(x660.elems[0].asRaw()));
-#endif // archsel_hip
   auto x789 = x111 * x164;
   auto x790 = x789 + x166;
   auto x791 = x113 * x164;
@@ -45101,11 +44242,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001648 = rkw_ee(x2001645, x797);
   rkw_ef(_wx2001648, x116, x793, true);
   auto x2001648 = rkw_fin(_wx2001648);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x806 = rk_link_nf_k(x788, x2001648, 4u);
-#else // archsel_hip
   RkAcc x806 = rk_link_nf_kl(x788, x2001648, 4u, EF_DEP(x685.lo[0]));
-#endif // archsel_hip
   auto x807 = x117 * x164;
   const uint32_t efl_rkBA_46_0 = EF_LDCR(rkBA, 46u, 0u);
   const uint32_t efl_rkBA_45_0 = EF_LDCR(rkBA, 45u, 0u);
@@ -45120,11 +44257,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   auto x816 = rkw_fin(_wx816);
   const uint32_t efl_rkBA_43_0 = EF_LDCR(rkBA, 43u, 0u);
   const uint32_t efl_arg4_12_0 = EF_LDCR(arg4, 12u, 0u);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x817 = rk_link_k(x806, x816, 5u);
-#else // archsel_hip
   RkAcc x817 = rk_link_kl(x806, x816, 5u, EF_DEP(x719.lo[0]));
-#endif // archsel_hip
   constexpr FpExt r99_x0(0,1,0,0);
   auto r99_x115 = ::risc0::Fp::fromRaw(efl_rkBA_46_0);
   auto r99_x538 = r99_x115 * r99_x0;
@@ -45138,16 +44271,12 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   auto r99_x543 = r99_x118 + r99_x542;
   auto x818 = static_cast<const ::risc0::FpExt>(::risc0::FpExt(r99_x543));
   auto x819 = x642 - x818;
-#if defined(__GFX12__) // archsel_hip
-  FpExt x820 = rk_fin(rk_link_k(x817, x819, 6u));
-#else // archsel_hip
   FpExt x820 = rk_fin(rk_link_kl(x817, x819, 6u, EF_DEP(x754.lo[0])));
-#endif // archsel_hip
   auto x129 = ::risc0::Fp::fromRaw(efl_arg4_12_0);
   const uint32_t efl_arg4_52_0 = EF_LDCR(arg4, 52u, 0u);
   const uint32_t efl_rkBD_53_0 = EF_LDCR(rkBD, 53u, 0u);
   RkW _cx821 = _cx661;
-  rk_cl_acc(_cx821, x129 * x820, 456u);
+  rk_cl_accl(_cx821, x129 * x820, 456u, EF_DEP(_cx661.lo[0]));
   FpExt x821 = rkw_fin(_cx821);
   auto x822 = x96 * x164;
   auto x823 = x822 + x166;
@@ -45188,11 +44317,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_rkBD_62_0 = EF_LDCR(rkBD, 62u, 0u);
   rkw_ef(_wx2001656, x131, x826, true);
   auto x2001656 = rkw_fin(_wx2001656);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x845 = rk_link_nf_k(arg3, x2001656, 0u);
-#else // archsel_hip
   RkAcc x845 = rk_link_nf_kl(arg3, x2001656, 0u, EF_DEP(x788.lo[0]));
-#endif // archsel_hip
   auto x132 = ::risc0::Fp::fromRaw(efl_arg4_57_0);
   auto x133 = ::risc0::Fp::fromRaw(efl_arg4_58_0);
   auto x134 = ::risc0::Fp::fromRaw(efl_arg4_59_0);
@@ -45252,11 +44377,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   rkw_ef(_wx2001664, x1, x861, true);
   auto x2001664 = rkw_fin(_wx2001664);
   const uint32_t efl_rkBD_73_0 = EF_LDCR(rkBD, 73u, 0u);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x879 = rk_link_k(x845, x2001664, 1u);
-#else // archsel_hip
   RkAcc x879 = rk_link_kl(x845, x2001664, 1u, EF_DEP(x806.lo[0]));
-#endif // archsel_hip
   auto x880 = x126 * x242;
   auto r109_x198 = EF_PM(605);
   auto r109_x36 = ::risc0::Fp::fromRaw(efl_rkBD_71_0);
@@ -45309,11 +44430,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_rkBD_89_0 = EF_LDCR(rkBD, 89u, 0u);
   rkw_ef(_wx2001672, x9, x895, true);
   auto x2001672 = rkw_fin(_wx2001672);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x914 = rk_link_nf_k(x879, x2001672, 2u);
-#else // archsel_hip
   RkAcc x914 = rk_link_nf_kl(x879, x2001672, 2u, EF_DEP(x817.lo[0]));
-#endif // archsel_hip
   RkW _wx921 = rkw_ef0(x26, x261, false);
   rkw_v(_wx921, x898, false);
   rkw_ef(_wx921, x14, x264, false);
@@ -45358,11 +44475,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_rkBD_100_0 = EF_LDCR(rkBD, 100u, 0u);
   rkw_ef(_wx2001680, x3000059, x930, true);
   auto x2001680 = rkw_fin(_wx2001680);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x948 = rk_link_k(x914, x2001680, 3u);
-#else // archsel_hip
   RkAcc x948 = rk_link_kl(x914, x2001680, 3u, EF_DEP(x820.elems[0].asRaw()));
-#endif // archsel_hip
   auto x949 = x36 * x242;
   FpExt r118_x325 = EF_PM(605);
   auto r118_x87 = ::risc0::Fp::fromRaw(efl_rkBD_98_0);
@@ -45406,11 +44519,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_rkBD_110_0 = EF_LDCR(rkBD, 110u, 0u);
   rkw_ef(_wx2001688, x43, x964, true);
   auto x2001688 = rkw_fin(_wx2001688);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x976 = rk_link_nf_k(x948, x2001688, 4u);
-#else // archsel_hip
   RkAcc x976 = rk_link_nf_kl(x948, x2001688, 4u, EF_DEP(x845.lo[0]));
-#endif // archsel_hip
   auto r122_x196 = EF_PM(609);
   auto r122_x211 = EF_PM(608);
   auto r122_x92 = ::risc0::Fp::fromRaw(efl_rkBD_108_0);
@@ -45470,11 +44579,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   rkw_v(_wx984, x981, true);
   rkw_v(_wx984, x983, true);
   auto x984 = rkw_fin(_wx984);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x985 = rk_link_k(x976, x984, 5u);
-#else // archsel_hip
   RkAcc x985 = rk_link_kl(x976, x984, 5u, EF_DEP(x879.lo[0]));
-#endif // archsel_hip
   auto x986 = x59 * x209;
   auto x987 = x986 + x166;
   auto r126_x196 = EF_PM(609);
@@ -45526,11 +44631,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_arg4_124_0 = EF_LDCR(arg4, 124u, 0u);
   rkw_v(_wx2001693, x997, true);
   auto x2001693 = rkw_fin(_wx2001693);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x999 = rk_link_nf_k(x985, x2001693, 6u);
-#else // archsel_hip
   RkAcc x999 = rk_link_nf_kl(x985, x2001693, 6u, EF_DEP(x914.lo[0]));
-#endif // archsel_hip
   auto x1000 = x57 * x209;
   auto x1001 = x1000 + x166;
   auto x1002 = x62 * x209;
@@ -45548,11 +44649,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   const uint32_t efl_arg4_125_0 = EF_LDCR(arg4, 125u, 0u);
   rkw_ef(_wx2001701, x61, x1004, true);
   auto x2001701 = rkw_fin(_wx2001701);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x1017 = rk_link_k(x999, x2001701, 7u);
-#else // archsel_hip
   RkAcc x1017 = rk_link_kl(x999, x2001701, 7u, EF_DEP(x948.lo[0]));
-#endif // archsel_hip
   auto x139 = ::risc0::Fp::fromRaw(efl_arg4_126_0);
   auto x1018 = x139 * x209;
   auto x1019 = x1018 + x166;
@@ -45570,11 +44667,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001709 = rkw_ee(x2001706, x1026);
   rkw_ef(_wx2001709, x3000062, x1022, true);
   auto x2001709 = rkw_fin(_wx2001709);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x1035 = rk_link_nf_k(x1017, x2001709, 8u);
-#else // archsel_hip
   RkAcc x1035 = rk_link_nf_kl(x1017, x2001709, 8u, EF_DEP(x976.lo[0]));
-#endif // archsel_hip
   auto x1036 = x66 * x209;
   auto x1037 = x1036 + x166;
   auto x1038 = x68 * x209;
@@ -45589,11 +44682,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001717 = rkw_ee(x2001714, x1044);
   rkw_ef(_wx2001717, x69, x1040, true);
   auto x2001717 = rkw_fin(_wx2001717);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x1053 = rk_link_k(x1035, x2001717, 9u);
-#else // archsel_hip
   RkAcc x1053 = rk_link_kl(x1035, x2001717, 9u, EF_DEP(x985.lo[0]));
-#endif // archsel_hip
   auto x1054 = x72 * x209;
   auto x1055 = x1054 + x166;
   auto x1056 = x18 * x209;
@@ -45608,11 +44697,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001725 = rkw_ee(x2001722, x1062);
   rkw_ef(_wx2001725, x75, x1058, true);
   auto x2001725 = rkw_fin(_wx2001725);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x1071 = rk_link_nf_k(x1053, x2001725, 10u);
-#else // archsel_hip
   RkAcc x1071 = rk_link_nf_kl(x1053, x2001725, 10u, EF_DEP(x999.lo[0]));
-#endif // archsel_hip
   auto x1072 = x79 * x209;
   auto x1073 = x1072 + x166;
   auto x1074 = x83 * x209;
@@ -45629,11 +44714,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   rkw_ef(_wx2001733, x80, x1076, true);
   const uint32_t efl_rkBD_152_0 = EF_LDCR(rkBD, 152u, 0u);
   auto x2001733 = rkw_fin(_wx2001733);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x1089 = rk_link_k(x1071, x2001733, 11u);
-#else // archsel_hip
   RkAcc x1089 = rk_link_kl(x1071, x2001733, 11u, EF_DEP(x1017.lo[0]));
-#endif // archsel_hip
   auto x1090 = x88 * x168;
   auto x1091 = x1090 + x166;
   auto r130_x196 = EF_PM(609);
@@ -45684,11 +44765,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   RkW _wx2001738 = rkw_ee(x2001736, x1091);
   rkw_v(_wx2001738, x1101, true);
   auto x2001738 = rkw_fin(_wx2001738);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x1103 = rk_link_nf_k(x1089, x2001738, 12u);
-#else // archsel_hip
   RkAcc x1103 = rk_link_nf_kl(x1089, x2001738, 12u, EF_DEP(x1035.lo[0]));
-#endif // archsel_hip
   auto x1104 = x90 * x168;
   auto x1105 = x1104 + x166;
   auto x1106 = x92 * x168;
@@ -45708,11 +44785,7 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   auto x2001746 = rkw_fin(_wx2001746);
   const uint32_t efl_rkBA_75_0 = EF_LDCR(rkBA, 75u, 0u);
   const uint32_t efl_arg4_13_0 = EF_LDCR(arg4, 13u, 0u);
-#if defined(__GFX12__) // archsel_hip
-  RkAcc x1121 = rk_link_k(x1103, x2001746, 13u);
-#else // archsel_hip
   RkAcc x1121 = rk_link_kl(x1103, x2001746, 13u, EF_DEP(x1053.lo[0]));
-#endif // archsel_hip
   constexpr FpExt r134_x0(0,1,0,0);
   auto r134_x236 = ::risc0::Fp::fromRaw(efl_rkBA_78_0);
   auto r134_x1146 = r134_x236 * r134_x0;
@@ -45726,14 +44799,10 @@ __device__ EF_CHAIN FpExt rv32im_v2_0(uint32_t cycle, uint32_t steps, FpExt* arg
   auto r134_x1151 = r134_x239 + r134_x1150;
   auto x1122 = static_cast<const ::risc0::FpExt>(::risc0::FpExt(r134_x1151));
   auto x1123 = x642 - x1122;
-#if defined(__GFX12__) // archsel_hip
-  FpExt x1124 = rk_fin(rk_link_k(x1121, x1123, 14u));
-#else // archsel_hip
   FpExt x1124 = rk_fin(rk_link_kl(x1121, x1123, 14u, EF_DEP(x1071.lo[0])));
-#endif // archsel_hip
   auto x141 = ::risc0::Fp::fromRaw(efl_arg4_13_0);
   RkW _cx1125 = _cx821;
-  rk_cl_acc(_cx1125, x141 * x1124, 457u);
+  rk_cl_accl(_cx1125, x141 * x1124, 457u, EF_DEP(_cx821.lo[0]));
   FpExt x1125 = rkw_fin(_cx1125);
   return x1125;
 }

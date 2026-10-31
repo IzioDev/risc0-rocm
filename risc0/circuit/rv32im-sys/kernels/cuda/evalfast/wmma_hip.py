@@ -70,21 +70,27 @@ typedef const __attribute__((address_space(1))) uint32_t ef_wgu32;
 #define EF_WSTR 80u    // dwords per slot: 64 points + 16 pad, so the tile reads are bank-conflict free
 __shared__ uint32_t ef_wlds[(EF_THREADS / 64) * EF_WSLOTS * EF_WSTR];
 // lane, its wave's staging tile, rdo = (lane / 16) * EF_WSTR + lane %% 16 (operand row group = link)
-struct EfW { ef_lu32* st; uint32_t lane, rdo; };
+struct EfW { ef_lu32* st; ef_wgu32* q; uint32_t lane, rdo; };
 __device__ __forceinline__ static EfW ef_wsetup() {
   EfW w;
   w.lane = threadIdx.x & 63u;
   w.rdo = (w.lane >> 4) * EF_WSTR + (w.lane & 15u);
   w.st = (ef_lu32*)(ef_wlds + (threadIdx.x >> 6) * (EF_WSLOTS * EF_WSTR));
+  // The A operand table through an opaque SGPR base (an empty asm): each ef_wq load is then base +
+  // lane offset + an immediate offset, instead of a 64-bit PC-relative SGPR address per constant
+  // that the scheduler hoisted and spilled to VGPR lanes (~600 s_getpc and ~970 v_readlane per wave).
+  uint64_t q = reinterpret_cast<uint64_t>(ef_wq_raw);
+  asm("" : "+s"(q));
+  w.q = (ef_wgu32*)q;
   return w;
 }
 #define EF_WSETUP const EfW efw = ef_wsetup();
 __device__ __forceinline__ static void ef_wst(const EfW& w, uint32_t slot, Fp c) { w.st[slot * EF_WSTR + w.lane] = c.asRaw(); }
 // A operand: Q rows of the links with constants k0..k0+3, or ka..kd with n < 4 real links (zero rows)
-__device__ __forceinline__ static int ef_wq(const EfW& w, uint32_t k0) { return (int)((ef_wgu32*)ef_wq_raw)[k0 * 16u + w.lane]; }
+__device__ __forceinline__ static int ef_wq(const EfW& w, uint32_t k0) { return (int)(w.q + k0 * 16u)[w.lane]; }
 __device__ __forceinline__ static int ef_wq4(const EfW& w, uint32_t ka, uint32_t kb, uint32_t kc, uint32_t kd, uint32_t n) {
   const uint32_t g = w.lane >> 4, k = g == 0 ? ka : g == 1 ? kb : g == 2 ? kc : kd;
-  const int v = (int)((ef_wgu32*)ef_wq_raw)[k * 16u + (w.lane & 15u)];
+  const int v = (int)w.q[k * 16u + (w.lane & 15u)];
   return g < n ? v : 0;
 }
 // 4 links (slots s0..s0+3) x 4 point tiles: unsigned bytes, i32 accumulation
@@ -111,6 +117,8 @@ __device__ __forceinline__ static FpExt ef_wfin(const EfW& w, const ef_v4i* d, u
 }
 #else
 #define EF_WSETUP
+// smem_hip.py's LogUp alias words (gfx12 variant) when the WMMA staging is compiled out (EF_NO_WMMA)
+__shared__ uint32_t ef_wlds[15u * EF_THREADS];
 #endif
 '''
 
