@@ -50,6 +50,9 @@ namespace cuda { namespace std { using ::std::array; } }
 #include <vector>
 #include <cstdlib>
 #include <map>
+#ifdef __HIPCC__
+#include <hipcub/hipcub.hpp>
+#endif
 
 // Async recursion witgen (off by default on Windows: see recAsync; kill switch
 // RISC0_CUDA_REC_WITGEN=0 restores the synchronous path): the witgen uploads and the accum's initial ones go on the context's stream
@@ -213,6 +216,296 @@ __global__ void parStepExec(ExecContext* ctx) {
   }
 }
 
+#ifdef __HIPCC__
+// Parallel exec in chain order (ROCm; see RISC0_HIP_REC_SORT below). In parStepExec a wave covers
+// 32 consecutive cycles: the thread of each chain head runs its whole chain (the following cycles
+// that are not parallel-safe: Poseidon2 and checked-bytes rows, up to 15 of them; longer ones run
+// on the host) while the other lanes, mostly one-row micro/macro ops or chain rows, idle, and the
+// rows of one wave take different step_exec arms. parStepExecPerm runs the same rows from a
+// permutation that groups the heads by chain length (longest first), by the arms of the head and
+// of its first chain row and by the head's micro opcodes or macro sub-op (recRowClass), so each
+// wave runs one kind of chain or op in lockstep; the rows that are not heads come last and return
+// at once. The rows are independent (that is what parallel-safe means; the unsorted kernel's waves
+// also run in any order), so the witness is the same. Per segment (fib 1M succinct, lift + join)
+// 7.6 -> 3.8 ms on an RX 7900 XTX, 9.5 -> 6.4 ms on an RX 9070 XT, the sort included.
+constexpr uint32_t kRecSortBits = 26;
+constexpr uint32_t kRecNotHead = (1u << kRecSortBits) - 1;
+
+// RISC0_HIP_REC_SORT: the launches that run their rows in sorted order, a bit mask (default 7): 1
+// parStepExec (chain order), 2 the accum kernels and 4 parStepVerifyWom (arm order); 0 turns them
+// all off.
+static uint32_t recSortMask() {
+  static const uint32_t mask = [] {
+    const char* e = std::getenv("RISC0_HIP_REC_SORT");
+    return e ? uint32_t(std::strtoul(e, nullptr, 10)) : 7u;
+  }();
+  return mask;
+}
+
+static bool recSort() {
+  return recSortMask() & 1;
+}
+
+static bool recAccumSort() {
+  return recSortMask() & 2;
+}
+
+static bool recVerifyWomSort() {
+  return recSortMask() & 4;
+}
+
+__device__ inline uint32_t recArm(const Fp* ctrl, size_t steps, uint32_t cycle) {
+  uint32_t arm = 0;
+  for (uint32_t k = 1; k <= 7; k++)
+    arm = ctrl[k * steps + cycle] != 0 ? k : arm;
+  return arm;
+}
+
+// The step arm (bits 12..14) and the branch within it (bits 0..11) that a row's step takes: for a
+// micro-op row its three opcodes (ctrl columns 8, 12, 16), for a macro-op row which of its nine
+// sub-op flags (columns 9..17) is set.
+__device__ inline uint32_t recRowClass(const Fp* ctrl, size_t steps, uint32_t cycle) {
+  uint32_t arm = recArm(ctrl, steps, cycle), sub = 0;
+  if (arm == 1) {
+    for (uint32_t k = 0; k < 3; k++)
+      sub = (sub << 4) | min(ctrl[(8 + 4 * k) * steps + cycle].asUInt32(), 15u);
+  } else if (arm == 2) {
+    for (uint32_t k = 0; k < 9; k++)
+      sub = ctrl[(9 + k) * steps + cycle] != 0 ? k + 1 : sub;
+  }
+  return (arm << 12) | sub;
+}
+
+__global__ void recExecKeys(ExecContext* ctx, uint32_t* keys, uint32_t* vals) {
+  uint32_t c = blockDim.x * blockIdx.x + threadIdx.x;
+  uint32_t n = ctx->trace->numCycles;
+  if (c >= n) return;
+  const PreflightCycle* cy = ctx->trace->cycles;
+  uint32_t ps = cy[c].isParSafe;
+  uint32_t key = kRecNotHead;
+  if ((c == 0 || ps != 0) && ps != 2) {
+    uint32_t len = 0;
+    while (c + 1 + len < n && len < 255 && cy[c + 1 + len].isParSafe == 0)
+      len++;
+    const Fp* ctrl = ctx->buffers.ctrl;
+    size_t steps = ctx->totalCycles;
+    uint32_t arm1 = len ? recArm(ctrl, steps, c + 1) : 0;
+    key = ((255 - len) << 18) | (arm1 << 15) | recRowClass(ctrl, steps, c);
+  }
+  keys[c] = key;
+  vals[c] = c;
+}
+
+__global__ void parStepExecPerm(ExecContext* ctx, const uint32_t* perm) {
+  uint32_t i = blockDim.x * blockIdx.x + threadIdx.x;
+  uint32_t count = ctx->trace->numCycles;
+  if (i < count) {
+    uint32_t cycle = perm[i];
+    if (ctx->trace->cycles[cycle].isParSafe != 2)
+      nextStepExec(ctx, cycle, count);
+  }
+}
+
+// Device buffers of the sorted launches: keys and values (double-buffered, cap each) and hipcub's
+// temporary storage. Per thread, like g_recThrustAlloc: reused only by later sorts on the same
+// thread, which run on the same stream (RecStream) after the kernels that read the previous
+// permutation.
+struct RecSortBufs {
+  uint32_t* buf = nullptr;
+  size_t cap = 0;
+  void* temp = nullptr;
+  size_t tempBytes = 0;
+#ifndef _WIN32
+  // Freed at thread exit, like g_execCache (see ~CachedExecBuffers).
+  ~RecSortBufs() {
+    cudaFree(buf);
+    cudaFree(temp);
+  }
+#endif
+};
+static thread_local RecSortBufs g_recSort;
+
+// Room for n keys and values; returns the first key array (the values start at 2 * cap).
+static uint32_t* recSortKeys(uint32_t n) {
+  RecSortBufs& b = g_recSort;
+  if (n > b.cap) {
+    if (b.buf) CUDA_OK(cudaFree(b.buf));
+    b.cap = n + n / 4;
+    CUDA_OK(cudaMalloc(&b.buf, b.cap * 4 * sizeof(uint32_t)));
+  }
+  return b.buf;
+}
+
+// Sorts the n (key, value) pairs written at recSortKeys(n) by key bits [0, endBit); returns the
+// values (device; valid until the next sort on this thread).
+static const uint32_t* recSortPairs(cudaStream_t stream, uint32_t n, int endBit) {
+  RecSortBufs& b = g_recSort;
+  hipcub::DoubleBuffer<uint32_t> keys(b.buf, b.buf + b.cap), vals(b.buf + 2 * b.cap, b.buf + 3 * b.cap);
+  size_t need = 0;
+  CUDA_OK(hipcub::DeviceRadixSort::SortPairs(nullptr, need, keys, vals, int(n), 0, endBit, stream));
+  if (need > b.tempBytes) {
+    if (b.temp) CUDA_OK(cudaFree(b.temp));
+    b.tempBytes = need + need / 4;
+    CUDA_OK(cudaMalloc(&b.temp, b.tempBytes));
+  }
+  CUDA_OK(hipcub::DeviceRadixSort::SortPairs(b.temp, need, keys, vals, int(n), 0, endBit, stream));
+  return vals.Current();
+}
+
+// The cycles [0, n) in chain order.
+static const uint32_t* recSortedCycles(cudaStream_t stream, ExecContext* ctx, uint32_t n,
+                                       const LaunchConfig& cfg) {
+  uint32_t* k = recSortKeys(n);
+  recExecKeys<<<cfg.grid, cfg.block, 0, stream>>>(ctx, k, k + 2 * g_recSort.cap);
+  return recSortPairs(stream, n, kRecSortBits);
+}
+
+// Rows of the one-step-per-row kernels (parStepComputeAccumInl / parStepVerifyAccumInl,
+// parStepVerifyWom; independent rows) in a permutation that groups the rows of each
+// 2^kRecAccumWin-row window by recRowClass, so a wave takes fewer branches while its rows stay
+// close in the trace. Per segment (fib 1M succinct): accum compute + verify 3.4 -> 1.5 ms (RX 7900
+// XTX) and 3.6 -> 1.5 ms (RX 9070 XT), parStepVerifyWom 1.0 -> 0.7 and 1.1 -> 0.7 ms, plus
+// ~0.1 ms of recAccumKeys and the sorts.
+constexpr uint32_t kRecAccumWin = 10;
+
+__global__ void recAccumKeys(const Fp* ctrl, uint32_t steps, uint32_t n, uint32_t* keys, uint32_t* vals) {
+  uint32_t c = blockDim.x * blockIdx.x + threadIdx.x;
+  if (c >= n) return;
+  keys[c] = ((c >> kRecAccumWin) << 15) | recRowClass(ctrl, steps, c);
+  vals[c] = c;
+}
+
+static const uint32_t* recAccumPerm(cudaStream_t stream, const Fp* ctrl, uint32_t steps, uint32_t n) {
+  uint32_t* k = recSortKeys(n);
+  recAccumKeys<<<(n + 255) / 256, 256, 0, stream>>>(ctrl, steps, n, k, k + 2 * g_recSort.cap);
+  int endBit = 15;
+  while (endBit < 32 && ((uint64_t(n - 1) >> kRecAccumWin) >> (endBit - 15)) != 0)
+    endBit++;
+  return recSortPairs(stream, n, endBit);
+}
+
+// verifyWom's sort of the WOM argument rows (ROCm; RISC0_HIP_REC_WOMSORT=0 turns it off). There
+// thrust::sort of the 20-byte rows is a merge sort: 2.6 / 3.3 ms per segment (fib 1M succinct) on
+// an RX 7900 XTX / RX 9070 XT, ~0.55 / ~0.85 ms with this. Its output is the unique ascending
+// order of the rows' (addr, value) words as compared by operator< (all five as asUInt32).
+// recWomSort makes the same array from a radix sort by the first word only: a stable sort of
+// (addr.asUInt32(), index) pairs and a gather. The rows of an address then stay in their original
+// order, which is already their sorted order when they are all equal: in a valid trace an address
+// holds the one value it was written with, and the unused rows all are the kInvalidPattern row.
+// The gather flags each row that is out of order (it compares each row with its predecessor), and
+// recWomFix sorts the rows of those addresses by the whole tuple, so the result is thrust's for
+// any rows (checked bit for bit against thrust::sort on random rows, with and without addresses
+// that hold several values).
+static bool recWomSortOn() {
+  static const bool on = [] {
+    const char* e = std::getenv("RISC0_HIP_REC_WOMSORT");
+    return !(e && e[0] == '0');
+  }();
+  return on;
+}
+
+__global__ void recWomKeys(const WomArgumentRow* rows, uint32_t n, WomArgumentRow* copy, uint32_t* keys,
+                           uint32_t* vals) {
+  uint32_t i = blockDim.x * blockIdx.x + threadIdx.x;
+  if (i >= n) return;
+  WomArgumentRow r = rows[i];
+  copy[i] = r;
+  keys[i] = r.addr.asUInt32();
+  vals[i] = i;
+}
+
+__global__ void recWomGather(const WomArgumentRow* copy, const uint32_t* perm, uint32_t n, WomArgumentRow* rows,
+                             uint32_t* flags, uint32_t* unsorted) {
+  uint32_t j = blockDim.x * blockIdx.x + threadIdx.x;
+  if (j >= n) return;
+  WomArgumentRow r = copy[perm[j]];
+  rows[j] = r;
+  bool out = j > 0 && r < copy[perm[j - 1]];
+  flags[j] = out;
+  if (out)
+    atomicAdd(unsorted, 1u);
+}
+
+__device__ inline void recWomSwap(WomArgumentRow* a, uint32_t i, uint32_t j) {
+  WomArgumentRow t = a[i];
+  a[i] = a[j];
+  a[j] = t;
+}
+
+__device__ void recWomSift(WomArgumentRow* a, uint32_t root, uint32_t end) {
+  for (;;) {
+    uint32_t child = 2 * root + 1;
+    if (child >= end) return;
+    if (child + 1 < end && a[child] < a[child + 1]) child++;
+    if (!(a[root] < a[child])) return;
+    recWomSwap(a, root, child);
+    root = child;
+  }
+}
+
+// Only does work when the gather flagged rows (never for a valid trace): the thread of a flagged
+// row finds the first row of its address (whose flag is 0: it is greater than its predecessor),
+// and the one that claims it heap-sorts that address's rows. The rows it permutes all have the
+// same addr.asUInt32(), which is all the other threads read of them.
+__global__ void recWomFix(WomArgumentRow* rows, uint32_t n, uint32_t* flags, const uint32_t* unsorted) {
+  uint32_t j = blockDim.x * blockIdx.x + threadIdx.x;
+  if (*unsorted == 0 || j >= n || flags[j] != 1) return;
+  uint32_t key = rows[j].addr.asUInt32();
+  uint32_t s = j;
+  while (s > 0 && rows[s - 1].addr.asUInt32() == key)
+    s--;
+  if (atomicCAS(&flags[s], 0u, 2u) != 0) return;
+  uint32_t e = j + 1;
+  while (e < n && rows[e].addr.asUInt32() == key)
+    e++;
+  WomArgumentRow* a = rows + s;
+  uint32_t m = e - s;
+  for (uint32_t i = m / 2; i-- > 0;)
+    recWomSift(a, i, m);
+  for (uint32_t end = m - 1; end > 0; end--) {
+    recWomSwap(a, 0, end);
+    recWomSift(a, 0, end);
+  }
+}
+
+// recWomSort's buffers: a copy of the rows, and cap flags followed by the unsorted count (per
+// thread, like g_recSort).
+struct RecWomSortBufs {
+  WomArgumentRow* copy = nullptr;
+  uint32_t* flags = nullptr;
+  size_t cap = 0;
+#ifndef _WIN32
+  ~RecWomSortBufs() {
+    cudaFree(copy);
+    cudaFree(flags);
+  }
+#endif
+};
+static thread_local RecWomSortBufs g_recWomSort;
+
+// rows[0, n) sorted as thrust::sort sorts them, on `stream`.
+static void recWomSort(cudaStream_t stream, WomArgumentRow* rows, uint32_t n) {
+  RecWomSortBufs& b = g_recWomSort;
+  if (n > b.cap) {
+    if (b.copy) CUDA_OK(cudaFree(b.copy));
+    if (b.flags) CUDA_OK(cudaFree(b.flags));
+    b.cap = n + n / 4;
+    CUDA_OK(cudaMalloc(&b.copy, b.cap * sizeof(WomArgumentRow)));
+    CUDA_OK(cudaMalloc(&b.flags, (b.cap + 1) * sizeof(uint32_t)));
+  }
+  WomArgumentRow* copy = b.copy;
+  uint32_t* flags = b.flags;
+  uint32_t* unsorted = flags + b.cap;
+  uint32_t* k = recSortKeys(n);
+  uint32_t grid = (n + 255) / 256;
+  recWomKeys<<<grid, 256, 0, stream>>>(rows, n, copy, k, k + 2 * g_recSort.cap);
+  const uint32_t* perm = recSortPairs(stream, n, 31);  // asUInt32() < P < 2^31
+  CUDA_OK(cudaMemsetAsync(unsorted, 0, sizeof(uint32_t), stream));
+  recWomGather<<<grid, 256, 0, stream>>>(copy, perm, n, rows, flags, unsorted);
+  recWomFix<<<grid, 256, 0, stream>>>(rows, n, flags, unsorted);
+}
+#endif
+
 // Rows of sequential chains executed on the host (see risc0_circuit_recursion_cpu_chains).
 struct HostChains {
   const uint32_t* heads;    // chain head cycles
@@ -301,6 +594,20 @@ __global__ void parStepVerifyWom(ExecContext* ctx) {
   }
 }
 
+#ifdef __HIPCC__
+// parStepVerifyWom over the cycles in perm's order (recAccumPerm: each window's cycles grouped by
+// step arm); the cycles are independent.
+__global__ void parStepVerifyWomPerm(ExecContext* ctx, const uint32_t* perm) {
+  uint32_t i = blockDim.x * blockIdx.x + threadIdx.x;
+  uint32_t count = ctx->trace->numCycles;
+  if (i < count) {
+    uint32_t cycle = perm[i];
+    Fp* args[3]{ctx->buffers.ctrl, ctx->buffers.global, ctx->buffers.data};
+    step_verify_mem(ctx, ctx->totalCycles, cycle, args[0], args[1], args[2], nullptr, nullptr);
+  }
+}
+#endif
+
 __global__ void fwdStepVerifyWom(ExecContext* ctx) {
   uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x;
   uint32_t count = ctx->trace->numCycles;
@@ -315,6 +622,10 @@ __global__ void fwdStepVerifyWom(ExecContext* ctx) {
 
 void risc0_recursion_launch_accum_inl(int verify, unsigned grid, unsigned block, cudaStream_t stream,
                                       AccumContext* ctx);
+#ifdef __HIPCC__
+void risc0_recursion_launch_accum_inl_perm(int verify, unsigned grid, unsigned block, cudaStream_t stream,
+                                           AccumContext* ctx, const uint32_t* perm);  // accum_inl.cu
+#endif
 // accum_inl.cu: the accum steps force-inlined into the kernels, and eval_check split into
 // standalone kernels (ffi_supra.cu): on unless RISC0_CUDA_REC_KERNELS=0. The switch selects
 // kernels, not sources: with it off, parStepComputeAccum / parStepVerifyAccum still run the
@@ -471,6 +782,11 @@ struct HostExecContext {
   LaunchConfig cfg;
   // ctx->trace->numCycles, kept on the host: ctx is managed memory (see verifyWom).
   uint32_t numCycles;
+#ifdef __HIPCC__
+  // For recAccumPerm (host copies, like numCycles).
+  const Fp* ctrlBuf = nullptr;
+  uint32_t steps = 0;
+#endif
 
   HostExecContext(ExecBuffers* buffers, PreflightTrace* trace, size_t totalCycles)
       : cfg(getSimpleConfig(trace->numCycles)), numCycles(trace->numCycles) {
@@ -481,6 +797,10 @@ struct HostExecContext {
     ctx->buffers.data = buffers->data;
     ctx->buffers.global = buffers->global;
     ctx->totalCycles = totalCycles;
+#ifdef __HIPCC__
+    ctrlBuf = buffers->ctrl;
+    steps = totalCycles;
+#endif
 
     ctx->trace = g_execCache.trace;
     ctx->trace->numWoms = trace->numWoms;
@@ -566,6 +886,13 @@ struct HostExecContext {
     nvtx3::scoped_range range("stepExec");
     switch (mode) {
     case kStepModeParallel: {
+#ifdef __HIPCC__
+      if (recSort() && numCycles > 1) {
+        const uint32_t* perm = recSortedCycles(stream, ctx, numCycles, cfg);
+        parStepExecPerm<<<cfg.grid, cfg.block, 0, stream>>>(ctx, perm);
+        break;
+      }
+#endif
       parStepExec<<<cfg.grid, cfg.block, 0, stream>>>(ctx);
     } break;
     case kStepModeSeqForward: {
@@ -601,6 +928,11 @@ struct HostExecContext {
 #endif
       {
         nvtx3::scoped_range range("sortWom");
+#ifdef __HIPCC__
+        if (recWomSortOn())
+          recWomSort(stream, womRows, numCycles * kMaxWomRowsPerCycle);
+        else
+#endif
         thrust::sort(policy, womRows, womRows + numCycles * kMaxWomRowsPerCycle);
       }
       {
@@ -629,6 +961,12 @@ struct HostExecContext {
 
     {
       nvtx3::scoped_range range("stepVerifyWom");
+#ifdef __HIPCC__
+      if (recVerifyWomSort() && numCycles > 1) {
+        const uint32_t* perm = recAccumPerm(stream, ctrlBuf, steps, numCycles);
+        parStepVerifyWomPerm<<<cfg.grid, cfg.block, 0, stream>>>(ctx, perm);
+      } else
+#endif
       parStepVerifyWom<<<cfg.grid, cfg.block, 0, stream>>>(ctx);
       CUDA_OK(cudaStreamSynchronize(stream));
     }
@@ -753,6 +1091,11 @@ struct HostAccumContext {
   // ctx->workCycles, kept on the host: ctx is managed memory, which the host must not touch while
   // the steps may run (see syncSteps).
   uint32_t workCycles;
+#ifdef __HIPCC__
+  // For recAccumPerm (host copies, like workCycles).
+  const Fp* ctrlBuf = nullptr;
+  uint32_t steps = 0;
+#endif
 
   HostAccumContext(AccumBuffers* buffers, size_t workCycles, size_t totalCycles)
       : cfg(getSimpleConfig(workCycles)), workCycles(workCycles) {
@@ -763,6 +1106,10 @@ struct HostAccumContext {
     ctx->buffers.global = buffers->global;
     ctx->buffers.data = buffers->data;
     ctx->buffers.mix = buffers->mix;
+#ifdef __HIPCC__
+    ctrlBuf = buffers->ctrl;
+    steps = totalCycles;
+#endif
     ctx->buffers.accum = buffers->accum;
     ctx->totalCycles = totalCycles;
     ctx->workCycles = workCycles;
@@ -805,6 +1152,14 @@ struct HostAccumContext {
   void computeAccum() {
     nvtx3::scoped_range range("computeAccum");
     if (accumInl()) {
+#ifdef __HIPCC__
+      if (recAccumSort() && workCycles > 1) {
+        // Made again for the verify pass (cheap), so that it does not depend on the buffer's
+        // lifetime between the two calls.
+        const uint32_t* perm = recAccumPerm(stream, ctrlBuf, steps, workCycles);
+        risc0_recursion_launch_accum_inl_perm(0, cfg.grid.x, cfg.block.x, stream, ctx, perm);
+      } else
+#endif
       risc0_recursion_launch_accum_inl(0, cfg.grid.x, cfg.block.x, stream, ctx);
     } else
     parStepComputeAccum<<<cfg.grid, cfg.block, 0, stream>>>(ctx);
@@ -863,6 +1218,14 @@ struct HostAccumContext {
     if (syncSteps())
       CUDA_OK(cudaDeviceSynchronize());
     if (accumInl()) {
+#ifdef __HIPCC__
+      if (recAccumSort() && workCycles > 1) {
+        // Made again for the verify pass (cheap), so that it does not depend on the buffer's
+        // lifetime between the two calls.
+        const uint32_t* perm = recAccumPerm(stream, ctrlBuf, steps, workCycles);
+        risc0_recursion_launch_accum_inl_perm(1, cfg.grid.x, cfg.block.x, stream, ctx, perm);
+      } else
+#endif
       risc0_recursion_launch_accum_inl(1, cfg.grid.x, cfg.block.x, stream, ctx);
     } else
     parStepVerifyAccum<<<cfg.grid, cfg.block, 0, stream>>>(ctx);
@@ -919,6 +1282,15 @@ const char* risc0_circuit_recursion_cuda_warmup() {
     CUDA_OK(cudaFuncGetAttributes(&attr, scatterHostChains));
     CUDA_OK(cudaFuncGetAttributes(&attr, parStepComputeAccum));
     CUDA_OK(cudaFuncGetAttributes(&attr, parStepVerifyAccum));
+#ifdef __HIPCC__
+    CUDA_OK(cudaFuncGetAttributes(&attr, recExecKeys));
+    CUDA_OK(cudaFuncGetAttributes(&attr, parStepExecPerm));
+    CUDA_OK(cudaFuncGetAttributes(&attr, recAccumKeys));
+    CUDA_OK(cudaFuncGetAttributes(&attr, recWomKeys));
+    CUDA_OK(cudaFuncGetAttributes(&attr, recWomGather));
+    CUDA_OK(cudaFuncGetAttributes(&attr, recWomFix));
+    CUDA_OK(cudaFuncGetAttributes(&attr, parStepVerifyWomPerm));
+#endif
 #ifdef REC_ASYNC_AVAILABLE
     if (recAsync()) {
       // The first parStepExec launch paid ~4 ms growing the context's local-memory

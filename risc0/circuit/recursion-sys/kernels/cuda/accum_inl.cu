@@ -48,6 +48,35 @@ __global__ void ACCUM_INL_BOUNDS parStepVerifyAccumInl(AccumContext* ctx) {
   }
 }
 
+#ifdef __HIPCC__
+// The same kernels over the rows in perm's order (ffi.cu's recAccumPerm: the rows of each window
+// grouped by step arm, so a wave takes fewer arms); the rows are independent.
+__global__ void ACCUM_INL_BOUNDS parStepComputeAccumInlPerm(AccumContext* ctx, const uint32_t* perm) {
+  uint32_t i = blockDim.x * blockIdx.x + threadIdx.x;
+  if (i < ctx->workCycles) {
+    step_compute_accum_inl(ctx, ctx->totalCycles, perm[i], ctx->buffers.ctrl, ctx->buffers.global,
+                           ctx->buffers.data, ctx->buffers.mix, ctx->buffers.accum);
+  }
+}
+
+__global__ void ACCUM_INL_BOUNDS parStepVerifyAccumInlPerm(AccumContext* ctx, const uint32_t* perm) {
+  uint32_t i = blockDim.x * blockIdx.x + threadIdx.x;
+  if (i < ctx->workCycles) {
+    step_verify_accum_inl(ctx, ctx->totalCycles, perm[i], ctx->buffers.ctrl, ctx->buffers.global,
+                          ctx->buffers.data, ctx->buffers.mix, ctx->buffers.accum);
+  }
+}
+
+void risc0_recursion_launch_accum_inl_perm(int verify, unsigned grid, unsigned block, cudaStream_t stream,
+                                           AccumContext* ctx, const uint32_t* perm) {
+  if (verify) {
+    parStepVerifyAccumInlPerm<<<grid, block, 0, stream>>>(ctx, perm);
+  } else {
+    parStepComputeAccumInlPerm<<<grid, block, 0, stream>>>(ctx, perm);
+  }
+}
+#endif
+
 void risc0_recursion_launch_accum_inl(int verify, unsigned grid, unsigned block, cudaStream_t stream,
                                       AccumContext* ctx) {
   if (verify) {
@@ -61,7 +90,11 @@ void risc0_recursion_launch_accum_inl(int verify, unsigned grid, unsigned block,
 // memory size, so the caller can pre-grow the context's stack reservation.
 size_t risc0_recursion_accum_inl_warmup() {
   size_t need = 0;
-  for (const void* f : {(const void*)parStepComputeAccumInl, (const void*)parStepVerifyAccumInl}) {
+  for (const void* f : {(const void*)parStepComputeAccumInl, (const void*)parStepVerifyAccumInl
+#ifdef __HIPCC__
+                        , (const void*)parStepComputeAccumInlPerm, (const void*)parStepVerifyAccumInlPerm
+#endif
+                       }) {
     cudaFuncAttributes attr;
     CUDA_OK(cudaFuncGetAttributes(&attr, f));
     need = attr.localSizeBytes > need ? attr.localSizeBytes : need;

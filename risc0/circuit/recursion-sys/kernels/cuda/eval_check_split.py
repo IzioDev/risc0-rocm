@@ -38,6 +38,7 @@ import os, re, sys
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ec_lazyredc
+import ec_lazyfp
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, 'eval_check_split.cu')
@@ -300,6 +301,23 @@ for part, name in EC_MUL_PARTS.items():
     new = (new[:i] + '#ifdef __HIPCC__\nnamespace %s {\n#endif\n' % name + new[i:j] +
            '#ifdef __HIPCC__\n} // namespace %s\nusing %s::poly_fp_part%d;\n#endif\n' % (name, name, part) +
            new[j:])
+
+# HIP (RDNA) only: per part and architecture, the measured faster of ec_lazyfp.py's forms (uniform
+# trace addressing 'col'; lazy Fp sums of products 'lz1'/'lz2'), each under
+# `#if defined(__HIP_DEVICE_COMPILE__) && defined(__GFX1x__)` with the unchanged body as the #else
+# branch (so the CUDA build sees the same tokens). Per call, po2 18, median of 3 interleaved
+# harness runs, bit-identical check output: gfx1100 part 0 3275 -> 3162 us (col), part 1 3013 ->
+# 2739 (lz2), part 2 1727 -> 1410 (lz1); gfx1201 part 4 3040 -> 2909 (lz1); all six parts, 4
+# interleaved runs: RX 7900 XTX 15.69 -> 14.86 ms, RX 9070 XT 17.40 -> 16.94 ms. Every other
+# part/arch pair was slower with each form (the forms cut VALU work 10-25% but change the part's
+# register allocation, 216 VGPRs with the maxocc scheduler); re-measure before changing this.
+EC_VARIANTS = {0: {'gfx11': 'col'}, 1: {'gfx11': 'lz2'}, 2: {'gfx11': 'lz1'}, 4: {'gfx12': 'lz1'}}
+EC_VARIANTS_EXPECT = {'col': 268, 'lz2_prod': 1093, 'lz2_fin': 562, 'lz1_prod': 1167, 'lz1_fin': 727}
+new, vcounts = ec_lazyfp.select(new, EC_VARIANTS)
+if vcounts != EC_VARIANTS_EXPECT:
+    sys.exit('eval_check_split: ec_lazyfp counts %s != %s (input changed: re-validate the variants '
+             'with the harness, then update EC_VARIANTS_EXPECT)' % (vcounts, EC_VARIANTS_EXPECT))
+STATS += '; HIP variants: %s' % ', '.join('%s %d' % kv for kv in sorted(vcounts.items()))
 
 try:
     cur = open(OUT, newline='').read()
