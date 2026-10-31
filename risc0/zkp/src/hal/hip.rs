@@ -230,8 +230,8 @@ pub fn auto_configure_hw_queues() {
         // kernels (stepVerifyWom, the accum passes) each waited ~110 us for an allocation. A
         // limit of 4 KiB/lane keeps those retained (at most that much per hardware queue, within
         // ROCr's pool limits); the rv32im and keccak witgen kernels (4.5-78 KB/lane) stay
-        // use-once.
-        if std::env::var("HSA_SCRATCH_SINGLE_LIMIT").is_err() {
+        // use-once. RDNA3 only: on an RX 9070 XT it made fib 1M succinct ~0.2 s slower.
+        if queues == "8" && std::env::var("HSA_SCRATCH_SINGLE_LIMIT").is_err() {
             if let Some(slots) = visible.iter().map(|g| g.2).max().filter(|&s| s > 0) {
                 let limit = slots * 32 * 4096;
                 tracing::info!("Auto-setting HSA_SCRATCH_SINGLE_LIMIT={limit}");
