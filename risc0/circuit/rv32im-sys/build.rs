@@ -609,8 +609,10 @@ fn build_rocm_kernels() {
         // the fastest at po2 20 on both an RX 7900 XTX and an RX 9070 XT (3 and 5 within 2%,
         // 32-wide waves 5-20% slower). On the previous kernel, ROCm 7.2 miscompiled EF_MINB 8:
         // nearly every call after the first few returned wrong values (5, 6 and 10 were correct
-        // in 300 calls each).
-        eval_check_flags.extend(["-mwavefrontsize64", "-DEF_MINB=4"]);
+        // in 300 calls each). gfx11 runs 3 (EF_MINB_GFX11: 252 VGPRs, less scratch spilling) since
+        // the inlined kernel with pmlag_hip.py: ~115.7 instead of ~123.6 ms on an RX 7900 XTX (ef
+        // harness, po2 20, bit-exact); gfx12 keeps 4 (3 is ~13 ms slower on an RX 9070 XT).
+        eval_check_flags.extend(["-mwavefrontsize64", "-DEF_MINB=4", "-DEF_MINB_GFX11=3"]);
     } else {
         eval_check_flags.extend([
             "-mllvm",

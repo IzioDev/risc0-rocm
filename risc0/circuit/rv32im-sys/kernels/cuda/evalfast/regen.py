@@ -58,6 +58,12 @@ pointers read from a device table instead of passed in VGPRs); inline_hip.py
 then inlines the chain functions into the kernel (no callee-saved register
 saves at every call) and smem_hip.py moves each phase's hottest slab words to
 LDS on gfx11.
+wmma_hip.py through smem_hip.py run twice: the default (24 WMMA staging slots
+per wave, 32 LDS words per phase) and, for gfx12, 12 slots and 16 LDS words
+(smem_hip.py's LDS words on gfx12 too); pmlag_hip.py then lags the scalar
+links' constant loads in the default (gfx11). archsel_hip.py merges the outputs,
+the runs of lines that differ under #if defined(__GFX12__), and checks that
+each side selects back its input.
 
 The results are committed, so the GPU builds need no Python. Re-run this after
 changing the generated circuit (kernels/cxx/rust_poly_fp_*.cpp) or any of the
@@ -72,9 +78,11 @@ import tempfile
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import archsel_hip  # noqa: E402
 import args_hip  # noqa: E402
 import hoist_hip  # noqa: E402
 import inline_hip  # noqa: E402
+import pmlag_hip  # noqa: E402
 import smem_hip  # noqa: E402
 import to_hip  # noqa: E402
 import wmma_hip  # noqa: E402
@@ -96,6 +104,16 @@ INLINE_EXPECT = 'inline_hip: 21 chain functions inlined, 22 opaque row indices'
 # smem_hip.py (last): on gfx11 each phase's 32 most accessed slab words in LDS.
 SMEM_EXPECT = ('smem_hip: 22 functions; gfx11 LDS words: main 32 of 85 (539 of 751 accesses), LogUp 32 of 104 '
                '(96 of 268)')
+# pmlag_hip.py (the default variant, last): on gfx11 the scalar links' constants loaded <= 4 links ahead.
+PMLAG_EXPECT = ('pmlag_hip: 22 functions, 5034 links with lagged constants (W 4)')
+# The gfx12 variant (archsel_hip.py): 12 WMMA staging slots per wave (7.5 KB of LDS per block) and
+# smem_hip.py's LDS words on gfx12 too, 16 per phase (8 KB).
+WMMA_GFX12_SLOTS = 12
+SMEM_GFX12_WORDS = 16
+WMMA_GFX12_EXPECT = ('wmma_hip: 136 of 282 chains, 4672 of 4948 Fp links on the matrix units (wmin 6, 1 x 12 slots, group 60), 0 chains without a free region')
+HOIST_GFX12_EXPECT = HOIST_EXPECT
+SMEM_GFX12_EXPECT = ('smem_hip: 22 functions; gfx11 LDS words: main 16 of 85 (334 of 751 accesses), LogUp 16 of 104 (48 of 268)')
+ARCHSEL_EXPECT = ('archsel_hip: 3735 runs of 10078 lines selected by __GFX12__')
 NS = 'namespace risc0::circuit::rv32im_v2 {'
 
 # mksub.py cut points: function, body lines, cut line, live values passed to the tail (+ input
@@ -163,7 +181,14 @@ HIP_POST_HEADER = '''//
 // statements ahead (hoist_hip.py), narrower chain-function calls (args_hip.py),
 // every chain function inlined into the kernel (inline_hip.py), with the trace
 // loads through per-32-column buffer resources (to_hip.py) and, on gfx11, the
-// hottest slab words in LDS (smem_hip.py). At po2 20 with 64-wide waves and EF_MINB
+// hottest slab words in LDS (smem_hip.py). gfx12 compiles its own variant of
+// the lines that differ (archsel_hip.py): 12 WMMA staging slots per wave and
+// 16 LDS slab words per phase (~134 instead of ~137 ms on an RX 9070 XT);
+// other targets, and the host pass, read the default: 24 slots, 32 words on
+// gfx11, where each scalar chain link's poly_mix constant is loaded at most 4
+// links ahead (pmlag_hip.py: ~123.5 instead of ~136 ms on an RX 7900 XTX, no
+// v_readlane-restored SGPR spills) and the kernel runs 3 blocks per SIMD
+// (build.rs: EF_MINB_GFX11, ~115.7 ms). At po2 20 with 64-wide waves and EF_MINB
 // 4 (build.rs): ~139 ms on an RX 7900 XTX (gfx1100) and ~137 ms on an RX 9070 XT
 // (gfx1201), against ~156 and 141 ms inlined with global loads and the scratch
 // slab, 160 and 169 ms with the chain functions called (callee-saved register
@@ -243,26 +268,44 @@ def main():
         with open(gen, newline='') as f:
             new = f.read()
     outputs = []
-    wstats = []
-    hip = wmma_hip.convert(to_hip.convert(hip), stats=wstats)
-    if wstats != [WMMA_EXPECT]:
-        sys.exit('regen: EXPECT failed: wmma_hip.py printed\n  %s\nnot\n  %s' % (wstats, WMMA_EXPECT))
-    hstats = []
-    hip = hoist_hip.convert(hip, stats=hstats)
-    if hstats != [HOIST_EXPECT]:
-        sys.exit('regen: EXPECT failed: hoist_hip.py printed\n  %s\nnot\n  %s' % (hstats, HOIST_EXPECT))
-    astats = []
-    hip = args_hip.convert(hip, stats=astats)
-    if astats != [ARGS_EXPECT]:
-        sys.exit('regen: EXPECT failed: args_hip.py printed\n  %s\nnot\n  %s' % (astats, ARGS_EXPECT))
-    istats = []
-    hip = inline_hip.convert(hip, stats=istats)
-    if istats != [INLINE_EXPECT]:
-        sys.exit('regen: EXPECT failed: inline_hip.py printed\n  %s\nnot\n  %s' % (istats, INLINE_EXPECT))
-    sstats = []
-    hip = smem_hip.convert(hip, stats=sstats)
-    if sstats != [SMEM_EXPECT]:
-        sys.exit('regen: EXPECT failed: smem_hip.py printed\n  %s\nnot\n  %s' % (sstats, SMEM_EXPECT))
+
+    def chain(hip, slots, wmma_expect, nhot, hoist_expect, smem_expect, lag):
+        wstats = []
+        hip = wmma_hip.convert(hip, slots=slots, stats=wstats)
+        if wstats != [wmma_expect]:
+            sys.exit('regen: EXPECT failed: wmma_hip.py printed\n  %s\nnot\n  %s' % (wstats, wmma_expect))
+        hstats = []
+        hip = hoist_hip.convert(hip, stats=hstats)
+        if hstats != [hoist_expect]:
+            sys.exit('regen: EXPECT failed: hoist_hip.py printed\n  %s\nnot\n  %s' % (hstats, hoist_expect))
+        astats = []
+        hip = args_hip.convert(hip, stats=astats)
+        if astats != [ARGS_EXPECT]:
+            sys.exit('regen: EXPECT failed: args_hip.py printed\n  %s\nnot\n  %s' % (astats, ARGS_EXPECT))
+        istats = []
+        hip = inline_hip.convert(hip, stats=istats)
+        if istats != [INLINE_EXPECT]:
+            sys.exit('regen: EXPECT failed: inline_hip.py printed\n  %s\nnot\n  %s' % (istats, INLINE_EXPECT))
+        sstats = []
+        hip = smem_hip.convert(hip, nmain=nhot, nlu=nhot, gfx12=True, stats=sstats)
+        if sstats != [smem_expect]:
+            sys.exit('regen: EXPECT failed: smem_hip.py printed\n  %s\nnot\n  %s' % (sstats, smem_expect))
+        if not lag:
+            return pmlag_hip.define(hip)
+        pstats = []
+        hip = pmlag_hip.convert(hip, stats=pstats)
+        if pstats != [PMLAG_EXPECT]:
+            sys.exit('regen: EXPECT failed: pmlag_hip.py printed\n  %s\nnot\n  %s' % (pstats, PMLAG_EXPECT))
+        return hip
+    hip = to_hip.convert(hip)
+    # gfx12 (RDNA4) devices compile the variant, every other target the default (archsel_hip.py).
+    default = chain(hip, 24, WMMA_EXPECT, 32, HOIST_EXPECT, SMEM_EXPECT, True)
+    variant = chain(hip, WMMA_GFX12_SLOTS, WMMA_GFX12_EXPECT, SMEM_GFX12_WORDS, HOIST_GFX12_EXPECT,
+                    SMEM_GFX12_EXPECT, False)
+    mstats = []
+    hip = archsel_hip.merge(default, variant, '__GFX12__', stats=mstats)
+    if mstats != [ARCHSEL_EXPECT]:
+        sys.exit('regen: EXPECT failed: archsel_hip.py printed\n  %s\nnot\n  %s' % (mstats, ARCHSEL_EXPECT))
     for path, text, post in ((OUT, new, POST_HEADER), (OUT_HIP, hip, HIP_POST_HEADER)):
         assert text.count(HEADER_END) == 1
         text = text.replace(HEADER_END, HEADER_END + post)

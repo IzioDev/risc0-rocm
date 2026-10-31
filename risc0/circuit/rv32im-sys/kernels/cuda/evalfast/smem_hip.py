@@ -19,8 +19,9 @@
 # __shared__ array ef_sm[N][EF_THREADS] (a block runs one phase; [word][thread] keeps the 32 lanes of
 # an LDS access on distinct banks); the other words stay in the scratch slab. With 32 words a
 # 128-thread block takes 16 KB, so 8 blocks (4 waves per SIMD, the VGPR-bound occupancy) still fit a
-# 128 KB WGP. gfx12 keeps the scratch slab: its WMMA staging (wmma_hip.py) already takes 15 KB of the
-# block's 16 KB share, and other targets were not measured. Measured on the ef harness at po2 20
+# 128 KB WGP. gfx12 keeps the scratch slab at the default 24 WMMA staging slots (wmma_hip.py: 15 KB of
+# the block's 16 KB share); with gfx12=True (regen.py's gfx12 variant: 12 slots, 16 words per phase) the
+# LDS words are used there too. Other targets were not measured. Measured on the ef harness at po2 20
 # (medians of interleaved runs, bit-exact), RX 7900 XTX: 142.7 -> 138.5 ms on the inlined kernel
 # with buffer trace loads (160.5 -> 156.3 ms with the chain functions called; 16 words 158.1).
 #
@@ -34,7 +35,7 @@ LU = {'rk_accblk', 'rv32im_v2_2', 'rv32im_v2_1', 'rv32im_v2_0'}
 ANCHOR = '#define RK_ST4(p, w0, w1, w2, w3, v)'
 
 
-def convert(s, nmain=32, nlu=32, stats=None):
+def convert(s, nmain=32, nlu=32, gfx12=False, stats=None):
     lines = s.split('\n')
     cnt = {'m': collections.Counter(), 'l': collections.Counter()}
     nfn = 0
@@ -59,9 +60,11 @@ def convert(s, nmain=32, nlu=32, stats=None):
     s = '\n'.join(lines)
     hot = {'M': [w for w, _ in cnt['m'].most_common(nmain)], 'L': [w for w, _ in cnt['l'].most_common(nlu)]}
     n = max(nmain, nlu, 1)
-    out = ['// smem_hip.py: on gfx11 the hottest slab words of each phase in LDS (ef_sm), the rest in the',
+    out = ['// smem_hip.py: on gfx11%s the hottest slab words of each phase in LDS (ef_sm), the rest in the'
+           % (' and gfx12' if gfx12 else ''),
            '// scratch slab; other targets use the slab for every word.',
-           '#if defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__)',
+           '#if defined(__HIP_DEVICE_COMPILE__) && %s' % ('(defined(__GFX11__) || defined(__GFX12__))' if gfx12
+                                                         else 'defined(__GFX11__)'),
            '#define EF_NHOT %du' % n,
            '__shared__ uint32_t ef_sm[EF_NHOT][EF_THREADS];',
            '#define EF_SMW(k) ef_sm[k][threadIdx.x]']

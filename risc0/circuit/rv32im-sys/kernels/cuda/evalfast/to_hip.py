@@ -188,6 +188,17 @@ def convert(s):
       if (s_cc_major < 0) cudaDeviceGetAttribute(&s_cc_major, cudaDevAttrComputeCapabilityMajor, getCachedDevice());
       needs_sync = s_cc_major >= 12;
 #endif''')
+    # The occupancy target of ef_eval_split per architecture (build.rs: EF_MINB 4, EF_MINB_GFX11 3).
+    sub('#ifndef EF_MINB\n#define EF_MINB 3\n#endif\n',
+        '#ifndef EF_MINB\n#define EF_MINB 3\n#endif\n'
+        '#if defined(__GFX11__) && defined(EF_MINB_GFX11)\n'
+        '// gfx11: its own occupancy target (build.rs: 3 blocks of 128 threads, 252 VGPRs).\n'
+        '#define EF_MINB_K EF_MINB_GFX11\n'
+        '#else\n'
+        '#define EF_MINB_K EF_MINB\n'
+        '#endif\n')
+    sub('__launch_bounds__(EF_THREADS, EF_MINB)\n__global__ void ef_eval_split(',
+        '__launch_bounds__(EF_THREADS, EF_MINB_K)\n__global__ void ef_eval_split(')
     return s
 
 
