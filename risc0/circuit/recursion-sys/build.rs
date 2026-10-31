@@ -507,12 +507,24 @@ fn build_rocm_kernels() {
     let obj_ext = risc0_build_kernel::object_extension();
 
     let mut obj_files = Vec::new();
+    // Group A and eval_check_split.cu use the AMDGPU iterative max-occupancy scheduler: it keeps
+    // the big unrolled kernels under the occupancy thresholds with fewer spills. Per recursion
+    // proof (gfx1100 / gfx1201): ec_part<0..5> 19.3 -> 14.9 / 27.6 -> 17.1 ms (with the bounds in
+    // eval_check_split.py), parStepComputeAccumInl+parStepVerifyAccumInl 2.36 -> 1.75 / 3.28 ->
+    // 2.05 ms, parStepExec neutral / -3%. The Group B (supra) eval code has no such kernel.
+    let mut maxocc_flags = base_flags.clone();
+    maxocc_flags.extend(["-mllvm", "-amdgpu-sched-strategy=iterative-maxocc"]);
     for (amalg_path, obj_name) in [
         (&risc0_amalg_path, "risc0_kernels_rocm"),
         (&supra_amalg_path, "supra_kernels_rocm"),
     ] {
         let obj = out_dir.join(format!("{obj_name}.{obj_ext}"));
-        risc0_build_kernel::hip_compile(&hipcc, &base_flags, amalg_path, &obj, &arches, None);
+        let flags = if obj_name == "risc0_kernels_rocm" {
+            &maxocc_flags
+        } else {
+            &base_flags
+        };
+        risc0_build_kernel::hip_compile(&hipcc, flags, amalg_path, &obj, &arches, None);
         obj_files.push(obj);
     }
 
@@ -523,7 +535,12 @@ fn build_rocm_kernels() {
         let obj_name = format!("{}.{obj_ext}", name.trim_end_matches(".cu"));
         let obj = out_dir.join(&obj_name);
         let abs = std::fs::canonicalize(cu).unwrap();
-        risc0_build_kernel::hip_compile(&hipcc, &base_flags, &abs, &obj, &arches, None);
+        let flags = if name == "eval_check_split.cu" {
+            &maxocc_flags
+        } else {
+            &base_flags
+        };
+        risc0_build_kernel::hip_compile(&hipcc, flags, &abs, &obj, &arches, None);
         obj_files.push(obj);
     }
 

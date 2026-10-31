@@ -13,13 +13,80 @@ constexpr size_t INV_RATE = 4;
 __constant__ FpExt poly_mix[158];
 
 #ifdef __HIPCC__
-// RDNA: 128-thread blocks (per po2 18 call: 21.1 vs 23.2 ms on gfx1100, 29.5 vs 32.1 ms on gfx1201).
+// RDNA: 128-thread blocks (per po2 18 call: 21.1 vs 23.2 ms on gfx1100, 29.5 vs 32.1 ms on gfx1201),
+// and at most 216 VGPRs: 7 waves per SIMD instead of 5 or 6, for a few spills, with build.rs's
+// iterative-maxocc scheduler (per call, all six parts: 20.9 -> 16.5 ms on gfx1100, 28.8 -> 18.5 ms
+// on gfx1201; 192 and 232 VGPRs were slower on both).
 constexpr uint32_t kBlock = 128;
+#define EC_PART_BOUNDS __launch_bounds__(kBlock, 1) __attribute__((amdgpu_num_vgpr(216)))
 #else
 constexpr uint32_t kBlock = 256;
+#define EC_PART_BOUNDS __launch_bounds__(kBlock, 1)
 #endif
 
 namespace risc0::circuit::recursion::cuda {
+#ifdef __HIPCC__
+namespace ec_mul_all {
+__device__ __forceinline__ uint32_t opq(uint32_t x) {
+  asm("" : "+v"(x));
+  return x;
+}
+__device__ __forceinline__ Fp operator*(Fp a, Fp b) {
+#if defined(__HIP_DEVICE_COMPILE__)
+  constexpr uint32_t P = 0x78000001u;
+  uint32_t av = *a, bv = *b;
+  int64_t t;
+  int32_t m;
+  if (__builtin_constant_p(bv) || __builtin_constant_p(av)) {
+    bool cb = __builtin_constant_p(bv);
+    uint32_t c = cb ? bv : av, x = cb ? av : bv;
+    int32_t ce = (c & 1) ? int32_t(c - P) : int32_t(c);
+    t = int64_t(int32_t(x)) * ce;
+    uint32_t lo = uint32_t(t);
+    m = int32_t(lo + (lo << 27));
+  } else {
+    t = int64_t(uint64_t(av) * bv);
+    uint32_t lo = uint32_t(t);
+    m = int32_t(opq(lo + (lo << 27)) + (lo << 31));
+  }
+  uint32_t r = uint32_t(uint64_t(t + int64_t(m) * -int64_t(P)) >> 32);
+  return Fp(__builtin_elementwise_min(r, r + P));
+#else
+  return Fp(static_cast<const bb31_base&>(a) * static_cast<const bb31_base&>(b));
+#endif
+}
+} // namespace ec_mul_all
+namespace ec_mul_gfx11 {
+__device__ __forceinline__ uint32_t opq(uint32_t x) {
+  asm("" : "+v"(x));
+  return x;
+}
+__device__ __forceinline__ Fp operator*(Fp a, Fp b) {
+#if defined(__GFX11__)
+  constexpr uint32_t P = 0x78000001u;
+  uint32_t av = *a, bv = *b;
+  int64_t t;
+  int32_t m;
+  if (__builtin_constant_p(bv) || __builtin_constant_p(av)) {
+    bool cb = __builtin_constant_p(bv);
+    uint32_t c = cb ? bv : av, x = cb ? av : bv;
+    int32_t ce = (c & 1) ? int32_t(c - P) : int32_t(c);
+    t = int64_t(int32_t(x)) * ce;
+    uint32_t lo = uint32_t(t);
+    m = int32_t(lo + (lo << 27));
+  } else {
+    t = int64_t(uint64_t(av) * bv);
+    uint32_t lo = uint32_t(t);
+    m = int32_t(opq(lo + (lo << 27)) + (lo << 31));
+  }
+  uint32_t r = uint32_t(uint64_t(t + int64_t(m) * -int64_t(P)) >> 32);
+  return Fp(__builtin_elementwise_min(r, r + P));
+#else
+  return Fp(static_cast<const bb31_base&>(a) * static_cast<const bb31_base&>(b));
+#endif
+}
+} // namespace ec_mul_gfx11
+#endif
 
 // ---- ec_lazyredc.py: lazy Montgomery accumulation of FpExt += poly_mix[k] * Fp ----
 // Canonical-input assumption: every operand is a residue in [0, P) (see the generator).
@@ -6856,6 +6923,9 @@ __device__ __forceinline__ FpExt poly_fp_part2(uint32_t idx, uint32_t size, cons
   s1 = s1 + x6152_m * x5226 * poly_mix[136];
   return s1;
 }
+#ifdef __HIPCC__
+namespace ec_mul_all {
+#endif
 __device__ __forceinline__ FpExt poly_fp_part3(uint32_t idx, uint32_t size, const Fp* ctrl, const Fp* out, const Fp* data, const Fp* mix, const Fp* accum) {
   uint32_t mask = size - 1;
   Fp x1(1);
@@ -8958,6 +9028,13 @@ __device__ __forceinline__ FpExt poly_fp_part3(uint32_t idx, uint32_t size, cons
   s1 = s1 + x8069_m * x7910 * poly_mix[138];
   return s1;
 }
+#ifdef __HIPCC__
+} // namespace ec_mul_all
+using ec_mul_all::poly_fp_part3;
+#endif
+#ifdef __HIPCC__
+namespace ec_mul_gfx11 {
+#endif
 __device__ __forceinline__ FpExt poly_fp_part4(uint32_t idx, uint32_t size, const Fp* ctrl, const Fp* out, const Fp* data, const Fp* mix, const Fp* accum) {
   uint32_t mask = size - 1;
   Fp x1(1);
@@ -10910,6 +10987,13 @@ __device__ __forceinline__ FpExt poly_fp_part4(uint32_t idx, uint32_t size, cons
   s1 = s1 + x284 * x8071 * poly_mix[147];
   return s1;
 }
+#ifdef __HIPCC__
+} // namespace ec_mul_gfx11
+using ec_mul_gfx11::poly_fp_part4;
+#endif
+#ifdef __HIPCC__
+namespace ec_mul_gfx11 {
+#endif
 __device__ __forceinline__ FpExt poly_fp_part5(uint32_t idx, uint32_t size, const Fp* ctrl, const Fp* out, const Fp* data, const Fp* mix, const Fp* accum) {
   uint32_t mask = size - 1;
   Fp x1(1);
@@ -13697,6 +13781,10 @@ __device__ __forceinline__ FpExt poly_fp_part5(uint32_t idx, uint32_t size, cons
   s1 = s1 + x12357 * x1103 * poly_mix[157];
   return s1;
 }
+#ifdef __HIPCC__
+} // namespace ec_mul_gfx11
+using ec_mul_gfx11::poly_fp_part5;
+#endif
 constexpr int kNumParts = 6;
 __device__ __forceinline__ FpExt poly_fp_part(int p, uint32_t idx, uint32_t size, const Fp* ctrl, const Fp* out, const Fp* data, const Fp* mix, const Fp* accum) {
   switch (p) {
@@ -13711,9 +13799,9 @@ __device__ __forceinline__ FpExt poly_fp_part(int p, uint32_t idx, uint32_t size
 }
 
 template <int P>
-__launch_bounds__(kBlock, 1) __global__ void ec_part(Fp* check, const Fp* ctrl, const Fp* data, const Fp* accum,
-                                                  const Fp* mix, const Fp* out, const Fp rou, uint32_t po2,
-                                                  uint32_t domain) {
+EC_PART_BOUNDS __global__ void ec_part(Fp* check, const Fp* ctrl, const Fp* data, const Fp* accum,
+                                       const Fp* mix, const Fp* out, const Fp rou, uint32_t po2,
+                                       uint32_t domain) {
   uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x;
   if (cycle >= domain) return;
   FpExt tot = poly_fp_part(P, cycle, domain, ctrl, out, data, mix, accum);

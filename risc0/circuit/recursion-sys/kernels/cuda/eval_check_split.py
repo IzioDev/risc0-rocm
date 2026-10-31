@@ -176,18 +176,23 @@ constexpr size_t INV_RATE = 4;
 __constant__ FpExt poly_mix[158];
 
 #ifdef __HIPCC__
-// RDNA: 128-thread blocks (per po2 18 call: 21.1 vs 23.2 ms on gfx1100, 29.5 vs 32.1 ms on gfx1201).
+// RDNA: 128-thread blocks (per po2 18 call: 21.1 vs 23.2 ms on gfx1100, 29.5 vs 32.1 ms on gfx1201),
+// and at most 216 VGPRs: 7 waves per SIMD instead of 5 or 6, for a few spills, with build.rs's
+// iterative-maxocc scheduler (per call, all six parts: 20.9 -> 16.5 ms on gfx1100, 28.8 -> 18.5 ms
+// on gfx1201; 192 and 232 VGPRs were slower on both).
 constexpr uint32_t kBlock = 128;
+#define EC_PART_BOUNDS __launch_bounds__(kBlock, 1) __attribute__((amdgpu_num_vgpr(216)))
 #else
 constexpr uint32_t kBlock = 256;
+#define EC_PART_BOUNDS __launch_bounds__(kBlock, 1)
 #endif
 
 namespace risc0::circuit::recursion::cuda {
 ''' + '\n' + '\n'.join(out) + '\n' + '''
 template <int P>
-__launch_bounds__(kBlock, 1) __global__ void ec_part(Fp* check, const Fp* ctrl, const Fp* data, const Fp* accum,
-                                                  const Fp* mix, const Fp* out, const Fp rou, uint32_t po2,
-                                                  uint32_t domain) {
+EC_PART_BOUNDS __global__ void ec_part(Fp* check, const Fp* ctrl, const Fp* data, const Fp* accum,
+                                       const Fp* mix, const Fp* out, const Fp rou, uint32_t po2,
+                                       uint32_t domain) {
   uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x;
   if (cycle >= domain) return;
   FpExt tot = poly_fp_part(P, cycle, domain, ctrl, out, data, mix, accum);
@@ -234,6 +239,67 @@ if counts != ec_lazyredc.EXPECT:
     sys.exit('eval_check_split: ec_lazyredc counts %s != EXPECT %s (input changed: re-validate with '
              'the lazy-REDC harness, then update ec_lazyredc.EXPECT)' % (counts, ec_lazyredc.EXPECT))
 STATS += '; lazy REDC: chain terms %d, folds %d, from %d, materialized %d' % counts
+
+# HIP (RDNA) only: a cheaper Fp product for some parts. 32-bit multiplies (v_mad_u64_u32,
+# v_mad_i64_i32, v_mul_lo_u32) issue at a quarter of the add rate; sppark's bb31_t product costs
+# three of them (a*b, m = lo * M0, + m*p), this one two, with a signed REDC: m = (int32)(t * p^-1
+# mod 2^32), p^-1 = 2^31 + 2^27 + 1, from shift-adds (an empty asm keeps LLVM from folding them
+# back into a v_mul_lo_u32), and t - m*p from one v_mad_i64_i32, whose low word is 0, so the high
+# word is the exact quotient r. For a, b in [0, p), |t| < p^2 and |r| < (p^2 + 2^31 p) / 2^32 < p,
+# and min_u32(r, r + p) maps r to [0, p): both forms return the canonical a * b * 2^-32 mod p, so
+# the result is bit-identical. A compile-time constant operand is replaced by its even
+# representative in (-p, p) (c or c - p): t is then even, lo * 2^31 == 0 mod 2^32, and m is one
+# shift-add. Only where it measured faster (each part's register allocation changes with it; per
+# call, po2 18, with the bounds and scheduler above): part 3 on gfx11 and gfx12, parts 4 and 5 on
+# gfx11 only (parts 3/4/5: 1739/2727/4018 -> 1483/2545/3627 us on an RX 7900 XTX; part 3: 1800 ->
+# 1468 us on an RX 9070 XT; the other parts, and parts 4/5 on gfx12, were slower with it). Each
+# such part is wrapped in a namespace whose operator* is found before sppark's hidden friend (an
+# exact match against a derived-to-base conversion); the CUDA build sees the same tokens as before.
+EC_MUL_PARTS = {3: 'ec_mul_all', 4: 'ec_mul_gfx11', 5: 'ec_mul_gfx11'}
+EC_MUL_NS = {'ec_mul_all': 'defined(__HIP_DEVICE_COMPILE__)', 'ec_mul_gfx11': 'defined(__GFX11__)'}
+EC_MUL_BODY = '''namespace NAME {
+__device__ __forceinline__ uint32_t opq(uint32_t x) {
+  asm("" : "+v"(x));
+  return x;
+}
+__device__ __forceinline__ Fp operator*(Fp a, Fp b) {
+#if COND
+  constexpr uint32_t P = 0x78000001u;
+  uint32_t av = *a, bv = *b;
+  int64_t t;
+  int32_t m;
+  if (__builtin_constant_p(bv) || __builtin_constant_p(av)) {
+    bool cb = __builtin_constant_p(bv);
+    uint32_t c = cb ? bv : av, x = cb ? av : bv;
+    int32_t ce = (c & 1) ? int32_t(c - P) : int32_t(c);
+    t = int64_t(int32_t(x)) * ce;
+    uint32_t lo = uint32_t(t);
+    m = int32_t(lo + (lo << 27));
+  } else {
+    t = int64_t(uint64_t(av) * bv);
+    uint32_t lo = uint32_t(t);
+    m = int32_t(opq(lo + (lo << 27)) + (lo << 31));
+  }
+  uint32_t r = uint32_t(uint64_t(t + int64_t(m) * -int64_t(P)) >> 32);
+  return Fp(__builtin_elementwise_min(r, r + P));
+#else
+  return Fp(static_cast<const bb31_base&>(a) * static_cast<const bb31_base&>(b));
+#endif
+}
+} // namespace NAME
+'''
+k = 'namespace risc0::circuit::recursion::cuda {\n'
+assert new.count(k) == 1
+new = new.replace(k, k + '#ifdef __HIPCC__\n' + ''.join(
+    EC_MUL_BODY.replace('NAME', n).replace('COND', c) for n, c in EC_MUL_NS.items()) + '#endif\n', 1)
+for part, name in EC_MUL_PARTS.items():
+    head = '__device__ __forceinline__ FpExt poly_fp_part%d(' % part
+    assert new.count(head) == 1, head
+    i = new.index(head)
+    j = new.index('\n}\n', i) + 3
+    new = (new[:i] + '#ifdef __HIPCC__\nnamespace %s {\n#endif\n' % name + new[i:j] +
+           '#ifdef __HIPCC__\n} // namespace %s\nusing %s::poly_fp_part%d;\n#endif\n' % (name, name, part) +
+           new[j:])
 
 try:
     cur = open(OUT, newline='').read()
