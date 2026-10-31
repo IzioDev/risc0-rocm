@@ -36,11 +36,13 @@
 //   canon() = min_u32(r, r + p) maps to [0, p).
 // - For even t, lo(t) * (2^27 + 1) is already t * p^-1 mod 2^32 (lo * 2^31 == 0), so products by
 //   a constant use one shift-add for m: each constant is replaced by its even representative in
-//   (-p, p) (DH_i or DH_i - p), and the partial rounds' addend a == S * 2^32 is made even as
-//   2 * sredc(st * (2^95 mod p)) (|a| < 1.48p < 2^32), with st = sredc(S) (|st| < p/2 + 12).
-// - Partial-round cells: e'_i = sredc(E_i * e_i + a) with |E_i| < p, |e_i| < p, |a| < 2^32:
-//   |e'_i| < 0.96875p + 2 < p, so |cells| < p holds for any number of rounds, by induction (the
-//   S-box cell is canonicalized before adding its round constant). |S| < 24p < 2^36.
+//   (-p, p) (DH_i or DH_i - p). The partial rounds' addend a == S * 2^32 (mod p) comes without
+//   a reduction: with S = 2^24 * c + l, l = S mod 2^24, a = l * 2^32 + c * (2^56 mod p), even
+//   (2^56 mod p is), |c| <= 2881 since |S| < 24p < 2^36, so |a| < 2^56 + 2^43.
+// - Partial-round cells: e'_i = sredc(E_i * e_i + a) with |E_i| <= 0.93p, |e_i| < p,
+//   |a| < 2^56 + 2^43: |t - m*p| < 0.93p^2 + 2^56.01 + 2^31 p < 2^63 and
+//   |e'_i| < 0.95p < p, so |cells| < p holds for any number of rounds, by induction (the S-box
+//   cell is canonicalized before adding its round constant).
 
 #pragma once
 
@@ -99,8 +101,8 @@ constexpr int32_t PV_DHE[24] = {
     985139354,   1760666932,  -1713368876, 224647294,   -656957998, -764689148,
     1866859900,  1132319062,  1622455428,  -871607094,  1242914314, -234514942,
     1178086656,  -1482974038, -1528792916, 316128532,   1581421748, 456216014};
-// 2^95 mod p (0x4579bdfe), even: sredc_even(st * PV_C95) == S * 2^31 for st == S * 2^-32.
-constexpr int32_t PV_C95 = 0x4579bdfe;
+// 2^56 mod p (even).
+constexpr int32_t PV_C56 = 0x0dddddde;
 #endif
 
 __device__ __forceinline__ uint32_t red1(uint32_t r) { // [0, 2p) -> [0, p)
@@ -188,13 +190,12 @@ __device__ __forceinline__ void full_round(uint32_t* x, int r) {
 }
 
 #ifdef __HIPCC__
-// sum_i e_i exactly for 24 values with |e_i| < 2^31: the low word wraps (v_add3_u32); the rest
-// comes from the top bytes, sum = 2^24 * tb + d with tb = sum (e_i >> 24) and d = sum (e_i mod
-// 2^24) in [0, 24 * 2^24), so d = lo - 2^24 * tb (mod 2^32) and the high word is
-// (tb + d / 2^24) >> 8. One v_perm_b32 packs two sign-extended top bytes into 16-bit lanes and
-// one v_pk_add_u16 adds them (|lane| <= 12 * 128): about 1.5 ops per term instead of 3 for a
-// sign-extended 64-bit sum.
-__device__ __forceinline__ int64_t ssum24(const int32_t* e) {
+// S = sum_i e_i for 24 values with |e_i| < 2^31, as its wrapping low word lo (v_add3_u32) and
+// tb = sum (e_i >> 24) over the sign-extended top bytes: one v_perm_b32 packs two of them into
+// int16 lanes and one v_pk_add_u16 adds them (|lane| <= 12 * 128), about 1.5 ops per term. Then
+// S = 2^24 * tb + d with d = sum (e_i mod 2^24) in [0, 24 * 2^24), so d = lo - 2^24 * tb
+// (mod 2^32) exactly, and floor(S / 2^24) = tb + (d >> 24).
+__device__ __forceinline__ void ssum24(const int32_t* e, uint32_t& lo_out, int32_t& tb_out) {
   typedef unsigned short u16x2 __attribute__((ext_vector_type(2)));
   uint32_t lo = 0;
   u16x2 hp = {0, 0};
@@ -204,10 +205,8 @@ __device__ __forceinline__ int64_t ssum24(const int32_t* e) {
     // {e[i] >> 24, e[i + 1] >> 24} as int16 lanes: bytes 3, sign(3), 7, sign(7) of {e[i+1], e[i]}.
     hp += __builtin_bit_cast(u16x2, __builtin_amdgcn_perm(uint32_t(e[i + 1]), uint32_t(e[i]), 0x0b070903u));
   }
-  int32_t tb = int32_t(int16_t(hp.x)) + int32_t(int16_t(hp.y));
-  uint32_t d = lo - (uint32_t(tb) << 24);
-  int32_t hi = (tb + int32_t(d >> 24)) >> 8;
-  return int64_t((uint64_t(uint32_t(hi)) << 32) | lo);
+  lo_out = lo;
+  tb_out = int32_t(int16_t(hp.x)) + int32_t(int16_t(hp.y));
 }
 
 // The 21 partial rounds with int32 cells in (-p, p): e'_i = sum_j e_j + DH_i * e_i * 2^-32,
@@ -220,9 +219,12 @@ __device__ __forceinline__ void partial_rounds(uint32_t* x) {
 #pragma unroll 1
   for (int r = 0; r < 21; r++) {
     e[0] = ssbox(int32_t(canon(e[0]) + (PV_RCP[r] - P)));
-    int64_t sum = ssum24(e);
-    int32_t st = sredc(sum);                                    // == S * 2^-32, |st| < p/2 + 12
-    int64_t a = int64_t(sredc_even(int64_t(st) * PV_C95)) * 2; // == S * 2^32, even, |a| < 1.48p
+    uint32_t lo;
+    int32_t tb;
+    ssum24(e, lo, tb);
+    // S = 2^24 * c + l with l = lo mod 2^24 and c = floor(S / 2^24): a = l * 2^32 + c * C56.
+    int32_t c = tb + int32_t((lo - (uint32_t(tb) << 24)) >> 24);
+    int64_t a = int64_t(uint64_t(lo & 0xffffffu) << 32) + int64_t(c) * PV_C56;
 #pragma unroll
     for (int i = 0; i < 24; i++)
       e[i] = sredc_even(int64_t(PV_DHE[i]) * e[i] + a);
@@ -298,6 +300,38 @@ __global__ __launch_bounds__(128, 6) void fold_k(uint4* out, const uint4* in, ui
   out[(size_t)gid * 2] = make_uint4(x[0], x[1], x[2], x[3]);
   out[(size_t)gid * 2 + 1] = make_uint4(x[4], x[5], x[6], x[7]);
 }
+
+#ifdef __HIPCC__
+// The top layers of a fold tree in one block, n0 <= 128 threads: layers n0, n0/2, ..., 1 of the
+// sppark_poseidon2_fold_tree layout (digests: layer of size n at [n, 2n), its inputs at [2n, 4n)).
+// Those layers are latency-bound (one permutation each), so this saves the launch gaps.
+__global__ __launch_bounds__(128) void fold_tail_k(uint4* nodes, uint32_t n0) {
+  uint32_t t = threadIdx.x;
+#pragma unroll 1
+  for (uint32_t n = n0; n >= 1; n >>= 1) {
+    if (t < n) {
+      const uint4* in = nodes + 4 * (size_t)n;
+      uint32_t x[24];
+#pragma unroll
+      for (int q = 0; q < 4; q++) {
+        uint4 v = in[(size_t)t * 4 + q];
+        x[4 * q] = v.x;
+        x[4 * q + 1] = v.y;
+        x[4 * q + 2] = v.z;
+        x[4 * q + 3] = v.w;
+      }
+#pragma unroll
+      for (int i = 16; i < 24; i++)
+        x[i] = 0;
+      permute(x);
+      uint4* out = nodes + 2 * (size_t)n;
+      out[(size_t)t * 2] = make_uint4(x[0], x[1], x[2], x[3]);
+      out[(size_t)t * 2 + 1] = make_uint4(x[4], x[5], x[6], x[7]);
+    }
+    __syncthreads();
+  }
+}
+#endif
 
 // out[r] = hash of row r of the column-major dim_x x dim_y matrix m (16 elements per absorb).
 __global__ __launch_bounds__(128, 6) void rows_k(uint4* out,

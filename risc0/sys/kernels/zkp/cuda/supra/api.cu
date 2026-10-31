@@ -33,6 +33,73 @@ static bool use_pv_kernels() {
   return true;
 #endif
 }
+
+#ifdef __HIPCC__
+// pv.cuh's kernels from their own TU (supra/pv_hip.cu, built with the max-ilp scheduler: 2-5% faster
+// on RDNA3/4), and the top layers of a fold tree in one launch (fold_tail_k).
+// RISC0_HIP_PV_TU: 0 = this file's instances (default scheduler) only, 1 = the max-ilp TU for every
+// launch, unset = auto: the max-ilp TU, except on gfx12 for launches of more than 2^19 and fewer
+// than 2^22 permutations (about 0.8-6 ms on an RX 9070 XT). After a max-ilp kernel of >= ~1.5 ms an
+// RX 9070 XT idles ~0.27 ms before the next kernel starts (power management, it seems; not after the
+// default-scheduler kernels, nor on gfx11), which costs those launches more than they gain.
+// RISC0_HIP_PV_TAIL=0: one launch per fold layer.
+void pv_hip_rows(uint4* out, const uint32_t* m, uint32_t count, uint32_t col_size, hipStream_t s);
+void pv_hip_fold(uint4* out, const uint4* in, uint32_t n, hipStream_t s);
+void pv_hip_fold_tail(uint4* nodes, uint32_t n0, hipStream_t s);
+static int env_mode(const char* name) { // 0, 1, or 2 when unset (or anything else)
+  const char* v = std::getenv(name);
+  return v && std::strcmp(v, "0") == 0 ? 0 : v && std::strcmp(v, "1") == 0 ? 1 : 2;
+}
+static bool is_gfx12() {
+  int device = 0;
+  (void)hipGetDevice(&device);
+  static int arch[16] = {}; // 0 unknown, 1 gfx12, 2 other
+  if (device < 0 || device >= 16)
+    return false;
+  if (arch[device] == 0) {
+    hipDeviceProp_t prop;
+    arch[device] = hipGetDeviceProperties(&prop, device) == hipSuccess &&
+                           std::strncmp(prop.gcnArchName, "gfx12", 5) == 0
+                       ? 1
+                       : 2;
+  }
+  return arch[device] == 1;
+}
+// Whether a launch of `perms` permutations uses the max-ilp TU.
+static bool use_pv_tu(size_t perms) {
+  static const int mode = env_mode("RISC0_HIP_PV_TU");
+  if (mode != 2)
+    return mode == 1;
+  return !(perms > (size_t(1) << 19) && perms < (size_t(1) << 22) && is_gfx12());
+}
+static bool use_pv_tail() {
+  static const bool on = env_mode("RISC0_HIP_PV_TAIL") != 0;
+  return on;
+}
+static constexpr uint32_t PV_TAIL = 128; // fold_tail_k's block size limit
+static void hip_pv_rows(uint4* out, const uint32_t* m, uint32_t count, uint32_t col_size, hipStream_t s) {
+  if (use_pv_tu(size_t(count) * ((col_size + 15) / 16))) {
+    pv_hip_rows(out, m, count, col_size, s);
+  } else {
+    uint32_t bs = count < PV_BLOCK ? count : PV_BLOCK;
+    pv::rows_k<<<(count + bs - 1) / bs, bs, 0, s>>>(out, m, count, col_size);
+  }
+}
+static void hip_pv_fold(uint4* out, const uint4* in, uint32_t n, hipStream_t s) {
+  if (use_pv_tu(n)) {
+    pv_hip_fold(out, in, n, s);
+  } else {
+    uint32_t bs = n < PV_BLOCK ? n : PV_BLOCK;
+    pv::fold_k<<<(n + bs - 1) / bs, bs, 0, s>>>(out, in, n);
+  }
+}
+static void hip_pv_fold_tail(uint4* nodes, uint32_t n0, hipStream_t s) {
+  if (use_pv_tu(n0))
+    pv_hip_fold_tail(nodes, n0, s);
+  else
+    pv::fold_tail_k<<<1, n0, 0, s>>>(nodes, n0);
+}
+#endif
 #if defined(__HIPCC__) && !defined(__HIP_DEVICE_COMPILE__)
 // HIP host pass: blst_256_t::operator[] is private, causing errors in
 // poseidon254.cuh's __device__ helpers. Provide empty __global__ kernel
@@ -135,9 +202,7 @@ sppark_poseidon2_fold(poseidon_out_t* d_out, const poseidon_in_t* d_in, size_t n
     }
 #else
     if (use_pv_kernels()) {
-      size_t bs = num_hashes < PV_BLOCK ? num_hashes : PV_BLOCK;
-      pv::fold_k<<<(num_hashes + bs - 1) / bs, bs, 0, gpu>>>(
-          (uint4*)d_out, (const uint4*)d_in, (uint32_t)num_hashes);
+      hip_pv_fold((uint4*)d_out, (const uint4*)d_in, (uint32_t)num_hashes, gpu);
     } else {
       _poseidon2_fold<<<num_blocks, block_size, 0, gpu>>>(d_out, d_in, num_hashes);
     }
@@ -178,10 +243,15 @@ sppark_poseidon2_fold_tree(poseidon_out_t* nodes, uint32_t layers) {
             (uint4*)(nodes + layer_size), (const uint4*)(nodes + 2 * layer_size), layer_size);
       }
 #else
+      if (use_pv_kernels() && use_pv_tail() && layer_size <= PV_TAIL) {
+        // This layer and all above it, in one launch.
+        hip_pv_fold_tail((uint4*)nodes, layer_size, gpu);
+        CUDA_OK(cudaGetLastError());
+        break;
+      }
       if (use_pv_kernels()) {
-        uint32_t bs = layer_size < PV_BLOCK ? layer_size : PV_BLOCK;
-        pv::fold_k<<<(layer_size + bs - 1) / bs, bs, 0, gpu>>>(
-            (uint4*)(nodes + layer_size), (const uint4*)(nodes + 2 * layer_size), layer_size);
+        hip_pv_fold((uint4*)(nodes + layer_size), (const uint4*)(nodes + 2 * layer_size),
+                    layer_size, gpu);
       } else {
         size_t block_size = layer_size < P2_BLOCK ? layer_size : P2_BLOCK;
         size_t num_blocks = layer_size < P2_BLOCK ? 1 : layer_size / P2_BLOCK;
@@ -228,9 +298,7 @@ sppark_poseidon2_rows(poseidon_out_t* d_out, const fr_t* d_in, uint32_t count, u
     }
 #else
     if (use_pv_kernels()) {
-      uint32_t bs = count < PV_BLOCK ? count : PV_BLOCK;
-      pv::rows_k<<<(count + bs - 1) / bs, bs, 0, gpu>>>(
-          (uint4*)d_out, (const uint32_t*)d_in, count, col_size);
+      hip_pv_rows((uint4*)d_out, (const uint32_t*)d_in, count, col_size, gpu);
     } else {
       _poseidon2_rows<<<num_blocks, block_size, 0, gpu>>>(d_out, d_in, count, col_size);
     }

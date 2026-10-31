@@ -133,6 +133,30 @@ fn build_rocm_kernels(cxx_root: &Path) {
         .flags(risc0_build_kernel::hip_host_flags())
         .compile("risc0_zkp_cuda");
 
+    // pv.cuh's Poseidon2 kernels in their own TU, with the ILP-first scheduler (see supra/pv_hip.cu).
+    cc::Build::new()
+        .compiler(&hipcc)
+        .cpp(true)
+        .debug(false)
+        .flag("-x")
+        .flag("hip")
+        .flag("-std=c++17")
+        .flag("-O3")
+        .flag("-Wno-unused-function")
+        .flag("-Wno-unused-parameter")
+        .flag(format!(
+            "--offload-arch={}",
+            std::env::var("RISC0_HIP_ARCH").unwrap_or_else(|_| "native".to_string())
+        ))
+        .flag("-mllvm")
+        .flag("-amdgpu-early-inline-all=false")
+        .flag("-mllvm")
+        .flag("-amdgpu-sched-strategy=max-ilp")
+        .include(cxx_root)
+        .file("kernels/zkp/cuda/supra/pv_hip.cu")
+        .flags(risc0_build_kernel::hip_host_flags())
+        .compile("risc0_zkp_cuda_pv");
+
     // Link against HIP runtime
     risc0_build_kernel::emit_rocm_lib_link();
 }
