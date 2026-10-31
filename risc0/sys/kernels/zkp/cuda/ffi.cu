@@ -37,6 +37,13 @@ __global__ void mix_poly_coeffs_v2(FpExt* __restrict__ out, const Fp* __restrict
                                    const FpExt* __restrict__ mixStart,
                                    const FpExt* __restrict__ mix, const uint32_t inputSize,
                                    const uint32_t count);
+#ifdef __HIPCC__
+__global__ void mix_poly_coeffs_v6(FpExt* __restrict__ out, const Fp* __restrict__ in,
+                                   const uint32_t* __restrict__ combos,
+                                   const FpExt* __restrict__ mixStart,
+                                   const FpExt* __restrict__ mix, const uint32_t inputSize,
+                                   const uint32_t count);
+#endif
 __global__ void gather_samples(Fp* dst, const Fp* src, const uint32_t* idxs, const uint32_t n,
                                const uint32_t size, const uint32_t stride);
 __global__ void combos_sub(FpExt* combos, const FpExt* deltas, const uint32_t* offsets,
@@ -171,6 +178,19 @@ const char* risc0_zkp_cuda_mix_poly_coeffs(FpExt* out,
                                            const uint32_t inputSize,
                                            const uint32_t count) {
   // v2 keeps the mix powers and combo ids in shared memory (20 bytes per input).
+#ifdef __HIPCC__
+  // ROCm: v6 (2 elements per thread, per-combo register accumulators; slower below 2^16 rows)
+  // unless RISC0_HIP_MIX_V6=0.
+  static const bool v6 = [] {
+    const char* e = getenv("RISC0_HIP_MIX_V6");
+    return !(e && e[0] == '0');
+  }();
+  if (v6 && inputSize <= 2048 && count >= (1u << 16) && (count % 2) == 0 &&
+      (reinterpret_cast<uintptr_t>(in) & 7) == 0) {
+    return launchKernel(mix_poly_coeffs_v6, count / 2, inputSize * (sizeof(FpExt) + sizeof(uint32_t)),
+                        out, in, combos, mixStart, mix, inputSize, count);
+  }
+#endif
   if (inputSize <= 2048) {
     return launchKernel(mix_poly_coeffs_v2, count, inputSize * (sizeof(FpExt) + sizeof(uint32_t)),
                         out, in, combos, mixStart, mix, inputSize, count);
@@ -213,7 +233,12 @@ const char* risc0_zkp_cuda_batch_evaluate_any(FpExt* out,
   }
   try {
     cudaStream_t stream = getPersistentStream();
+#ifdef __HIPCC__
+    // ROCm (lazy eu2_main): fewer, longer blocks measured ~5% faster on the rv32im data group.
+    const uint32_t targetBlocks = 512;
+#else
     const uint32_t targetBlocks = 1024;
+#endif
     uint32_t maxS = deg / minChunk;
     uint32_t S = 1;
     while (S < maxS && (uint64_t)S * nEvals < targetBlocks)

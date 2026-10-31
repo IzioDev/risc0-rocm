@@ -11,8 +11,8 @@
 // The lazy-reduction Poseidon2 kernels (pv.cuh), for CUDA and ROCm.
 #include "pv.cuh"
 #define PV_BLOCK 128
-#ifndef __HIPCC__
 #include "mdiv.cuh"
+#ifndef __HIPCC__
 // Latency-bound small levels / row counts: warp- and quad-per-permutation kernels.
 #include "pv_small.cuh"
 #endif
@@ -503,6 +503,31 @@ supra_poly_divide_multi(fr4_t* combos_base, size_t stride,
     if (s_mdiv && mdiv_supported(stride, num_combos, pows_per_combo)) {
       mdiv_run(combos_base, stride, combo_indices, pows_per_combo, all_pows, num_combos, remainders, gpu);
       return RustError{cudaSuccess};
+    }
+#else
+    // ROCm: the same fused division (mdiv.cuh), MD_MAXJ combos per mdiv_run, instead of one
+    // cooperative launch and one pageable remainder copy per root (~2.2-2.8x faster at lg 20,
+    // bit-identical; r0amd r8/L4 mdiv). On unless RISC0_HIP_MDIV=0.
+    static const bool s_mdiv = [] {
+      const char* e = std::getenv("RISC0_HIP_MDIV");
+      return !(e && e[0] == '0');
+    }();
+    if (s_mdiv) {
+      bool ok = num_combos > 0;
+      for (uint32_t g = 0; ok && g < num_combos; g += MD_MAXJ)
+        ok = mdiv_supported(stride, std::min<uint32_t>(MD_MAXJ, num_combos - g), pows_per_combo + g);
+      if (ok) {
+        size_t off = 0;
+        for (uint32_t g = 0; g < num_combos; g += MD_MAXJ) {
+          const uint32_t k = std::min<uint32_t>(MD_MAXJ, num_combos - g);
+          size_t cnt = 0;
+          for (uint32_t c = g; c < g + k; c++) cnt += pows_per_combo[c];
+          mdiv_run(combos_base, stride, combo_indices + g, pows_per_combo + g, all_pows + off, k,
+                   remainders + off, gpu);
+          off += cnt;
+        }
+        return RustError{cudaSuccess};
+      }
     }
 #endif
 #ifdef SPPARK_NO_COOPERATIVE_LAUNCH

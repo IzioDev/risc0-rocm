@@ -664,6 +664,18 @@ __global__ void injectCycleCols(Fp* data, const PreflightCycle* cycles, uint32_t
   data[size_t(cMode) * rows + row] = Fp(uint32_t(c.machineMode));
 }
 
+#ifdef __HIPCC__
+// perm (optional): the launch's cycles in the order to run them (absolute cycle numbers), see
+// witgenPerm.
+__global__ void par_stepExec(DeviceExecContext* ctx, uint32_t start, uint32_t count,
+                             const uint32_t* perm = nullptr) {
+  uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x;
+  if (cycle >= count) {
+    return;
+  }
+  nextStep(ctx, perm ? perm[cycle] : start + cycle);
+}
+#else
 __global__ void par_stepExec(DeviceExecContext* ctx, uint32_t start, uint32_t count) {
   uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x;
   if (cycle >= count) {
@@ -671,6 +683,7 @@ __global__ void par_stepExec(DeviceExecContext* ctx, uint32_t start, uint32_t co
   }
   nextStep(ctx, start + cycle);
 }
+#endif
 
 __global__ void rev_stepExec(DeviceExecContext* ctx, uint32_t split, uint32_t lastCycle) {
   for (uint32_t cycle = split; cycle-- > 0;) {
@@ -724,6 +737,61 @@ __global__ void majorKeys(const PreflightCycle* cycles, uint32_t* keys, uint32_t
     vals[i] = i;
   }
 }
+
+#ifdef __HIPCC__
+// Cycles [0, n) of the device preflight (cycles) grouped by major within 2^win-row windows
+// (stable hipcub radix sort over majorKeys' keys): returns the permutation (device, valid
+// until the next call with the same slot on this device). Slot 0: witgen, 1: accum.
+static uint32_t* hipMajorPerm(int slot, const PreflightCycle* cycles, uint32_t n, uint32_t win,
+                              cudaStream_t stream) {
+  static uint32_t* s_keys[16][2][2] = {};
+  static uint32_t* s_perm[16][2][2] = {};
+  static size_t s_cap[16][2] = {};
+  static void* s_sort_temp[16][2] = {};
+  static size_t s_sort_temp_bytes[16][2] = {};
+  int dev = getCachedDevice();
+  if (n > s_cap[dev][slot]) {
+    for (int b = 0; b < 2; b++) {
+      if (s_keys[dev][slot][b]) CUDA_OK(hipFree(s_keys[dev][slot][b]));
+      if (s_perm[dev][slot][b]) CUDA_OK(hipFree(s_perm[dev][slot][b]));
+      CUDA_OK(hipMalloc(&s_keys[dev][slot][b], n * sizeof(uint32_t)));
+      CUDA_OK(hipMalloc(&s_perm[dev][slot][b], n * sizeof(uint32_t)));
+    }
+    s_cap[dev][slot] = n;
+  }
+  auto cfg = getSimpleConfig(n);
+  majorKeys<<<cfg.grid, cfg.block, 0, stream>>>(cycles, s_keys[dev][slot][0], s_perm[dev][slot][0], n, win);
+  uint32_t maxWin = (win < 32 && n) ? ((n - 1) >> win) : 0;
+  int endBit = 8;
+  while (maxWin) { endBit++; maxWin >>= 1; }
+  hipcub::DoubleBuffer<uint32_t> keys(s_keys[dev][slot][0], s_keys[dev][slot][1]);
+  hipcub::DoubleBuffer<uint32_t> vals(s_perm[dev][slot][0], s_perm[dev][slot][1]);
+  size_t temp_bytes = 0;
+  CUDA_OK(hipcub::DeviceRadixSort::SortPairs(nullptr, temp_bytes, keys, vals, int(n), 0, endBit, stream));
+  if (temp_bytes > s_sort_temp_bytes[dev][slot]) {
+    if (s_sort_temp[dev][slot]) CUDA_OK(hipFree(s_sort_temp[dev][slot]));
+    CUDA_OK(hipMalloc(&s_sort_temp[dev][slot], temp_bytes));
+    s_sort_temp_bytes[dev][slot] = temp_bytes;
+  }
+  CUDA_OK(hipcub::DeviceRadixSort::SortPairs(
+      s_sort_temp[dev][slot], temp_bytes, keys, vals, int(n), 0, endBit, stream));
+  return vals.Current();
+}
+
+// par_stepExec's first launch (cycles before the table split) runs its cycles grouped by major
+// within 2^RISC0_HIP_WITGEN_SORT-row windows (default 12; 0 = cycle order), as stepAccum does:
+// a wave then mostly runs one arm of step_Top's mux. Same witness: each cycle still runs once
+// and writes only its own row; the rows it reads back hold the injected values, which their own
+// cycles write again (the same values) in any order, as with the unsorted launch, whose waves
+// run in no fixed order either; the lookup-table counts are commutative atomic adds.
+static uint32_t witgenSortWin() {
+  static const uint32_t win = [] {
+    const char* e = getenv("RISC0_HIP_WITGEN_SORT");
+    return e ? (uint32_t)atoi(e) : 12u;
+  }();
+  return win;
+}
+#endif
 
 // finalizeAccum fused with eltwise_zeroize_fp(accum) (INVALID -> 0), one pass over all rows.
 // Same result as finalizeAccum followed by the zeroize: machine cells are finalized (an unset
@@ -1044,8 +1112,16 @@ const char* risc0_circuit_rv32im_cuda_witgen_v2(uint32_t mode,
         } else
 #endif
         {
+#ifdef __HIPCC__
+          const uint32_t win = witgenSortWin();
+          const uint32_t* wperm =
+              (win && split > 1) ? hipMajorPerm(0, get_cache().a_cycles, split, win, stream) : nullptr;
+          par_stepExec<<<cfg1.grid, cfg1.block, 0, stream>>>(d_ctx, 0, split, wperm);
+          par_stepExec<<<cfg2.grid, cfg2.block, 0, stream>>>(d_ctx, split, phase2Count);
+#else
           par_stepExec<<<cfg1.grid, cfg1.block, 0, stream>>>(d_ctx, 0, split);
           par_stepExec<<<cfg2.grid, cfg2.block, 0, stream>>>(d_ctx, split, phase2Count);
+#endif
         }
       }
     } break;

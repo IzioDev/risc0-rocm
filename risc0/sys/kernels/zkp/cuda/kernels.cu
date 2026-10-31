@@ -206,6 +206,27 @@ __device__ __forceinline__ uint32_t eu_redc_pair(uint32_t a0, uint32_t b0, uint3
   return ret >= Fp::P ? ret - Fp::P : ret;
 }
 
+#ifdef __HIPCC__
+// ROCm: lazy accumulation for eu2_main. Hi-word fold: subtract P once if hi >= P, which keeps a
+// 64-bit sum of products congruent mod P*2^32 (so its REDC is unchanged) and bounds hi < P.
+__device__ __forceinline__ uint64_t eu_fold(uint64_t v) {
+  uint32_t lo = uint32_t(v), hi = uint32_t(v >> 32);
+  hi = __builtin_elementwise_min(hi, hi - Fp::P);
+  return (uint64_t(hi) << 32) | lo;
+}
+// REDC of a 64-bit sum whose hi word is < P (so o64 + red*P < 2P*2^32 < 2^64); canonical
+// result. red = M * -lo from shift-adds as in Fp::mul_rdna (32-bit multiplies are quarter rate).
+__device__ __forceinline__ uint32_t eu_redc64(uint64_t o64) {
+  uint32_t lo = uint32_t(o64);
+  uint32_t tt = lo + (lo << 27);
+  asm("" : "+v"(tt));
+  uint32_t red = (lo << 31) - tt;
+  o64 += uint64_t(red) * uint64_t(Fp::P);
+  uint32_t ret = o64 >> 32;
+  return __builtin_elementwise_min(ret, ret - Fp::P);
+}
+#endif
+
 // pw[e*EU_THREADS + t] = x_e^(J*t);  ps[e*S + s] = x_e^(s*chunk)
 __global__ void eu2_pows(FpExt* pw, FpExt* ps, const FpExt* xs, uint32_t S, uint32_t chunk) {
   uint32_t e = blockIdx.x;
@@ -253,8 +274,54 @@ __global__ void __launch_bounds__(EU_THREADS) eu2_main(FpExt* partial,
   // step = x^(J*THREADS)
   FpExt step = pw[(size_t)e * EU_THREADS + (EU_THREADS - 1)] * (xp[EU_J - 1] * x);
   const uint32_t iters = chunk / (EU_J * EU_THREADS);
-  FpExt acc;
   const uint4* p4 = reinterpret_cast<const uint4*>(poly);
+#ifdef __HIPCC__
+  // acc' = acc * step + inner, per output component as one exact 64-bit sum of 4 + J raw
+  // Montgomery products (NBETA folded into step, as the lazy FpExt multiply in sys/cxx/fpext.h)
+  // reduced once: 4 products < 4p^2 < 2^64; then hi is folded below P before each further pair
+  // (P*2^32 + 2^32 + 2p^2 < 2^64). Exact field arithmetic with canonical results, so bit-identical
+  // to the pairwise form below; about half the multiplies.
+  const uint32_t b0 = step.elems[0].asRaw(), b1 = step.elems[1].asRaw();
+  const uint32_t b2 = step.elems[2].asRaw(), b3 = step.elems[3].asRaw();
+  const uint32_t b1n = (step.elems[1] * Fp(Fp::P - 11)).asRaw();
+  const uint32_t b2n = (step.elems[2] * Fp(Fp::P - 11)).asRaw();
+  const uint32_t b3n = (step.elems[3] * Fp(Fp::P - 11)).asRaw();
+  const uint32_t sm[4][4] = {{b0, b3n, b2n, b1n}, {b1, b0, b3n, b2n}, {b2, b1, b0, b3n}, {b3, b2, b1, b0}};
+  uint32_t a[4] = {0, 0, 0, 0};
+#pragma unroll 2
+  for (int k = (int)iters - 1; k >= 0; k--) {
+    size_t base = ((size_t)k * EU_THREADS + t) * (EU_J / 4);
+    uint32_t c[EU_J];
+#pragma unroll
+    for (int q = 0; q < EU_J / 4; q++) {
+      uint4 v = __ldg(p4 + base + q);
+      c[4 * q + 0] = v.x;
+      c[4 * q + 1] = v.y;
+      c[4 * q + 2] = v.z;
+      c[4 * q + 3] = v.w;
+    }
+    uint32_t na[4];
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      uint64_t o = (uint64_t)a[0] * sm[i][0];
+      o += (uint64_t)a[1] * sm[i][1];
+      o += (uint64_t)a[2] * sm[i][2];
+      o += (uint64_t)a[3] * sm[i][3];
+#pragma unroll
+      for (int j = 0; j < EU_J; j += 2) {
+        o = eu_fold(o);
+        o += (uint64_t)c[j] * xp[j].elems[i].asRaw();
+        o += (uint64_t)c[j + 1] * xp[j + 1].elems[i].asRaw();
+      }
+      na[i] = eu_redc64(eu_fold(o));
+    }
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+      a[i] = na[i];
+  }
+  FpExt acc(Fp::fromRaw(a[0]), Fp::fromRaw(a[1]), Fp::fromRaw(a[2]), Fp::fromRaw(a[3]));
+#else
+  FpExt acc;
 #pragma unroll 2
   for (int k = (int)iters - 1; k >= 0; k--) {
     size_t base = ((size_t)k * EU_THREADS + t) * (EU_J / 4);
@@ -279,6 +346,7 @@ __global__ void __launch_bounds__(EU_THREADS) eu2_main(FpExt* partial,
     }
     acc = acc * step + inner;
   }
+#endif
   acc = acc * pw[(size_t)e * EU_THREADS + t];
   // block reduce
 #pragma unroll
@@ -384,6 +452,128 @@ __global__ void __launch_bounds__(256) mix_poly_coeffs_v2(FpExt* __restrict__ ou
     }
   }
 }
+
+#ifdef __HIPCC__
+// ---- mix_poly_coeffs v6 (ROCm) ----
+// 2 consecutive elements per thread with nontemporal 8-byte loads issued 4 inputs ahead; the
+// FpExt x Fp products of each combo id < MX_C summed exactly in 64-bit accumulators held in
+// registers (hi folded below P before each product, so no overflow; one REDC per combo at the
+// end) and one RMW of `out` per combo instead of one per run of equal ids; ids >= MX_C use a run
+// accumulator and an RMW per run, as v2. Exact field arithmetic with canonical outputs =>
+// bit-identical to v2. Needs an even count and an 8-byte aligned `in`.
+#define MX_C 5
+#define MX_V 2
+#define MX_U 4
+__device__ __forceinline__ uint64_t mx_fold(uint64_t v) {
+  uint32_t lo = uint32_t(v), hi = uint32_t(v >> 32);
+  hi = __builtin_elementwise_min(hi, hi - Fp::P);
+  return (uint64_t(hi) << 32) | lo;
+}
+// REDC of a 64-bit sum whose hi word is < P; canonical result (red from shift-adds, as mul_rdna).
+__device__ __forceinline__ uint32_t mx_redc64(uint64_t o64) {
+  uint32_t lo = uint32_t(o64);
+  uint32_t tt = lo + (lo << 27);
+  asm("" : "+v"(tt));
+  uint32_t red = (lo << 31) - tt;
+  o64 += uint64_t(red) * uint64_t(Fp::P);
+  uint32_t ret = o64 >> 32;
+  return __builtin_elementwise_min(ret, ret - Fp::P);
+}
+
+__global__ void __launch_bounds__(256) mix_poly_coeffs_v6(FpExt* __restrict__ out,
+                                                          const Fp* __restrict__ in,
+                                                          const uint32_t* __restrict__ combos,
+                                                          const FpExt* __restrict__ mixStart,
+                                                          const FpExt* __restrict__ mix,
+                                                          const uint32_t inputSize,
+                                                          const uint32_t count) {
+  extern __shared__ uint32_t mx_smem[];
+  FpExt* mixPows = reinterpret_cast<FpExt*>(mx_smem);
+  uint32_t* cids = mx_smem + 4 * inputSize;
+  {
+    FpExt ms = *mixStart;
+    FpExt m = *mix;
+    for (uint32_t i = threadIdx.x; i < inputSize; i += blockDim.x) {
+      mixPows[i] = ms * pow(m, i);
+      cids[i] = combos[i];
+    }
+  }
+  __syncthreads();
+  const uint32_t idx0 = (blockIdx.x * blockDim.x + threadIdx.x) * MX_V;
+  if (idx0 >= count)
+    return;
+  typedef uint32_t mx_vec_t __attribute__((ext_vector_type(MX_V)));
+  const mx_vec_t* inv =
+      reinterpret_cast<const mx_vec_t*>(reinterpret_cast<const uint32_t*>(in) + idx0);
+  uint64_t o[MX_C + 1][MX_V][4];  // [MX_C]: the current run of an id >= MX_C
+#pragma unroll
+  for (int cc = 0; cc <= MX_C; cc++)
+#pragma unroll
+    for (int e = 0; e < MX_V; e++)
+      o[cc][e][0] = o[cc][e][1] = o[cc][e][2] = o[cc][e][3] = 0;
+  uint32_t used = 0;  // bit cc: combo cc accumulated (uniform)
+  const size_t cstride = count / MX_V;
+  for (uint32_t i0 = 0; i0 < inputSize; i0 += MX_U) {
+    mx_vec_t c[MX_U];
+#pragma unroll
+    for (int u = 0; u < MX_U; u++)
+      c[u] = (i0 + u < inputSize) ? __builtin_nontemporal_load(inv + cstride * (i0 + u)) : mx_vec_t(0);
+#pragma unroll
+    for (int u = 0; u < MX_U; u++) {
+      const uint32_t i = i0 + u;
+      if (i < inputSize) {
+        const uint32_t id = cids[i];
+        const uint32_t slot = id < MX_C ? id : MX_C;
+        const uint4 m = reinterpret_cast<const uint4*>(mixPows)[i];
+#pragma unroll
+        for (int cc = 0; cc <= MX_C; cc++) {
+          if (cc == (int)slot) {
+#pragma unroll
+            for (int e = 0; e < MX_V; e++) {
+              o[cc][e][0] = mx_fold(o[cc][e][0]) + (uint64_t)c[u][e] * m.x;
+              o[cc][e][1] = mx_fold(o[cc][e][1]) + (uint64_t)c[u][e] * m.y;
+              o[cc][e][2] = mx_fold(o[cc][e][2]) + (uint64_t)c[u][e] * m.z;
+              o[cc][e][3] = mx_fold(o[cc][e][3]) + (uint64_t)c[u][e] * m.w;
+            }
+          }
+        }
+        if (slot < MX_C) {
+          used |= 1u << slot;
+        } else if (i + 1 >= inputSize || cids[i + 1] != id) {
+#pragma unroll
+          for (int e = 0; e < MX_V; e++) {
+            FpExt* op = out + (size_t)count * id + idx0 + e;
+            FpExt v = *op;
+#pragma unroll
+            for (int k = 0; k < 4; k++) {
+              v.elems[k] = v.elems[k] + Fp::fromRaw(mx_redc64(mx_fold(o[MX_C][e][k])));
+              o[MX_C][e][k] = 0;
+            }
+            *op = v;
+          }
+        }
+      }
+    }
+  }
+#pragma unroll
+  for (int cc = 0; cc < MX_C; cc++) {
+    if (used & (1u << cc)) {
+#pragma unroll
+      for (int e = 0; e < MX_V; e++) {
+        FpExt* op = out + (size_t)count * cc + idx0 + e;
+        FpExt v = *op;
+#pragma unroll
+        for (int k = 0; k < 4; k++)
+          v.elems[k] = v.elems[k] + Fp::fromRaw(mx_redc64(mx_fold(o[cc][e][k])));
+        *op = v;
+      }
+    }
+  }
+}
+#undef MX_C
+#undef MX_V
+#undef MX_U
+#endif
 
 // ---- batched gather_sample (all FRI queries of one tree in one launch) ----
 __global__ void gather_samples(Fp* dst, const Fp* src, const uint32_t* idxs, const uint32_t n,

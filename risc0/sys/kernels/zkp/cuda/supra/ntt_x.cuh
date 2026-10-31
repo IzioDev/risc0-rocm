@@ -560,6 +560,48 @@ void bit_rev_z_batched(fr_t* out0, const fr_t* in0, uint32_t lg_domain_size, siz
     } while (Z_COUNT <= WARP_SZ && (tid += blockDim.x*gridDim.x) < step);
 }
 
+#ifdef __HIPCC__
+// ROCm: bit_rev_z_batched<64> keeps 64 values per thread in registers and spills on RDNA3/4
+// (256 VGPRs, ~300 B/lane scratch); a kernel with scratch also costs ~35-115 us at each
+// dispatch boundary there. This one swaps the Z x Z tiles g and rev(g) of a column through two
+// padded LDS tiles (no register array, no scratch, conflict-free transposed reads): element
+// (i, c) of tile g, at i*step + g*Z + c, moves to rev(c)*step + rev(g)*Z + rev(i), i.e. the
+// same bit reversal. Every block reads both of its tiles before writing either, and distinct
+// blocks own disjoint tile pairs, so in place is safe. Harness: r0amd r8/L4/brev (bit-identical,
+// 2-3x faster at lg 18-20).
+template<unsigned int Z, unsigned int NT>
+__launch_bounds__(NT) __global__
+void bit_rev_t2_batched(fr_t* io0, uint32_t lg, size_t stride)
+{
+    static_assert(sizeof(fr_t) == sizeof(uint32_t), "bit_rev_t2_batched moves 32-bit elements");
+    constexpr uint32_t LZ = lg2(Z);
+    __shared__ uint32_t A[Z][Z + 1], B[Z][Z + 1];
+    uint32_t* io = reinterpret_cast<uint32_t*>(io0 + blockIdx.y * stride);
+    const index_t g = blockIdx.x;
+    const index_t gr = bit_rev(g, lg - 2 * LZ);
+    if (g > gr)
+        return;
+    const index_t step = (index_t)1 << (lg - LZ);
+    const bool two = g != gr;
+    #pragma unroll 4
+    for (uint32_t e = threadIdx.x; e < Z * Z; e += NT) {
+        const uint32_t i = e / Z, c = e % Z;
+        A[i][c] = io[i * step + g * Z + c];
+        if (two)
+            B[i][c] = io[i * step + gr * Z + c];
+    }
+    __syncthreads();
+    #pragma unroll 4
+    for (uint32_t e = threadIdx.x; e < Z * Z; e += NT) {
+        const uint32_t r = e / Z, c = e % Z;
+        const uint32_t rc = bit_rev(c, LZ), rr = bit_rev(r, LZ);
+        io[r * step + gr * Z + c] = A[rc][rr];
+        if (two)
+            io[r * step + g * Z + c] = B[rc][rr];
+    }
+}
+#endif
+
 static void bitrev_batched(const stream_t& s, fr_t* io, unsigned lg, unsigned cols)
 {
     const uint32_t Z = 64;   // 256 / sizeof(fr_t)
@@ -568,7 +610,11 @@ static void bitrev_batched(const stream_t& s, fr_t* io, unsigned lg, unsigned co
         for (unsigned c = 0; c < cols; c++)
             bit_rev_permutation<<<n <= 1024 ? 1 : n / 64, n <= 1024 ? n : 64, 0, s>>>(io + c * n, io + c * n, lg);
     } else {
+#ifdef __HIPCC__
+        bit_rev_t2_batched<32, 128><<<dim3(n / 32 / 32, cols), 128, 0, s>>>(io, lg, n);
+#else
         bit_rev_z_batched<Z><<<dim3(n / Z / Z, cols), Z, Z * Z * sizeof(fr_t), s>>>(io, io, lg, n);
+#endif
     }
     CUDA_OK(cudaGetLastError());
 }

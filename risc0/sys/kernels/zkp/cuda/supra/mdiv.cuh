@@ -1,4 +1,4 @@
-// Fused multi-root polynomial division for risc0 combos_divide (CUDA).
+// Fused multi-root polynomial division for risc0 combos_divide (CUDA and ROCm).
 // Bit-identical to calling sppark div_by_x_minus_z<rotate=true> once per root, in order, on
 // each combo slice (including for inputs whose remainders are nonzero), but with
 // 2 short launches per root "layer" (all combos of a layer batched) + 2, and no host syncs.
@@ -13,6 +13,7 @@
 #include <vector>
 #include <algorithm>
 #include <cstdint>
+#include <mutex>
 
 #ifndef MD_NTH
 #define MD_NTH 256
@@ -20,6 +21,15 @@
 #define MD_E 8
 #define MD_T (MD_NTH * MD_E)
 #define MD_MAXJ 8
+
+// ROCm: no __grid_constant__ (the jobs are an ordinary by-value kernel argument), and the
+// shuffles are sppark cuda2hip's 32-lane polyfills (the kernels need wave32: RDNA). The lanes
+// they read across the wave boundary are discarded by the csel()s, as on CUDA.
+#ifdef __HIPCC__
+#define MD_GRID_CONST
+#else
+#define MD_GRID_CONST __grid_constant__
+#endif
 
 typedef bb31_4_t md4_t;
 
@@ -131,7 +141,7 @@ __device__ __forceinline__ void md_store_tile(md4_t* dst, const md4_t* x, md4_t*
 #endif
 
 // Root-0 tile aggregates: agg[i] = sum_{k in tile i} a[k] z^(k - i*T).
-__global__ __launch_bounds__(MD_NTH) void mdiv_agg0(const __grid_constant__ MdJobs J) {
+__global__ __launch_bounds__(MD_NTH) void mdiv_agg0(const MD_GRID_CONST MdJobs J) {
   __shared__ md4_t sh[MD_NTH / 32 + 33];
   const MdJob& jb = J.j[blockIdx.y];
   const size_t b = (size_t)blockIdx.x * MD_T + threadIdx.x * MD_E;
@@ -157,7 +167,7 @@ __global__ __launch_bounds__(MD_NTH) void mdiv_agg0(const __grid_constant__ MdJo
 // Per slice (blockIdx.x), NTILES threads: carries C_i = sum_{u>i} agg_u z^(T(u-i-1)).
 // Also installs the previous root's remainder at a[n-1] and in the top tile's aggregate.
 template <int NTILES>
-__global__ __launch_bounds__(NTILES) void mdiv_scan(const __grid_constant__ MdJobs J) {
+__global__ __launch_bounds__(NTILES) void mdiv_scan(const MD_GRID_CONST MdJobs J) {
   __shared__ md4_t sh[NTILES / 32 + 33];
   const MdJob& jb = J.j[blockIdx.x];
   const int t = threadIdx.x;
@@ -175,7 +185,7 @@ __global__ __launch_bounds__(NTILES) void mdiv_scan(const __grid_constant__ MdJo
 }
 
 // Apply one root on each tile; optionally compute the next root's tile aggregates.
-__global__ __launch_bounds__(MD_NTH) void mdiv_apply(const __grid_constant__ MdJobs J) {
+__global__ __launch_bounds__(MD_NTH) void mdiv_apply(const MD_GRID_CONST MdJobs J) {
   __shared__ md4_t sh[MD_NTH / 32 + 33];
   const MdJob& jb = J.j[blockIdx.y];
   const uint32_t tile = blockIdx.x, ntiles = gridDim.x;
@@ -230,7 +240,7 @@ __global__ __launch_bounds__(MD_NTH) void mdiv_apply(const __grid_constant__ MdJ
 }
 
 // Install the last remainder of each slice at a[n-1].
-__global__ void mdiv_final(const __grid_constant__ MdJobs J, uint32_t njobs) {
+__global__ void mdiv_final(const MD_GRID_CONST MdJobs J, uint32_t njobs) {
   uint32_t t = threadIdx.x;
   if (t < njobs) J.j[t].a[J.n - 1] = *J.j[t].prev_rem;
 }
@@ -265,13 +275,36 @@ static void mdiv_run(md4_t* base, size_t n, const uint32_t combo_indices[], cons
     maxm = std::max(maxm, pows_per_combo[c]);
   }
   md4_t* scratch = nullptr;
-  CUDA_OK(cudaMallocAsync((void**)&scratch, (2 * (size_t)num_combos * ntiles + tot) * sizeof(md4_t), st));
+  const size_t scratch_bytes = (2 * (size_t)num_combos * ntiles + tot) * sizeof(md4_t);
+#ifdef __HIPCC__
+  // A grow-only scratch per device (cuda2hip's cudaMallocAsync/cudaFreeAsync are hipMalloc and
+  // hipFree, and hipFree synchronizes the device), held under a lock until this function has
+  // synchronized `st`.
+  static std::mutex s_mtx;
+  std::lock_guard<std::mutex> lock(s_mtx);
+  {
+    static md4_t* s_scratch[16] = {};
+    static size_t s_scratch_bytes[16] = {};
+    int dev = 0;
+    CUDA_OK(cudaGetDevice(&dev));
+    if (scratch_bytes > s_scratch_bytes[dev]) {
+      if (s_scratch[dev]) CUDA_OK(cudaFree(s_scratch[dev]));
+      s_scratch[dev] = nullptr;
+      s_scratch_bytes[dev] = 0;
+      CUDA_OK(cudaMalloc(&s_scratch[dev], scratch_bytes));
+      s_scratch_bytes[dev] = scratch_bytes;
+    }
+    scratch = s_scratch[dev];
+  }
+#else
+  CUDA_OK(cudaMallocAsync((void**)&scratch, scratch_bytes, st));
   // Freed (stream-ordered) on every path out, also when a launch check below throws.
   struct scratch_guard {
     md4_t* p;
     cudaStream_t st;
     ~scratch_guard() { (void)cudaFreeAsync(p, st); }
   } guard{scratch, st};
+#endif
   md4_t* rems_d = scratch + 2 * (size_t)num_combos * ntiles;
   auto job = [&](uint32_t c, uint32_t r) {
     MdJob j;
