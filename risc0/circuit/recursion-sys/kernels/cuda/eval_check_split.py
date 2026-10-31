@@ -312,16 +312,21 @@ for part, name in EC_MUL_PARTS.items():
            new[j:])
 
 # HIP (RDNA) only: per part and architecture, the measured faster of ec_lazyfp.py's forms (uniform
-# trace addressing 'col'; lazy Fp sums of products 'lz1'/'lz2'), each under
+# trace addressing 'col'; lazy Fp sums of products 'lz1'/'lz2'; raw buffer trace loads 'buf', alone
+# or after another form as 'X+buf'), each under
 # `#if defined(__HIP_DEVICE_COMPILE__) && defined(__GFX1x__)` with the unchanged body as the #else
 # branch (so the CUDA build sees the same tokens). Per call, po2 18, median of 3 interleaved
 # harness runs, bit-identical check output: gfx1100 part 0 3275 -> 3162 us (col), part 1 3013 ->
 # 2739 (lz2), part 2 1727 -> 1410 (lz1); gfx1201 part 4 3040 -> 2909 (lz1); all six parts, 4
-# interleaved runs: RX 7900 XTX 15.69 -> 14.86 ms, RX 9070 XT 17.40 -> 16.94 ms. Every other
+# interleaved runs: RX 7900 XTX 15.69 -> 14.86 ms, RX 9070 XT 17.40 -> 16.94 ms. Then 'buf' (medians
+# of 10 interleaved runs, us): gfx1100 part 0 3188 -> 2774, part 1 2756 -> 2268, part 2 1366 -> 976,
+# part 3 1498 -> 1443, part 4 2546 -> 2342 (part 5 3654 -> 3729, kept); gfx1201 part 0 3548 -> 3387,
+# part 2 1606 -> 1554, part 4 2796 -> 2701 (parts 1, 3, 5 slower, with more spills); the full call
+# (6 interleaved runs): RX 7900 XTX 14.80 -> 14.08 ms, RX 9070 XT 16.95 -> 16.61 ms. Every other
 # part/arch pair was slower with each form (the forms cut VALU work 10-25% but change the part's
 # register allocation, 216 VGPRs with the maxocc scheduler); re-measure before changing this.
-EC_VARIANTS = {0: {'gfx11': 'col'}, 1: {'gfx11': 'lz2'}, 2: {'gfx11': 'lz1'}, 4: {'gfx12': 'lz1'}}
-EC_VARIANTS_EXPECT = {'col': 268, 'lz2_prod': 1093, 'lz2_fin': 562, 'lz1_prod': 1167, 'lz1_fin': 727}
+EC_VARIANTS = {0: {'gfx11': 'col+buf', 'gfx12': 'buf'}, 1: {'gfx11': 'lz2+buf'}, 2: {'gfx11': 'lz1+buf', 'gfx12': 'buf'}, 3: {'gfx11': 'buf'}, 4: {'gfx11': 'buf', 'gfx12': 'lz1+buf'}}
+EC_VARIANTS_EXPECT = {'col': 268, 'buf': 1815, 'lz2_prod': 1093, 'lz2_fin': 562, 'lz1_prod': 1167, 'lz1_fin': 727}
 new, vcounts = ec_lazyfp.select(new, EC_VARIANTS)
 if vcounts != EC_VARIANTS_EXPECT:
     sys.exit('eval_check_split: ec_lazyfp counts %s != %s (input changed: re-validate the variants '

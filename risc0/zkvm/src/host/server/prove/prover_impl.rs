@@ -1952,7 +1952,7 @@ impl ProverServer for ProverImpl {
         }
 
         eprintln!(
-            "[composite_to_succinct] lift/join done: {:.1}s",
+            "[composite_to_succinct] lift/join done: {:.3}s",
             t_pipeline.elapsed().as_secs_f64()
         );
 

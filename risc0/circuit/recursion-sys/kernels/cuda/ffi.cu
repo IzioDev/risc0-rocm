@@ -276,13 +276,20 @@ __device__ inline uint32_t recRowClass(const Fp* ctrl, size_t steps, uint32_t cy
   return (arm << 12) | sub;
 }
 
-__global__ void recExecKeys(ExecContext* ctx, uint32_t* keys, uint32_t* vals) {
+// win == 0: one global order (key bits [0, 26)). win > 0: the same grouping within each
+// 2^win-cycle window, chain length clamped to 15 (bits [0, 22) plus the window index above them), so
+// a wave's rows stay closer in the trace. RDNA4 uses kRecExecWinGfx12: parStepExecPerm 3.01 -> 1.89
+// ms per lift/join on an RX 9070 XT (fib 1M succinct; windows of 2^8 / 2^12 cycles: 2.66 / 2.05). On
+// an RX 7900 XTX the windows were slower (1.74 -> 2.34 ms at 2^10), so 0 there.
+// RISC0_HIP_REC_EXECWIN overrides it.
+constexpr uint32_t kRecExecWinGfx12 = 10;
+__global__ void recExecKeys(ExecContext* ctx, uint32_t* keys, uint32_t* vals, uint32_t win) {
   uint32_t c = blockDim.x * blockIdx.x + threadIdx.x;
   uint32_t n = ctx->trace->numCycles;
   if (c >= n) return;
   const PreflightCycle* cy = ctx->trace->cycles;
   uint32_t ps = cy[c].isParSafe;
-  uint32_t key = kRecNotHead;
+  uint32_t key = win ? (1u << 22) - 1 : kRecNotHead;
   if ((c == 0 || ps != 0) && ps != 2) {
     uint32_t len = 0;
     while (c + 1 + len < n && len < 255 && cy[c + 1 + len].isParSafe == 0)
@@ -290,8 +297,13 @@ __global__ void recExecKeys(ExecContext* ctx, uint32_t* keys, uint32_t* vals) {
     const Fp* ctrl = ctx->buffers.ctrl;
     size_t steps = ctx->totalCycles;
     uint32_t arm1 = len ? recArm(ctrl, steps, c + 1) : 0;
-    key = ((255 - len) << 18) | (arm1 << 15) | recRowClass(ctrl, steps, c);
+    if (win)
+      key = ((15 - min(len, 14u)) << 18) | (arm1 << 15) | recRowClass(ctrl, steps, c);
+    else
+      key = ((255 - len) << 18) | (arm1 << 15) | recRowClass(ctrl, steps, c);
   }
+  if (win)
+    key |= (c >> win) << 22;
   keys[c] = key;
   vals[c] = c;
 }
@@ -355,9 +367,26 @@ static const uint32_t* recSortPairs(cudaStream_t stream, uint32_t n, int endBit)
 // The cycles [0, n) in chain order.
 static const uint32_t* recSortedCycles(cudaStream_t stream, ExecContext* ctx, uint32_t n,
                                        const LaunchConfig& cfg) {
+  static const int winEnv = [] {
+    const char* e = std::getenv("RISC0_HIP_REC_EXECWIN");
+    return e ? int(std::strtoul(e, nullptr, 10)) : -1;
+  }();
+  int dev = 0;
+  uint32_t win = winEnv >= 0 ? uint32_t(winEnv)
+                 : (cudaGetDevice(&dev) == cudaSuccess && risc0_hip_hop::is_gfx12(dev)) ? kRecExecWinGfx12
+                                                                                        : 0u;
+  // The window index must fit above bit 22.
+  uint32_t endBit = kRecSortBits;
+  if (win) {
+    while (win < 31 && (uint64_t(n - 1) >> win) >= (1u << 10))
+      win++;
+    endBit = 22;
+    while (endBit < 32 && (uint64_t(n - 1) >> win) >> (endBit - 22) != 0)
+      endBit++;
+  }
   uint32_t* k = recSortKeys(n);
-  recExecKeys<<<cfg.grid, cfg.block, 0, stream>>>(ctx, k, k + 2 * g_recSort.cap);
-  return recSortPairs(stream, n, kRecSortBits);
+  recExecKeys<<<cfg.grid, cfg.block, 0, stream>>>(ctx, k, k + 2 * g_recSort.cap, win);
+  return recSortPairs(stream, n, int(endBit));
 }
 
 // Rows of the one-step-per-row kernels (parStepComputeAccumInl / parStepVerifyAccumInl,
@@ -375,13 +404,67 @@ __global__ void recAccumKeys(const Fp* ctrl, uint32_t steps, uint32_t n, uint32_
   vals[c] = c;
 }
 
-static const uint32_t* recAccumPerm(cudaStream_t stream, const Fp* ctrl, uint32_t steps, uint32_t n) {
+static const uint32_t* recAccumPermSort(cudaStream_t stream, const Fp* ctrl, uint32_t steps, uint32_t n) {
   uint32_t* k = recSortKeys(n);
   recAccumKeys<<<(n + 255) / 256, 256, 0, stream>>>(ctrl, steps, n, k, k + 2 * g_recSort.cap);
   int endBit = 15;
   while (endBit < 32 && ((uint64_t(n - 1) >> kRecAccumWin) >> (endBit - 15)) != 0)
     endBit++;
   return recSortPairs(stream, n, endBit);
+}
+
+// One proof's three arm-order launches (parStepVerifyWom, then the accum compute and verify
+// passes) use the same permutation (the same ctrl rows): it is made once, at the witgen's
+// verifyWom, and kept in its own buffer for the accum calls of that proof (keyed by ctrl, steps
+// and n; a new witgen on this thread makes it again). Any permutation of [0, n) gives the same
+// witness (the rows are independent), so the key only guards the grouping. Saves two
+// recAccumKeys + radix sorts (~10 kernels each) per lift/join. RISC0_HIP_REC_PERMCACHE=0 turns
+// it off.
+struct RecPermCache {
+  uint32_t* buf = nullptr;
+  size_t cap = 0;
+  const Fp* ctrl = nullptr;
+  uint32_t steps = 0, n = 0;
+  bool valid = false;
+#ifndef _WIN32
+  // Freed at thread exit, like g_recSort.
+  ~RecPermCache() { cudaFree(buf); }
+#endif
+};
+static thread_local RecPermCache g_recPerm;
+
+static bool recPermCacheOn() {
+  static const bool on = [] {
+    const char* e = std::getenv("RISC0_HIP_REC_PERMCACHE");
+    return !(e && e[0] == '0');
+  }();
+  return on;
+}
+
+// `fresh`: make it again (the witgen's call); else reuse a matching one.
+static const uint32_t* recAccumPerm(cudaStream_t stream, const Fp* ctrl, uint32_t steps, uint32_t n,
+                                    bool fresh = false) {
+  if (!recPermCacheOn())
+    return recAccumPermSort(stream, ctrl, steps, n);
+  RecPermCache& c = g_recPerm;
+  if (!fresh && c.valid && c.ctrl == ctrl && c.steps == steps && c.n == n)
+    return c.buf;
+  c.valid = false;
+  const uint32_t* perm = recAccumPermSort(stream, ctrl, steps, n);
+  if (n > c.cap) {
+    // cudaFree waits for the device: nothing still reads the old buffer.
+    if (c.buf) CUDA_OK(cudaFree(c.buf));
+    c.buf = nullptr;
+    c.cap = 0;
+    CUDA_OK(cudaMalloc(&c.buf, size_t(n) * sizeof(uint32_t)));
+    c.cap = n;
+  }
+  CUDA_OK(cudaMemcpyAsync(c.buf, perm, size_t(n) * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
+  c.ctrl = ctrl;
+  c.steps = steps;
+  c.n = n;
+  c.valid = true;
+  return c.buf;
 }
 
 // verifyWom's sort of the WOM argument rows (ROCm; RISC0_HIP_REC_WOMSORT=0 turns it off). There
@@ -822,6 +905,22 @@ constexpr int kStageSlots = 2;
 static std::mutex g_stageMu;
 static StagedInputs g_stage[kStageSlots];
 
+// The copy stream of the current device (callers hold g_stageMu), shared by the slots: one with
+// its own hardware queue (hip_hop.h's dedicated_stream). ROCclr maps plain streams onto the
+// GPU_MAX_HW_QUEUES shared queues, and with one (the RDNA4 default) the copies waited behind the
+// running proof's kernels and overlapped nothing.
+static cudaStream_t stageStream(int device) {
+  static cudaStream_t streams[16] = {};
+  if (device < 0 || device >= 16)
+    throw std::runtime_error("recursion staging: device index out of range");
+  if (!streams[device]) {
+    cudaStream_t s = risc0_hip_hop::dedicated_stream();
+    if (!s) CUDA_OK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+    streams[device] = s;
+  }
+  return streams[device];
+}
+
 template <typename T> static void stageGrow(T*& p, size_t& cap, size_t n) {
   n = n ? n : 1;
   if (n <= cap) return;
@@ -1100,7 +1199,7 @@ struct HostExecContext {
       nvtx3::scoped_range range("stepVerifyWom");
 #ifdef __HIPCC__
       if (recVerifyWomSort() && numCycles > 1) {
-        const uint32_t* perm = recAccumPerm(stream, ctrlBuf, steps, numCycles);
+        const uint32_t* perm = recAccumPerm(stream, ctrlBuf, steps, numCycles, true);
         parStepVerifyWomPerm<<<cfg.grid, cfg.block, 0, stream>>>(ctx, perm);
       } else
 #endif
@@ -1290,9 +1389,9 @@ struct HostAccumContext {
     nvtx3::scoped_range range("computeAccum");
 #ifdef __HIPCC__
     {
-      // Made again for the verify pass (cheap), so that it does not depend on the buffer's
-      // lifetime between the two calls. Its kernels go on `stream` before the hop scope opens
-      // (the hopped kernel waits only for work recorded before the scope).
+      // The witgen's verifyWom permutation when it matches (RecPermCache), else made here. Its
+      // kernels go on `stream` before the hop scope opens (the hopped kernel waits only for work
+      // recorded before the scope).
       const uint32_t* perm = (accumInl() && recAccumSort() && workCycles > 1)
                                  ? recAccumPerm(stream, ctrlBuf, steps, workCycles)
                                  : nullptr;
@@ -1367,9 +1466,9 @@ struct HostAccumContext {
       CUDA_OK(cudaDeviceSynchronize());
 #ifdef __HIPCC__
     {
-      // Made again for the verify pass (cheap), so that it does not depend on the buffer's
-      // lifetime between the two calls. Its kernels go on `stream` before the hop scope opens
-      // (the hopped kernel waits only for work recorded before the scope).
+      // The witgen's verifyWom permutation when it matches (RecPermCache), else made here. Its
+      // kernels go on `stream` before the hop scope opens (the hopped kernel waits only for work
+      // recorded before the scope).
       const uint32_t* perm = (accumInl() && recAccumSort() && workCycles > 1)
                                  ? recAccumPerm(stream, ctrlBuf, steps, workCycles)
                                  : nullptr;
@@ -1552,7 +1651,7 @@ const char* risc0_circuit_recursion_hip_stage(const PreflightTrace* trace, const
     }
     if (!s) return nullptr;
     s->device = device;
-    if (!s->stream) CUDA_OK(cudaStreamCreateWithFlags(&s->stream, cudaStreamNonBlocking));
+    if (!s->stream) s->stream = stageStream(device);
     if (!s->done) CUDA_OK(cudaEventCreateWithFlags(&s->done, cudaEventDisableTiming));
     stageGrow(s->dWom, s->womCap, trace->numWoms);
     stageGrow(s->dCycles, s->cyclesCap, trace->numCycles);

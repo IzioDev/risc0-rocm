@@ -109,7 +109,8 @@ thread_local! {
     static THREAD_DEVICE: Cell<i32> = Cell::new(0);
 }
 
-/// Auto-configure GPU_MAX_HW_QUEUES based on the visible GPU architectures.
+/// Auto-configure GPU_MAX_HW_QUEUES (and HSA_SCRATCH_SINGLE_LIMIT, see below) based on the
+/// visible GPU architectures.
 ///
 /// After a long kernel whose grid needs several rounds of waves, the next
 /// dispatch on the same hardware queue starts ~200 us late. On RDNA3 (gfx11xx)
@@ -140,8 +141,8 @@ pub fn auto_configure_hw_queues() {
                 .unwrap_or(u32::MAX)
         });
 
-        // (gfx_target_version, unique_id) of each GPU node, in node order.
-        let mut gpus: Vec<(u32, u64)> = Vec::new();
+        // (gfx_target_version, unique_id, scratch wave slots) of each GPU node, in node order.
+        let mut gpus: Vec<(u32, u64, u64)> = Vec::new();
         for entry in node_dirs {
             let props_path = entry.path().join("properties");
             let Ok(content) = std::fs::read_to_string(&props_path) else {
@@ -162,7 +163,16 @@ pub fn auto_configure_hw_queues() {
             if ver == 0 {
                 continue; // CPU node
             }
-            gpus.push((ver as u32, prop("unique_id").unwrap_or(0)));
+            // ROCr's scratch wave slots: CUs x max_slots_scratch_cu.
+            let slots = match (
+                prop("simd_count"),
+                prop("simd_per_cu"),
+                prop("max_slots_scratch_cu"),
+            ) {
+                (Some(s), Some(p), Some(m)) if p > 0 => s / p * m,
+                _ => 0,
+            };
+            gpus.push((ver as u32, prop("unique_id").unwrap_or(0), slots));
         }
 
         // ROCR_VISIBLE_DEVICES (indices or GPU-<hex unique_id>) selects and
@@ -204,6 +214,23 @@ pub fn auto_configure_hw_queues() {
         if std::env::var("GPU_MAX_HW_QUEUES").is_err() {
             tracing::info!("Auto-setting GPU_MAX_HW_QUEUES={queues}");
             std::env::set_var("GPU_MAX_HW_QUEUES", queues);
+        }
+
+        // ROCr gives a dispatch "use-once" scratch (allocated before it, freed after it, and the
+        // queue's retained scratch released too) when its scratch for all of the device's wave
+        // slots (bytes/lane x 32 lanes x slots) is above HSA_SCRATCH_SINGLE_LIMIT (default
+        // 140 MiB). The recursion witgen's parStepExecPerm (3232 B/lane: 303 / 202 MiB on an
+        // RX 7900 XTX / RX 9070 XT) did that once per lift/join, and it and the next scratch
+        // kernels (stepVerifyWom, the accum passes) each waited ~110 us for an allocation. A
+        // limit of 4 KiB/lane keeps those retained (at most that much per hardware queue, within
+        // ROCr's pool limits); the rv32im and keccak witgen kernels (4.5-78 KB/lane) stay
+        // use-once.
+        if std::env::var("HSA_SCRATCH_SINGLE_LIMIT").is_err() {
+            if let Some(slots) = visible.iter().map(|g| g.2).max().filter(|&s| s > 0) {
+                let limit = slots * 32 * 4096;
+                tracing::info!("Auto-setting HSA_SCRATCH_SINGLE_LIMIT={limit}");
+                std::env::set_var("HSA_SCRATCH_SINGLE_LIMIT", limit.to_string());
+            }
         }
     });
 }

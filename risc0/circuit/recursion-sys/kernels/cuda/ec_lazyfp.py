@@ -54,6 +54,7 @@ ARITH = re.compile(r'^(\s*)Fp (x\d+) = (x\d+) ([-+*]) (x\d+);\s*$')
 TOK = re.compile(r'\bx\d+\b')
 LHS = re.compile(r'^\s*(?:Fp|FpExt|RecLz|auto) (x\d+)\b')
 COL = re.compile(r'\b(ctrl|data|accum)\[(\d+) \* size \+ \(\(idx - INV_RATE \* (\d+)\) & mask\)\]')
+UCOL = re.compile(r'REC_UCOL\((ctrl|data|accum), (\d+), (\d+)\)')
 
 HELPERS = r'''#ifdef __HIPCC__
 // ---- ec_lazyfp.py: lazy Fp sums of products and uniform trace addressing (HIP, some parts) ----
@@ -87,6 +88,26 @@ __device__ __forceinline__ Fp rlf_fin(uint64_t x) {
 // (SGPRs) at a 32-bit row byte offset (global_load saddr + voffset).
 #define REC_UCOL(p, c, k) (Fp(*(const __attribute__((address_space(1))) uint32_t*)(reinterpret_cast<uint64_t>( \
     reinterpret_cast<const char*>((p) + (c) * size) + (((idx - uint32_t(INV_RATE * (k))) & mask) << 2)))))
+#if defined(__HIP_DEVICE_COMPILE__) && (defined(__GFX11__) || defined(__GFX12__))
+// Trace column c of p at row (idx - INV_RATE * k) mod size as a raw buffer load (RDNA3/RDNA4, 'buf'
+// parts): one resource per REC_BG = 32 columns, based at the group's first column; the column within
+// the group as the SGPR offset (c % 32) * size * 4 and the row as the VGPR offset, which every column
+// read at that row shares (instead of a 64-bit VGPR address per column). Offsets stay below 4 GB for
+// size <= 2^25 (po2 <= 23). gfx11 loads carry SLC (as rv32im's eval_check, R3).
+#define REC_BG 32u
+#if defined(__GFX11__)
+#define REC_BAUX 2
+#else
+#define REC_BAUX 0
+#endif
+__device__ __forceinline__ __amdgpu_buffer_rsrc_t rec_rsrc(const Fp* p, uint32_t g, uint32_t size) {
+  return __builtin_amdgcn_make_buffer_rsrc(
+      const_cast<char*>(reinterpret_cast<const char*>(p) + uint64_t(g) * (REC_BG * 4u) * size), (short)0,
+      (int)0xffffffff, 0x31004000);
+}
+#define REC_BCOL(p, c, k) (Fp((uint32_t)__builtin_amdgcn_raw_buffer_load_b32(rec_rsrc((p), (c) / REC_BG, size), \
+    ((idx - uint32_t(INV_RATE * (k))) & mask) << 2, ((c) % REC_BG) * size * 4u, REC_BAUX)))
+#endif
 #endif
 '''
 
@@ -311,6 +332,15 @@ class Part:
 def variant(fn, spec, counts):
     lines = fn.split('\n')
     hdr, body = lines[0], lines[1:-2]
+    if spec.endswith('+buf') or spec == 'buf':
+        # 'buf' (alone or after another form): the trace loads as raw buffer loads (REC_BCOL).
+        base = spec[:-4] if spec.endswith('+buf') else None
+        if base:
+            body = variant(fn, base, counts).split('\n')[1:-2]
+        n = sum(len(COL.findall(l)) + len(UCOL.findall(l)) for l in body)
+        body = [UCOL.sub(lambda m: 'REC_BCOL(%s, %s, %s)' % m.groups(), COL.sub(lambda m: 'REC_BCOL(%s, %s, %s)' % m.groups(), l)) for l in body]
+        counts['buf'] = counts.get('buf', 0) + n
+        return '\n'.join([hdr] + body + ['}', ''])
     if spec == 'col':
         nb = [COL.sub(lambda m: 'REC_UCOL(%s, %s, %s)' % m.groups(), l) for l in body]
         counts['col'] = counts.get('col', 0) + sum(len(COL.findall(l)) for l in body)

@@ -370,16 +370,11 @@ impl Prover {
             );
             *preflight.pinned.lock().unwrap() = staged;
             // ROCm: upload them now, on this thread, while the GPU proves the previous proof
-            // (the witgen of this preflight then skips its uploads). Not with a single hardware
-            // queue (GPU_MAX_HW_QUEUES=1, the RDNA4 default), where it gained nothing.
+            // (the witgen of this preflight then skips its uploads). The copies run on a stream
+            // with its own hardware queue, so they overlap the running proof's kernels also with
+            // a single shared queue (GPU_MAX_HW_QUEUES=1, the RDNA4 default).
             #[cfg(feature = "rocm")]
-            if let Some(p) = preflight
-                .pinned
-                .lock()
-                .unwrap()
-                .as_mut()
-                .filter(|_| std::env::var("GPU_MAX_HW_QUEUES").as_deref() != Ok("1"))
-            {
+            if let Some(p) = preflight.pinned.lock().unwrap().as_mut() {
                 let chains = preflight.host_chains.lock().unwrap();
                 p.stage(
                     preflight.trace.wom.len() as u32,

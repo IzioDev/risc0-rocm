@@ -460,6 +460,10 @@ fn build_rocm_kernels() {
     let mut risc0_amalg = String::new();
     let mut supra_amalg = String::new();
     let mut separate_files = Vec::new();
+    // The generated witgen steps' trace-read asserts as plain traps (see rec_fast_assert.cuh).
+    // RISC0_HIP_REC_ASSERT=1 keeps HIP's __assert_fail.
+    println!("cargo:rerun-if-env-changed=RISC0_HIP_REC_ASSERT");
+    let fast_assert = env::var("RISC0_HIP_REC_ASSERT").map_or(true, |v| v != "1");
     for cu in &cu_files {
         let name = cu.file_name().unwrap().to_str().unwrap();
         let abs = std::fs::canonicalize(cu).unwrap();
@@ -469,6 +473,12 @@ fn build_rocm_kernels() {
         } else if name == "ffi_supra.cu" || name == "eval_check.cu" {
             supra_amalg.push_str(&line);
         } else {
+            if fast_assert && name.starts_with("step_") {
+                risc0_amalg.push_str(&format!(
+                    "#include \"{}/rec_fast_assert.cuh\"\n",
+                    kernel_dir.display()
+                ));
+            }
             risc0_amalg.push_str(&line);
         }
     }
