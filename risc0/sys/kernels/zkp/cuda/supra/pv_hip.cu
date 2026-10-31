@@ -28,9 +28,12 @@ namespace pv_tu {
 #include "pv.cuh"
 } // namespace pv_tu
 
-void pv_hip_rows(uint4* out, const uint32_t* m, uint32_t count, uint32_t col_size, hipStream_t s) {
+void pv_hip_rows(uint4* out, const uint32_t* m, uint32_t count, uint32_t col_size, hipStream_t s, bool v0) {
   uint32_t bs = count < 128 ? count : 128;
-  pv_tu::pv::rows_k<<<(count + bs - 1) / bs, bs, 0, s>>>(out, m, count, col_size);
+  if (v0)
+    pv_tu::pv::rows0_k<<<(count + bs - 1) / bs, bs, 0, s>>>(out, m, count, col_size);
+  else
+    pv_tu::pv::rows_k<<<(count + bs - 1) / bs, bs, 0, s>>>(out, m, count, col_size);
 }
 
 void pv_hip_fold(uint4* out, const uint4* in, uint32_t n, hipStream_t s) {

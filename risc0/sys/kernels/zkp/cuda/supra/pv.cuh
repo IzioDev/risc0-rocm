@@ -103,6 +103,10 @@ constexpr int32_t PV_DHE[24] = {
     1178086656,  -1482974038, -1528792916, 316128532,   1581421748, 456216014};
 // 2^56 mod p (even).
 constexpr int32_t PV_C56 = 0x0dddddde;
+// rows_k buffer loads: cache policy bits (PV_BAUX, see rows_k).
+#ifndef PV_BAUX
+#define PV_BAUX 0
+#endif
 #endif
 
 __device__ __forceinline__ uint32_t red1(uint32_t r) { // [0, 2p) -> [0, p)
@@ -471,6 +475,65 @@ __global__ __launch_bounds__(128, 6) void rows_k(uint4* out,
 #pragma unroll
   for (int i = 0; i < 24; i++)
     x[i] = 0;
+#if defined(__GFX11__) || defined(__GFX12__)
+  // RDNA3/4: the 16 columns of an absorb through one buffer resource (base: its first column, in
+  // SGPRs), the column offset j * dim_x * 4 as the SGPR offset and this row's byte offset as the
+  // VGPR offset: no per-load 64-bit address arithmetic, and only the zero-padded last absorb checks
+  // bounds (before: two VALU adds and a branch per load, one load per basic block). Needs
+  // 16 * dim_x * 4 <= 2^32, i.e. dim_x <= 2^26 rows (else plain loads). One permute() call site.
+  const bool rs = dim_x <= (1u << 26);
+  const uint32_t off = gid << 2, cs = dim_x << 2;
+  uint32_t i = 0;
+#pragma unroll 1
+  do {
+    if (rs) {
+      const __amdgpu_buffer_rsrc_t r = __builtin_amdgcn_make_buffer_rsrc(
+          const_cast<uint32_t*>(m) + size_t(i) * dim_x, (short)0, (int)0xffffffff, 0x31004000);
+      if (i + 16 <= dim_y) {
+#pragma unroll
+        for (int j = 0; j < 16; j++)
+          x[j] = (uint32_t)__builtin_amdgcn_raw_buffer_load_b32(r, off, j * cs, PV_BAUX);
+      } else {
+#pragma unroll
+        for (int j = 0; j < 16; j++)
+          x[j] = i + j < dim_y ? (uint32_t)__builtin_amdgcn_raw_buffer_load_b32(r, off, j * cs, PV_BAUX) : 0u;
+      }
+    } else {
+#pragma unroll
+      for (int j = 0; j < 16; j++)
+        x[j] = i + j < dim_y ? __ldg(m + gid + (size_t)(i + j) * dim_x) : 0u;
+    }
+    permute(x);
+    i += 16;
+  } while (i < dim_y);
+#else
+  m += gid;
+  uint32_t i = 0;
+  do {
+#pragma unroll
+    for (int j = 0; j < 16; j++, i++)
+      x[j] = i < dim_y ? __ldg(m + (size_t)i * dim_x) : 0u;
+    permute(x);
+  } while (i < dim_y);
+#endif
+  out[(size_t)gid * 2] = make_uint4(x[0], x[1], x[2], x[3]);
+  out[(size_t)gid * 2 + 1] = make_uint4(x[4], x[5], x[6], x[7]);
+}
+
+#ifdef __HIPCC__
+// rows_k with plain global loads (a 64-bit address and a bounds check per load), for
+// RISC0_HIP_PV_ROWS0=1.
+__global__ __launch_bounds__(128, 6) void rows0_k(uint4* out,
+                                                  const uint32_t* __restrict__ m,
+                                                  uint32_t dim_x,
+                                                  uint32_t dim_y) {
+  uint32_t gid = blockDim.x * blockIdx.x + threadIdx.x;
+  if (gid >= dim_x)
+    return;
+  uint32_t x[24];
+#pragma unroll
+  for (int i = 0; i < 24; i++)
+    x[i] = 0;
   m += gid;
   uint32_t i = 0;
   do {
@@ -482,5 +545,6 @@ __global__ __launch_bounds__(128, 6) void rows_k(uint4* out,
   out[(size_t)gid * 2] = make_uint4(x[0], x[1], x[2], x[3]);
   out[(size_t)gid * 2 + 1] = make_uint4(x[4], x[5], x[6], x[7]);
 }
+#endif
 
 } // namespace pv
