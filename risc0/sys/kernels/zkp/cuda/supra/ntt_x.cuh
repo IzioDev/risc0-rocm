@@ -602,6 +602,42 @@ void bit_rev_t2_batched(fr_t* io0, uint32_t lg, size_t stride)
 }
 #endif
 
+#ifdef __HIPCC__
+// Out-of-place bit_rev_t2_batched: column c of in (stride is) bit-reversed into column c of out
+// (stride os); in and out must not overlap.
+template<unsigned int Z, unsigned int NT>
+__launch_bounds__(NT) __global__
+void bit_rev_t2_oop(fr_t* out0, const fr_t* __restrict__ in0, uint32_t lg, size_t is, size_t os)
+{
+    constexpr uint32_t LZ = lg2(Z);
+    __shared__ uint32_t A[Z][Z + 1], B[Z][Z + 1];
+    const uint32_t* in = reinterpret_cast<const uint32_t*>(in0 + blockIdx.y * is);
+    uint32_t* out = reinterpret_cast<uint32_t*>(out0 + blockIdx.y * os);
+    const index_t g = blockIdx.x;
+    const index_t gr = bit_rev(g, lg - 2 * LZ);
+    if (g > gr)
+        return;
+    const index_t step = (index_t)1 << (lg - LZ);
+    const bool two = g != gr;
+    #pragma unroll 4
+    for (uint32_t e = threadIdx.x; e < Z * Z; e += NT) {
+        const uint32_t i = e / Z, c = e % Z;
+        A[i][c] = in[i * step + g * Z + c];
+        if (two)
+            B[i][c] = in[i * step + gr * Z + c];
+    }
+    __syncthreads();
+    #pragma unroll 4
+    for (uint32_t e = threadIdx.x; e < Z * Z; e += NT) {
+        const uint32_t r = e / Z, c = e % Z;
+        const uint32_t rc = bit_rev(c, LZ), rr = bit_rev(r, LZ);
+        out[r * step + gr * Z + c] = A[rc][rr];
+        if (two)
+            out[r * step + g * Z + c] = B[rc][rr];
+    }
+}
+#endif
+
 static void bitrev_batched(const stream_t& s, fr_t* io, unsigned lg, unsigned cols)
 {
     const uint32_t Z = 64;   // 256 / sizeof(fr_t)

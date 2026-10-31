@@ -333,6 +333,132 @@ __global__ __launch_bounds__(128) void fold_tail_k(uint4* nodes, uint32_t n0) {
 }
 #endif
 
+#ifdef __HIPCC__
+// One permutation on 4 lanes (q = lane & 3) for latency-bound launches: small fold levels and the
+// top of a fold tree. Lane q < 3 holds cells 8q .. 8q+7 (M4 groups 2q, 2q+1); lane 3 idles (its
+// cells are garbage, masked out of every cross-lane sum). Cross-lane sums use quad DPP (xor 1,
+// xor 2). Same arithmetic as permute() (the sums lo/tb and every modular sum are exact whatever
+// the order), so the output is bit-identical. ~1.3x lower latency per permutation (harness:
+// fold of 1 or 512 digests, the 128 -> 1 tail), slower above ~2^11 permutations.
+namespace q4 {
+// x from lane (lane ^ 1) / (lane ^ 2) of the quad
+__device__ __forceinline__ uint32_t x1(uint32_t v) { return __builtin_amdgcn_update_dpp(0, v, 0xB1, 0xf, 0xf, false); }
+__device__ __forceinline__ uint32_t x2(uint32_t v) { return __builtin_amdgcn_update_dpp(0, v, 0x4E, 0xf, 0xf, false); }
+// modular sum over the 3 active lanes of the quad (lane 3 passes v = 0)
+__device__ __forceinline__ uint32_t qsum(uint32_t v) {
+  v = addm(v, x1(v));
+  return addm(v, x2(v));
+}
+// x[8]: this lane's cells, canonical. External layer.
+__device__ __forceinline__ void m_ext(uint32_t* x, bool idle) {
+  m4(x[0], x[1], x[2], x[3]);
+  m4(x[4], x[5], x[6], x[7]);
+  uint32_t s[4];
+#pragma unroll
+  for (int j = 0; j < 4; j++) {
+    s[j] = idle ? 0u : addm(x[j], x[4 + j]);
+    s[j] = qsum(s[j]);
+  }
+#pragma unroll
+  for (int i = 0; i < 8; i++)
+    x[i] = addm(x[i], s[i & 3]);
+}
+__device__ __forceinline__ void full_round(uint32_t* x, int r, uint32_t q, bool idle) {
+  const uint32_t* rc = PV_RCF + r * 24 + 8 * (idle ? 0 : q);
+#pragma unroll
+  for (int i = 0; i < 8; i++)
+    x[i] = canon(ssbox(int32_t(x[i] + (rc[i] - P))));
+  m_ext(x, idle);
+}
+__device__ __forceinline__ void partial_rounds(uint32_t* x, uint32_t q, bool idle) {
+  int32_t e[8], dh[8];
+#pragma unroll
+  for (int i = 0; i < 8; i++) {
+    e[i] = int32_t(x[i]);
+    dh[i] = PV_DHE[8 * (idle ? 0 : q) + i];
+  }
+  typedef unsigned short u16x2 __attribute__((ext_vector_type(2)));
+#pragma unroll 1
+  for (int r = 0; r < 21; r++) {
+    int32_t s0 = ssbox(int32_t(canon(e[0]) + (PV_RCP[r] - P)));
+    e[0] = q == 0 ? s0 : e[0];
+    uint32_t lo = 0;
+    u16x2 hp = {0, 0};
+#pragma unroll
+    for (int i = 0; i < 8; i += 2) {
+      lo += uint32_t(e[i]) + uint32_t(e[i + 1]);
+      hp += __builtin_bit_cast(u16x2, __builtin_amdgcn_perm(uint32_t(e[i + 1]), uint32_t(e[i]), 0x0b070903u));
+    }
+    uint32_t hpu = idle ? 0u : __builtin_bit_cast(uint32_t, hp);
+    lo = idle ? 0u : lo;
+    lo += x1(lo);
+    hpu = __builtin_bit_cast(uint32_t, __builtin_bit_cast(u16x2, hpu) + __builtin_bit_cast(u16x2, x1(hpu)));
+    lo += x2(lo);
+    hpu = __builtin_bit_cast(uint32_t, __builtin_bit_cast(u16x2, hpu) + __builtin_bit_cast(u16x2, x2(hpu)));
+    hp = __builtin_bit_cast(u16x2, hpu);
+    int32_t tb = int32_t(int16_t(hp.x)) + int32_t(int16_t(hp.y));
+    int32_t c = tb + int32_t((lo - (uint32_t(tb) << 24)) >> 24);
+    int64_t a = int64_t(uint64_t(lo & 0xffffffu) << 32) + int64_t(c) * PV_C56;
+#pragma unroll
+    for (int i = 0; i < 8; i++)
+      e[i] = sredc_even(int64_t(dh[i]) * e[i] + a);
+  }
+#pragma unroll
+  for (int i = 0; i < 8; i++)
+    x[i] = canon(e[i]);
+}
+__device__ __forceinline__ void permute(uint32_t* x, uint32_t q) {
+  const bool idle = q == 3;
+  m_ext(x, idle);
+#pragma unroll 1
+  for (int r = 0; r < 8; r++) {
+    if (r == 4)
+      partial_rounds(x, q, idle);
+    full_round(x, r, q, idle);
+  }
+}
+// One fold permutation per quad: digest pair t (inputs in[2t], in[2t+1]) -> out[t]. Lanes 0/1 load
+// one input digest each, lane 0 stores.
+__device__ __forceinline__ void fold_one(uint4* out, const uint4* in, uint32_t t, uint32_t q) {
+  uint32_t x[8];
+  if (q < 2) {
+    uint4 a = in[(size_t)t * 4 + 2 * q], b = in[(size_t)t * 4 + 2 * q + 1];
+    x[0] = a.x; x[1] = a.y; x[2] = a.z; x[3] = a.w;
+    x[4] = b.x; x[5] = b.y; x[6] = b.z; x[7] = b.w;
+  } else {
+#pragma unroll
+    for (int i = 0; i < 8; i++)
+      x[i] = 0;
+  }
+  permute(x, q);
+  if (q == 0) {
+    out[(size_t)t * 2] = make_uint4(x[0], x[1], x[2], x[3]);
+    out[(size_t)t * 2 + 1] = make_uint4(x[4], x[5], x[6], x[7]);
+  }
+}
+} // namespace q4
+
+// out[t] = hash of in[2t], in[2t + 1], t < n: 4 threads per output (blockDim a multiple of 4).
+__global__ __launch_bounds__(256) void fold_q4_k(uint4* out, const uint4* in, uint32_t n) {
+  uint32_t gid = blockDim.x * blockIdx.x + threadIdx.x;
+  uint32_t t = gid >> 2;
+  if (t >= n)
+    return;
+  q4::fold_one(out, in, t, gid & 3);
+}
+
+// fold_tail_k on 4 threads per permutation: layers n0 .. 1, 4 * n0 <= 1024 threads.
+__global__ __launch_bounds__(512) void fold_tail_q4_k(uint4* nodes, uint32_t n0) {
+  uint32_t t = threadIdx.x >> 2, q = threadIdx.x & 3;
+#pragma unroll 1
+  for (uint32_t n = n0; n >= 1; n >>= 1) {
+    if (t < n)
+      q4::fold_one(nodes + 2 * (size_t)n, nodes + 4 * (size_t)n, t, q);
+    __syncthreads();
+  }
+}
+#endif
+
 // out[r] = hash of row r of the column-major dim_x x dim_y matrix m (16 elements per absorb).
 __global__ __launch_bounds__(128, 6) void rows_k(uint4* out,
                                                  const uint32_t* __restrict__ m,

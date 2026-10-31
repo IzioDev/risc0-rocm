@@ -257,9 +257,9 @@ pass_k(const fr_t* __restrict__ in, fr_t* __restrict__ out, size_t ics, size_t o
 // DRAM-bound, and bb31 Montgomery products are most of the issue time (opt-artifacts
 // r0amd/ntt2). pass_h is pass_k with the same thread/LDS layout and:
 //  * the Montgomery product in plain C (fr_t's v_mad_u64_u32 asm statement is opaque to the
-//    scheduler) with its final reduction as a 32-bit min (h - p wraps when h < p);
+//    scheduler) as a signed REDC: 2 quarter-rate multiplies instead of 3 (see mul);
 //  * add/sub as min(a + b, a + b - p) / min(a - b, a - b + p), without a carry SGPR;
-//  * lazy reduction: butterfly outputs that are next only multiplied stay in [0, 2p) (see dit);
+//  * lazy reduction: butterfly outputs that are next only multiplied stay in [-p, p) (see dit);
 //  * 32-bit byte offsets from a uniform column base (saddr global loads/stores);
 //  * MODE 2: the coset twist w_Lc^(row*b), row = n1 + LP1*n2, is applied as w_64^(b*n2) (uniform
 //    per block) before the first radix-16 and as w_Lc^(b*n1), folded into a per-coset copy of
@@ -271,12 +271,21 @@ namespace hq {
 constexpr uint32_t P = 0x78000001u;
 __device__ __forceinline__ uint32_t add(uint32_t a, uint32_t b) { uint32_t s = a + b; return min(s, s - P); }
 __device__ __forceinline__ uint32_t sub(uint32_t a, uint32_t b) { uint32_t d = a - b; return min(d, d + P); }
+// An opaque copy: keeps LLVM from folding the shift-adds of mul() back into a v_mul_lo_u32.
+__device__ __forceinline__ uint32_t opq(uint32_t x) { asm("" : "+v"(x)); return x; }
+// a * b * 2^-32 mod p, canonical, for a in [-p, p) (int32 bits: canonical or a lazy output) and b
+// canonical: signed REDC, 2 quarter-rate ops instead of 3. t = a * b (v_mad_i64_i32), |t| < p^2;
+// m = (int32)(t * p^-1 mod 2^32), p^-1 = 2^31 + 2^27 + 1, from two v_lshl_add_u32; t - m * p
+// (one v_mad_i64_i32) is 0 mod 2^32 and |t - m * p| < p^2 + 2^31 p < 2^63, so its high word r is
+// the exact quotient, == a * b * 2^-32 (mod p), |r| <= (p^2 + 2^31 p) / 2^32 < 0.97p; min(r, r + p)
+// as u32 is canonical.
 __device__ __forceinline__ uint32_t mul(uint32_t a, uint32_t b)
 {
-    uint64_t t = (uint64_t)a * b;
-    uint32_t red = (uint32_t)t * 0x77ffffffu;                     // -p^-1 mod 2^32
-    uint32_t h = (uint32_t)(((uint64_t)red * P + t) >> 32);      // < p + a*b/2^32 < 2p
-    return min(h, h - P);
+    int64_t t = (int64_t)(int32_t)a * (int32_t)b;
+    uint32_t lo = (uint32_t)t;
+    int32_t m = (int32_t)(opq(lo + (lo << 27)) + (lo << 31));
+    uint32_t r = (uint32_t)((uint64_t)(t + (int64_t)m * -(int64_t)P) >> 32);
+    return min(r, r + P);
 }
 // element offset i within one column (at most 2^23 elements), scaled to bytes in 32 bits
 __device__ __forceinline__ uint32_t ld(const uint32_t* base, uint32_t i)
@@ -284,8 +293,9 @@ __device__ __forceinline__ uint32_t ld(const uint32_t* base, uint32_t i)
 __device__ __forceinline__ void st(uint32_t* base, uint32_t i, uint32_t x)
 {   *(uint32_t*)((char*)base + (i << 2)) = x;   }
 // Lazy reduction: an output that is next used only as the left operand of mul (a 't' with k != 0
-// at the next level, or with LZ any output of the last level) is left in [0, 2p) (u + t, u - t + p);
-// mul(a, b) is canonical for any 32-bit a and canonical b. Everything else stays canonical.
+// at the next level, or with LZ any output of the last level) is left in [-p, p) as int32 bits
+// (u + t - p, u - t); mul(a, b) is canonical for such a and canonical b, red() makes it canonical.
+// Everything else stays canonical.
 template<int LOGP, int LG, bool LZ>
 __device__ __forceinline__ void dit(uint32_t* w, const uint32_t* rootsP)
 {
@@ -298,8 +308,8 @@ __device__ __forceinline__ void dit(uint32_t* w, const uint32_t* rootsP)
             for (int k = 0; k < half; k++) {
                 uint32_t u = w[s + k], t = w[s + k + half];
                 if (k != 0) t = mul(t, rootsP[k << (LOGP - LG)]);
-                w[s + k] = nt && (k != 0 || LG == LOGP) ? u + t : add(u, t);
-                w[s + k + half] = nt ? u - t + P : sub(u, t);
+                w[s + k] = nt && (k != 0 || LG == LOGP) ? u + t - P : add(u, t);
+                w[s + k + half] = nt ? u - t : sub(u, t);
             }
         }
         dit<LOGP, LG + 1, LZ>(w, rootsP);
@@ -316,7 +326,7 @@ __device__ __forceinline__ void dft(uint32_t* v, const uint32_t* rootsP)
     #pragma unroll
     for (int i = 0; i < PP; i++) v[i] = w[i];
 }
-__device__ __forceinline__ uint32_t red(uint32_t a) { return min(a, a - P); }   // [0, 2p) -> canonical
+__device__ __forceinline__ uint32_t red(uint32_t a) { return min(a, a + P); }   // [-p, p) -> canonical
 __device__ __forceinline__ uint32_t tw_at(const Tw& tw, unsigned e) {
     e &= (1u << tw.lgN) - 1;
     return mul(*(const uint32_t*)&tw.A[e & 4095], *(const uint32_t*)&tw.B[e >> 12]);
@@ -773,11 +783,11 @@ static Side& side(const gpu_t& gpu)
 
 // forward LDE of `cols` natural-order coefficient columns Cn into E (issued on stream s)
 static void fwd_cols(cudaStream_t s, const Tables& F, const Cfg& G, fr_t* T2, unsigned lg, unsigned kf,
-                     const fr_t* Cn, fr_t* E)
+                     const fr_t* Cn, fr_t* E, size_t ics = 0)
 {
     const unsigned lgN = lg + 2;
     const size_t n = (size_t)1 << lg, N = n << 2;
-    pass<2>(s, lg - F.lgLr, G.FTC, kf, Cn, T2, n, N, F.lgLr, 0, F.col, Tw{F.A, F.B, lgN});
+    pass<2>(s, lg - F.lgLr, G.FTC, kf, Cn, T2, ics ? ics : n, N, F.lgLr, 0, F.col, Tw{F.A, F.B, lgN});
     pass<1>(s, F.lgLr, G.FTR, kf, T2, E, N, N, F.lgLc, 0, F.row, Tw{nullptr, nullptr, 0},
             nullptr, nullptr, fr_t(1), F_DISCARD_IN | F_CS_OUT);
 }
@@ -823,20 +833,26 @@ static void commit(const gpu_t& gpu, fr_t* C, fr_t* E, const fr_t* W, unsigned l
 }
 
 // E = LDE of natural-order coefficients Cn (cols columns), same scheme as commit's forward half.
-static void forward(const gpu_t& gpu, fr_t* E, const fr_t* Cn, unsigned lg, unsigned lgB, unsigned cols)
+// ics: column stride of Cn (default n). With ics == N, Cn may lie inside E (column c's input in
+// column c's output): a chunk's input is read by its column pass before its row pass writes E.
+static void forward(const gpu_t& gpu, fr_t* E, const fr_t* Cn, unsigned lg, unsigned lgB, unsigned cols,
+                    size_t ics = 0)
 {
     const Cfg G = cfg(lg);
     const unsigned lgN = lg + lgB;
     const size_t n = (size_t)1 << lg, N = n << lgB;
+    if (ics == 0) ics = n;
     const Tables& F = tables(gpu, lgN, G.FR, lg - G.FR, false);
     std::lock_guard<std::mutex> lock(side_mtx);
     Side& S = side(gpu);
     cudaStream_t st = gpu;
     if (G.NS == 0) {
         for (unsigned c = 0; c < cols; c += G.CHF)
-            fwd_cols(st, F, G, S.t2(lg, 0), lg, std::min(G.CHF, cols - c), Cn + c * n, E + c * N);
+            fwd_cols(st, F, G, S.t2(lg, 0), lg, std::min(G.CHF, cols - c), Cn + c * ics, E + c * N, ics);
         return;
     }
+    if (ics != n)
+        throw cuda_error(cudaErrorInvalidValue, "nttq::forward: input stride with side streams");
     CUDA_OK(cudaEventRecord(S.inv, st));
     for (int i = 0; i < 2; i++) CUDA_OK(cudaStreamWaitEvent(S.s[i], S.inv, 0));
     unsigned rr = 0;

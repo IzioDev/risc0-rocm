@@ -41,3 +41,13 @@ void pv_hip_fold(uint4* out, const uint4* in, uint32_t n, hipStream_t s) {
 void pv_hip_fold_tail(uint4* nodes, uint32_t n0, hipStream_t s) {
   pv_tu::pv::fold_tail_k<<<1, n0, 0, s>>>(nodes, n0);
 }
+
+// 4 lanes per permutation (pv.cuh fold_q4_k / fold_tail_q4_k): n <= 128 for the tail.
+void pv_hip_fold_q4(uint4* out, const uint4* in, uint32_t n, hipStream_t s) {
+  uint32_t t = 4 * n, bs = t < 256 ? t : 256;
+  pv_tu::pv::fold_q4_k<<<(t + bs - 1) / bs, bs, 0, s>>>(out, in, n);
+}
+
+void pv_hip_fold_tail_q4(uint4* nodes, uint32_t n0, hipStream_t s) {
+  pv_tu::pv::fold_tail_q4_k<<<1, 4 * n0, 0, s>>>(nodes, n0);
+}

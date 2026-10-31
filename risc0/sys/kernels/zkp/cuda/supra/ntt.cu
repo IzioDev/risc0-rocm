@@ -432,10 +432,20 @@ static bool nttq_expand_ntt(const gpu_t& gpu, fr_t* d_out, fr_t* d_in, uint32_t 
 }
 
 #ifdef __HIPCC__
-// LDE of bit-reversed coefficients for the check group and FRI: the expand is folded into the
-// first CT pass (zero-padded input synthesized on load, trivial levels skipped), all columns in one
-// launch per pass. nttq's two-pass LDE (NTT_EXPAND=q in NTTQ_TUNE builds) is no faster at lg 20
-// and slower at the other sizes (opt-artifacts r0amd/ntt texp, chkexp).
+// RISC0_HIP_NTT_EXPAND=x: the CT path below for every size (no nttq LDE).
+static bool hip_expand_q() {
+  static const bool on = [] {
+    const char* e = std::getenv("RISC0_HIP_NTT_EXPAND");
+    return !(e && e[0] == 'x');
+  }();
+  return on;
+}
+// LDE of bit-reversed coefficients for the check group and FRI. lg 16..21 with blowup 4: nttq's
+// two passes (pass_h). The input is bit-reversed out of place into the last quarter of each output
+// column, which the forward column pass reads before the row pass of the same columns overwrites
+// it; d_in is not touched. Check group lg 20: RX 7900 XTX 2.1 -> 1.5 ms, RX 9070 XT 3.0 -> 1.9 ms
+// (opt-artifacts r0amd/r9/R4). Other sizes: the expand folded into the first CT pass (zero-padded
+// input synthesized on load, trivial levels skipped), all columns in one launch per pass.
 static bool hip_expand_ntt(const gpu_t& gpu, fr_t* d_out, fr_t* d_in, uint32_t lg,
                            uint32_t lg_blowup, uint32_t poly_count) {
   const uint32_t lg_ext = lg + lg_blowup;
@@ -448,6 +458,13 @@ static bool hip_expand_ntt(const gpu_t& gpu, fr_t* d_out, fr_t* d_in, uint32_t l
   }
 #endif
   const size_t n = (size_t)1 << lg, N = n << lg_blowup;
+  if (nttq::supported(lg, lg_blowup) && nttq::enabled() && hip_expand_q()) {
+    bit_rev_t2_oop<32, 128><<<dim3(n / 32 / 32, poly_count), 128, 0, gpu>>>(
+        d_out + (N - n), d_in, lg, n, N);
+    CUDA_OK(cudaGetLastError());
+    nttq::forward(gpu, d_out, d_out + (N - n), lg, lg_blowup, poly_count, N);
+    return true;
+  }
   ct_x(gpu, poly_count, d_in, n, lg_blowup, d_out, N, (int)lg_ext, true);
   return true;
 }

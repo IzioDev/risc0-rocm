@@ -43,9 +43,13 @@ static bool use_pv_kernels() {
 // RX 9070 XT idles ~0.27 ms before the next kernel starts (power management, it seems; not after the
 // default-scheduler kernels, nor on gfx11), which costs those launches more than they gain.
 // RISC0_HIP_PV_TAIL=0: one launch per fold layer.
+// Folds of at most 2^10 digests and the tail run 4 lanes per permutation (fold_q4_k,
+// fold_tail_q4_k: latency-bound launches, ~20-50 us less per fold tree); RISC0_HIP_PV_Q4=0 off.
 void pv_hip_rows(uint4* out, const uint32_t* m, uint32_t count, uint32_t col_size, hipStream_t s);
 void pv_hip_fold(uint4* out, const uint4* in, uint32_t n, hipStream_t s);
 void pv_hip_fold_tail(uint4* nodes, uint32_t n0, hipStream_t s);
+void pv_hip_fold_q4(uint4* out, const uint4* in, uint32_t n, hipStream_t s);
+void pv_hip_fold_tail_q4(uint4* nodes, uint32_t n0, hipStream_t s);
 static int env_mode(const char* name) { // 0, 1, or 2 when unset (or anything else)
   const char* v = std::getenv(name);
   return v && std::strcmp(v, "0") == 0 ? 0 : v && std::strcmp(v, "1") == 0 ? 1 : 2;
@@ -76,6 +80,11 @@ static bool use_pv_tail() {
   static const bool on = env_mode("RISC0_HIP_PV_TAIL") != 0;
   return on;
 }
+static bool use_pv_q4() {
+  static const bool on = env_mode("RISC0_HIP_PV_Q4") != 0;
+  return on;
+}
+static constexpr uint32_t PV_Q4_MAX = 1024; // fold_q4_k up to this many digests
 static constexpr uint32_t PV_TAIL = 128; // fold_tail_k's block size limit
 static void hip_pv_rows(uint4* out, const uint32_t* m, uint32_t count, uint32_t col_size, hipStream_t s) {
   if (use_pv_tu(size_t(count) * ((col_size + 15) / 16))) {
@@ -86,7 +95,9 @@ static void hip_pv_rows(uint4* out, const uint32_t* m, uint32_t count, uint32_t 
   }
 }
 static void hip_pv_fold(uint4* out, const uint4* in, uint32_t n, hipStream_t s) {
-  if (use_pv_tu(n)) {
+  if (n <= PV_Q4_MAX && use_pv_q4()) {
+    pv_hip_fold_q4(out, in, n, s);
+  } else if (use_pv_tu(n)) {
     pv_hip_fold(out, in, n, s);
   } else {
     uint32_t bs = n < PV_BLOCK ? n : PV_BLOCK;
@@ -94,7 +105,9 @@ static void hip_pv_fold(uint4* out, const uint4* in, uint32_t n, hipStream_t s) 
   }
 }
 static void hip_pv_fold_tail(uint4* nodes, uint32_t n0, hipStream_t s) {
-  if (use_pv_tu(n0))
+  if (use_pv_q4())
+    pv_hip_fold_tail_q4(nodes, n0, s);
+  else if (use_pv_tu(n0))
     pv_hip_fold_tail(nodes, n0, s);
   else
     pv::fold_tail_k<<<1, n0, 0, s>>>(nodes, n0);
