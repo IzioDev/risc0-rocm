@@ -20,11 +20,13 @@
 // on a 12 GB Arc B580 at po2=20, with the pool, the third session's segments took 35.6 s instead
 // of 28-30 s. UR_L0_DISABLE_USM_ALLOCATOR=0 (or its older name,
 // SYCL_PI_LEVEL_ZERO_DISABLE_USM_ALLOCATOR) keeps it.
-// Also on Windows, immediate command lists and no copy engine, for Alchemist (Arc A770), which
-// runs on Level Zero's legacy adapter there: with its defaults the recursion receipts came out
-// wrong (the next join's preflight failed an equality check) unless a host wait followed each
-// eval_check, and both variables were needed. Either variable set keeps its value. Battlemage
-// runs on the V2 adapter, which always uses immediate command lists.
+// Also on Windows, immediate command lists and no copy engine for Level Zero's legacy adapter,
+// which the loader picks for an Alchemist card (Arc A770) when no visible device supports the V2
+// adapter. Without both, the recursion receipts came out wrong on an A770 (the next join's
+// preflight failed an equality check) unless a host wait followed each eval_check. Either
+// variable set keeps its value. On V2, the A770 lost the device (UR_RESULT_ERROR_DEVICE_LOST)
+// a few po2=20 segments into a session, so V2 is not forced here; with a Battlemage card also
+// visible the loader picks V2 for both. Battlemage runs on V2, which ignores these.
 #ifdef _WIN32
 static const bool kLevelZeroEnv = [] {
     if (!std::getenv("UR_L0_DISABLE_USM_ALLOCATOR") &&
@@ -39,6 +41,18 @@ static const bool kLevelZeroEnv = [] {
     return true;
 }();
 #endif
+
+// SYCL's persistent kernel cache on, unless SYCL_CACHE_PERSISTENT says otherwise: GPUs without
+// ahead-of-time code (e.g. Alchemist, Arc A770) get their kernels compiled from SPIR-V by the
+// driver on first use, which for the eval_check kernels takes minutes; cached, only once.
+static const bool kSyclCacheEnv = [] {
+#ifdef _WIN32
+    if (!std::getenv("SYCL_CACHE_PERSISTENT")) _putenv_s("SYCL_CACHE_PERSISTENT", "1");
+#else
+    setenv("SYCL_CACHE_PERSISTENT", "1", 0);
+#endif
+    return true;
+}();
 
 // Host-to-device staging. A pageable q.memcpy is NOT reliably captured at
 // enqueue: NEO stages only the first copy from a given host address, and a

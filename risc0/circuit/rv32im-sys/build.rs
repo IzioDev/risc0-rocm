@@ -1058,6 +1058,47 @@ fn intel_eval_xmx_enabled() -> bool {
     )
 }
 
+/// The `-fsycl-targets=` argument for the GPUs without Xe2's DPAS among the build's targets
+/// (anything but Battlemage and Lunar Lake, e.g. spir64 or an Alchemist target), or None. The
+/// XMX linking chains are written for Xe2's SIMD16 DPAS and gave wrong values on Alchemist (Arc
+/// A770, SIMD8 DPAS), so with XMX on, eval_check is also built without it for these targets, as
+/// risc0_rv32im_intel_noxmx, which risc0_rv32im_intel loads on such a GPU.
+fn intel_non_xmx_targets() -> Option<String> {
+    let arg = risc0_build_kernel::intel_sycl_targets_arg();
+    let rest: Vec<&str> = arg
+        .trim_start_matches("-fsycl-targets=")
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !t.contains("bmg") && !t.contains("lnl"))
+        .collect();
+    (!rest.is_empty()).then(|| format!("-fsycl-targets={}", rest.join(",")))
+}
+
+/// Puts a library built here but not linked (risc0_rv32im_intel_noxmx, loaded at run time) next
+/// to the linked ones: on Windows, where intel_link_library copies the DLLs to the profile and
+/// deps directories; elsewhere it already sits beside them in the cache directory.
+fn intel_place_unlinked_library(dir: &Path, name: &str) {
+    if !cfg!(windows) {
+        return;
+    }
+    let lib = risc0_build_kernel::intel_library_path(dir, name);
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    if let Some(profile_dir) = out_dir.ancestors().nth(3) {
+        for dest in [profile_dir.to_path_buf(), profile_dir.join("deps")] {
+            if dest.is_dir() {
+                let target = dest.join(lib.file_name().unwrap());
+                if let Err(e) = std::fs::copy(&lib, &target) {
+                    println!(
+                        "cargo:warning=could not copy {} to {}: {e}",
+                        lib.display(),
+                        target.display()
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Cache_dir helper that suffixes the variant name so each (GRF, SIMD)
 /// combination has its own .so + stamp set. Switching variants does NOT
 /// re-trigger a 30-min icpx compile if that variant is already cached.
@@ -1478,7 +1519,12 @@ fn build_intel_kernels() {
     // Check if we can skip rebuild: artifact present, stamp parses, hash
     // matches the recomputed-from-source hash, status was "ok" last build.
     let stamp_path = cache_dir.join("intel_eval_check.stamp");
-    let need_rebuild = stamp::need_rebuild(&so_path, &stamp_path, &mono_hash);
+    let noxmx_targets = (intel_eval_fast_enabled() && intel_eval_xmx_enabled())
+        .then(intel_non_xmx_targets)
+        .flatten();
+    let noxmx_path = risc0_build_kernel::intel_library_path(&cache_dir, "risc0_rv32im_intel_noxmx");
+    let need_rebuild = stamp::need_rebuild(&so_path, &stamp_path, &mono_hash)
+        || (noxmx_targets.is_some() && !noxmx_path.exists());
 
     if need_rebuild {
         eprintln!("Building Intel SYCL eval_check kernel...");
@@ -1702,6 +1748,45 @@ fn build_intel_kernels() {
         for line in log.lines().filter(|l| l.contains("spilled around")) {
             eprintln!("  {}", line.trim());
         }
+        if let Some(targets) = &noxmx_targets {
+            // The same kernel without the XMX linking, for the non-Xe2 targets only.
+            let plain_path = out_dir.join("intel_eval_check_amalg_fast_noxmx.cpp");
+            let status = risc0_build_kernel::python_command()
+                .env("RISC0_INTEL_EVAL_XMX", "0")
+                .arg("kernels/intel/evalfast/pipeline.py")
+                .arg(&amalg_path)
+                .arg(&plain_path)
+                .arg(out_dir.join("evalfast_work_noxmx"))
+                .status()
+                .unwrap_or_else(|e| panic!("failed to run evalfast/pipeline.py: {e}"));
+            if !status.success() {
+                stamp::write(&stamp_path, &mono_hash, &icpx_version, "failed");
+                panic!("evalfast/pipeline.py failed for the eval_check without XMX");
+            }
+            let mut plain_args: Vec<std::ffi::OsString> = args
+                .iter()
+                .filter(|a| !a.to_string_lossy().starts_with("-fsycl-targets="))
+                .cloned()
+                .collect();
+            plain_args.push(targets.into());
+            plain_args.push("-DRISC0_RV32IM_EVAL_NOXMX".into());
+            let output = risc0_build_kernel::intel_build_library(
+                &icpx,
+                &plain_args,
+                &[plain_path],
+                &cache_dir,
+                "risc0_rv32im_intel_noxmx",
+            );
+            if !output.status.success() {
+                stamp::write(&stamp_path, &mono_hash, &icpx_version, "failed");
+                panic!(
+                    "Intel eval_check (without XMX) compilation failed:\n{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            eprintln!("  Built {}", noxmx_path.display());
+        }
         stamp::write(&stamp_path, &mono_hash, &icpx_version, "ok");
         eprintln!("  Built {}", so_path.display());
     } else {
@@ -1710,6 +1795,9 @@ fn build_intel_kernels() {
 
     // Link eval_check
     risc0_build_kernel::intel_link_library(&cache_dir, "risc0_rv32im_intel");
+    if noxmx_targets.is_some() {
+        intel_place_unlinked_library(&cache_dir, "risc0_rv32im_intel_noxmx");
+    }
 
     // mono_path is the monolithic amalgamation without kernel wrapper (for multipass gen)
     let mono_path = out_dir.join("intel_eval_check_mono.cpp");

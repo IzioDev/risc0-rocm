@@ -1465,16 +1465,17 @@ pub fn find_icpx() -> PathBuf {
 }
 
 /// The `-fsycl-targets=` argument for the kernels compiled ahead of time: Intel's Battlemage GPUs
-/// (BMG-G31: Arc Pro B70 and B60; BMG-G21: Arc B580 and B570). A GPU missing from the list has
-/// no device code for these kernels. `RISC0_INTEL_SYCL_TARGETS` overrides the list, e.g.
-/// `intel_gpu_bmg_g31` alone builds faster for a B70. Kernel caches must include the value in
-/// their keys, so that a build for other targets doesn't reuse them.
+/// (BMG-G31: Arc Pro B70 and B60; BMG-G21: Arc B580 and B570), plus SPIR-V, which the GPU driver
+/// compiles on first use for any other Intel GPU (e.g. Alchemist, Arc A770). Without spir64 a GPU
+/// missing from the list has no device code for these kernels. `RISC0_INTEL_SYCL_TARGETS`
+/// overrides the list, e.g. `intel_gpu_bmg_g31` alone builds faster for a B70. Kernel caches must
+/// include the value in their keys, so that a build for other targets doesn't reuse them.
 pub fn intel_sycl_targets_arg() -> String {
     println!("cargo:rerun-if-env-changed=RISC0_INTEL_SYCL_TARGETS");
     let targets = env::var("RISC0_INTEL_SYCL_TARGETS")
         .ok()
         .filter(|t| !t.trim().is_empty())
-        .unwrap_or_else(|| "intel_gpu_bmg_g31,intel_gpu_bmg_g21".into());
+        .unwrap_or_else(|| "intel_gpu_bmg_g31,intel_gpu_bmg_g21,spir64".into());
     format!("-fsycl-targets={targets}")
 }
 
