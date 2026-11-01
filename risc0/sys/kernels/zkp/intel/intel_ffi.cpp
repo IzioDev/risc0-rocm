@@ -20,11 +20,22 @@
 // on a 12 GB Arc B580 at po2=20, with the pool, the third session's segments took 35.6 s instead
 // of 28-30 s. UR_L0_DISABLE_USM_ALLOCATOR=0 (or its older name,
 // SYCL_PI_LEVEL_ZERO_DISABLE_USM_ALLOCATOR) keeps it.
+// Also on Windows, immediate command lists and no copy engine, for Alchemist (Arc A770), which
+// runs on Level Zero's legacy adapter there: with its defaults the recursion receipts came out
+// wrong (the next join's preflight failed an equality check) unless a host wait followed each
+// eval_check, and both variables were needed. Either variable set keeps its value. Battlemage
+// runs on the V2 adapter, which always uses immediate command lists.
 #ifdef _WIN32
-static const bool kLevelZeroUsmPoolOff = [] {
+static const bool kLevelZeroEnv = [] {
     if (!std::getenv("UR_L0_DISABLE_USM_ALLOCATOR") &&
         !std::getenv("SYCL_PI_LEVEL_ZERO_DISABLE_USM_ALLOCATOR"))
         _putenv_s("UR_L0_DISABLE_USM_ALLOCATOR", "1");
+    if (!std::getenv("UR_L0_USE_IMMEDIATE_COMMANDLISTS") &&
+        !std::getenv("SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS"))
+        _putenv_s("UR_L0_USE_IMMEDIATE_COMMANDLISTS", "1");
+    if (!std::getenv("UR_L0_USE_COPY_ENGINE") &&
+        !std::getenv("SYCL_PI_LEVEL_ZERO_USE_COPY_ENGINE"))
+        _putenv_s("UR_L0_USE_COPY_ENGINE", "0");
     return true;
 }();
 #endif
