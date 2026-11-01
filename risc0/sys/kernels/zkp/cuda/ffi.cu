@@ -37,6 +37,13 @@ __global__ void mix_poly_coeffs_v2(FpExt* __restrict__ out, const Fp* __restrict
                                    const FpExt* __restrict__ mixStart,
                                    const FpExt* __restrict__ mix, const uint32_t inputSize,
                                    const uint32_t count);
+#ifdef __HIPCC__
+__global__ void mix_poly_coeffs_v6(FpExt* __restrict__ out, const Fp* __restrict__ in,
+                                   const uint32_t* __restrict__ combos,
+                                   const FpExt* __restrict__ mixStart,
+                                   const FpExt* __restrict__ mix, const uint32_t inputSize,
+                                   const uint32_t count);
+#endif
 __global__ void gather_samples(Fp* dst, const Fp* src, const uint32_t* idxs, const uint32_t n,
                                const uint32_t size, const uint32_t stride);
 __global__ void combos_sub(FpExt* combos, const FpExt* deltas, const uint32_t* offsets,
@@ -111,6 +118,78 @@ const char* risc0_zkp_cuda_fill_u32(uint32_t* buf, uint32_t value, uint32_t coun
   return nullptr;
 }
 
+#ifdef __HIPCC__
+// The prefill queue: a dedicated hardware queue limited to RISC0_HIP_PREFILL_CUS compute units
+// (default 2, one WGP; 0 = all of them). A full-device fill beside the
+// latency-bound eval_check prologue (ef_prep: one thread, then constant-table copies) slowed it
+// from ~0.65 to ~2.7 ms on an RX 9070 XT by saturating DRAM; one WGP fills ~1 GB in ~10-20 ms
+// beside ef_eval_split (~160 ms) instead. Callers hold risc0_hip_hop::lock().
+static hipStream_t prefill_stream(int dev) {
+  static hipStream_t streams[16] = {};
+  static int state[16] = {};
+  if (dev < 0 || dev >= 16)
+    return nullptr;
+  if (!state[dev]) {
+    state[dev] = -1;
+    const char* v = std::getenv("RISC0_HIP_PREFILL_CUS");
+    int n = v && *v ? std::atoi(v) : 2;
+    uint32_t cus[8];
+    for (int i = 0; i < 8; i++) {
+      int lo = 32 * i;
+      cus[i] = n <= 0 || n >= lo + 32 ? ~0u : (n > lo ? (1u << (n - lo)) - 1 : 0u);
+    }
+    if (hipExtStreamCreateWithCUMask(&streams[dev], 8, cus) == hipSuccess) {
+      state[dev] = 1;
+    } else {
+      (void)hipGetLastError();
+      streams[dev] = nullptr;
+    }
+  }
+  return streams[dev];
+}
+
+// Fill forked off the persistent stream onto the prefill queue: it runs after everything queued on
+// the persistent stream so far, beside later work. *done is the event risc0_zkp_hip_fill_join
+// waits for (nullptr: the fill was queued on the persistent stream).
+const char* risc0_zkp_hip_fill_fork(uint32_t* buf, uint32_t value, size_t count, void** done) {
+  try {
+    hipStream_t main = getPersistentStream();
+    *done = nullptr;
+    std::unique_lock<std::recursive_mutex> lk(risc0_hip_hop::lock());
+    int dev = -1;
+    hipStream_t side = hipGetDevice(&dev) == hipSuccess ? prefill_stream(dev) : nullptr;
+    static hipEvent_t forkEv[16] = {};
+    hipEvent_t ev = nullptr;
+    if (side && dev < 16 && (forkEv[dev] || hipEventCreateWithFlags(&forkEv[dev], hipEventDisableTiming) == hipSuccess) &&
+        hipEventCreateWithFlags(&ev, hipEventDisableTiming) == hipSuccess &&
+        hipEventRecord(forkEv[dev], main) == hipSuccess && hipStreamWaitEvent(side, forkEv[dev], 0) == hipSuccess) {
+      CUDA_OK(value == 0 ? hipMemsetAsync(buf, 0, count * 4, side) : hipMemsetD32Async(buf, value, count, side));
+      CUDA_OK(hipEventRecord(ev, side));
+      *done = ev;
+      return nullptr;
+    }
+    (void)hipGetLastError();
+    if (ev)
+      (void)hipEventDestroy(ev);
+    CUDA_OK(value == 0 ? hipMemsetAsync(buf, 0, count * 4, main) : hipMemsetD32Async(buf, value, count, main));
+  } catch (const std::exception& err) {
+    return strdup(err.what());
+  }
+  return nullptr;
+}
+
+// Order the persistent stream after a forked fill (host = 1: wait on the host instead) and release
+// its event.
+const char* risc0_zkp_hip_fill_join(void* done, uint32_t host) {
+  try {
+    CUDA_OK(risc0_hip_hop::join_fill(host ? nullptr : getPersistentStream(), (hipEvent_t)done));
+  } catch (const std::exception& err) {
+    return strdup(err.what());
+  }
+  return nullptr;
+}
+#endif
+
 const char* risc0_zkp_cuda_eltwise_add_fp(Fp* out, const Fp* x, const Fp* y, uint32_t count) {
   return launchKernel(eltwise_add_fp, count, 0, out, x, y, count);
 }
@@ -171,6 +250,21 @@ const char* risc0_zkp_cuda_mix_poly_coeffs(FpExt* out,
                                            const uint32_t inputSize,
                                            const uint32_t count) {
   // v2 keeps the mix powers and combo ids in shared memory (20 bytes per input).
+#ifdef __HIPCC__
+  // ROCm: v6 (2 elements per thread, per-combo register accumulators; slower below 2^16 rows)
+  // unless RISC0_HIP_MIX_V6=0.
+  static const bool v6 = [] {
+    const char* e = getenv("RISC0_HIP_MIX_V6");
+    return !(e && e[0] == '0');
+  }();
+  if (v6 && inputSize <= 2048 && count >= (1u << 16) && (count % 2) == 0 &&
+      (reinterpret_cast<uintptr_t>(in) & 7) == 0) {
+    // >= 2^20 rows (~1.2 ms): on a side hardware queue (hip_hop.h).
+    return launchKernelHop(risc0_hip_hop::want(risc0_hip_hop::kMix, count, 20), mix_poly_coeffs_v6, count / 2,
+                           inputSize * (sizeof(FpExt) + sizeof(uint32_t)), out, in, combos, mixStart,
+                           mix, inputSize, count);
+  }
+#endif
   if (inputSize <= 2048) {
     return launchKernel(mix_poly_coeffs_v2, count, inputSize * (sizeof(FpExt) + sizeof(uint32_t)),
                         out, in, combos, mixStart, mix, inputSize, count);
@@ -213,7 +307,12 @@ const char* risc0_zkp_cuda_batch_evaluate_any(FpExt* out,
   }
   try {
     cudaStream_t stream = getPersistentStream();
+#ifdef __HIPCC__
+    // ROCm (lazy eu2_main): fewer, longer blocks measured ~5% faster on the rv32im data group.
+    const uint32_t targetBlocks = 512;
+#else
     const uint32_t targetBlocks = 1024;
+#endif
     uint32_t maxS = deg / minChunk;
     uint32_t S = 1;
     while (S < maxS && (uint64_t)S * nEvals < targetBlocks)

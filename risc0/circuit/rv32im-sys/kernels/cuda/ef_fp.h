@@ -82,8 +82,40 @@ private:
 #endif
   }
 
+#if defined(__HIP_DEVICE_COMPILE__)
+  // mul() on ROCm, bit-identical for all inputs: the final reduction is a v_min_u32 (ret - P
+  // wraps above ret when ret < P) instead of a 64-bit compare and a select. (fp.h's mul_rdna also
+  // forms red from shift-adds; in this kernel that measured 3 ms slower on gfx1100.)
+  static __device__ inline uint32_t mul_hip(uint32_t a, uint32_t b) {
+    uint64_t o64 = uint64_t(a) * uint64_t(b);
+    uint32_t red = M * -uint32_t(o64);
+    o64 += uint64_t(red) * uint64_t(P);
+    uint32_t ret = o64 >> 32;
+    return __builtin_elementwise_min(ret, ret - P);
+  }
+#endif
+
+public:
+  // x * M mod 2^32, the Montgomery factor of the generated kernels' lazy reductions. On ROCm two
+  // shift-adds (M = 2^31 + 2^27 + 1): a v_mul_lo_u32 issues at a quarter of the add rate on
+  // RDNA. The empty asm keeps LLVM from folding the shifts back into a multiply.
+#if defined(__HIP_DEVICE_COMPILE__)
+  static __device__ inline uint32_t mulM(uint32_t x) {
+    uint32_t t = x + (x << 27);
+    asm("" : "+v"(t));
+    return t + (x << 31);
+  }
+#else
+  static constexpr inline uint32_t mulM(uint32_t x) { return x * M; }
+#endif
+
+private:
   // Multiply two numbers
   static constexpr inline uint32_t mul(uint32_t a, uint32_t b) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    if (!__builtin_is_constant_evaluated())
+      return mul_hip(a, b);
+#endif
 #if defined(__CUDA_ARCH__) && defined(EF_FP_FAST)
     // Subtraction-form Montgomery REDC: with m = lo * P^-1 mod 2^32 the low
     // words of a*b and m*P cancel exactly, so (a*b - m*P) / 2^32 =

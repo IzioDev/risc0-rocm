@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Regenerate kernels/cuda/eval_check_ef.cu from the generated circuit.
+"""Regenerate kernels/cuda/eval_check_ef.cu (CUDA) and eval_check_ef_hip.cu (ROCm)
+from the generated circuit.
 
 usage: regen.py [--check]
 
@@ -46,9 +47,29 @@ Each pass prints what it did; EXPECT pins those lines, so a change in the
 circuit or a pass that changes the shape of the kernel fails here first: re-run
 the bit-exactness battery on the new kernel before updating the pins.
 
-The result is committed, so the CUDA build needs no Python. Re-run this after
+The ROCm kernel, eval_check_ef_hip.cu, is the chain's output after
+HIP_LAST (remat_lu.py) in to_hip.py's HIP forms: mksm2.py's shared-memory
+words cap the occupancy on RDNA, and mksub.py's splits only add calls there.
+wmma_hip.py then moves the poly_mix chains onto the matrix units for gfx12
+(RDNA4) devices only; other targets keep the scalar statements. hoist_hip.py
+issues the trace loads one window of statements ahead of their uses, and
+args_hip.py narrows the chain-function calls (32-bit cycle/steps, the kernel
+pointers read from a device table instead of passed in VGPRs); inline_hip.py
+then inlines the chain functions into the kernel (no callee-saved register
+saves at every call) and smem_hip.py moves each phase's hottest slab words to
+LDS on gfx11.
+wmma_hip.py through smem_hip.py run twice: the default (24 WMMA staging slots
+per wave, 32 LDS words per phase) and, for gfx12, 12 slots and 16 LDS words
+(smem_hip.py's LDS words on gfx12 too); pmlag_hip.py then lags the scalar
+links' constant loads (and the FpExt-term links' and chained closures' constant
+rows) in both: in the default (gfx11) every scalar link, in the gfx12 variant the
+plain links outside the WMMA chains. archsel_hip.py merges the outputs,
+the runs of lines that differ under #if defined(__GFX12__), and checks that
+each side selects back its input.
+
+The results are committed, so the GPU builds need no Python. Re-run this after
 changing the generated circuit (kernels/cxx/rust_poly_fp_*.cpp) or any of the
-passes; --check (run in CI) fails if the committed file is out of date.
+passes; --check (run in CI) fails if a committed file is out of date.
 """
 
 import difflib
@@ -57,9 +78,52 @@ import subprocess
 import sys
 import tempfile
 
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import archsel_hip  # noqa: E402
+import args_hip  # noqa: E402
+import hoist_hip  # noqa: E402
+import inline_hip  # noqa: E402
+import opq_hip  # noqa: E402
+import pmlag_hip  # noqa: E402
+import smem_hip  # noqa: E402
+import to_hip  # noqa: E402
+import wmma_hip  # noqa: E402
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SYS = os.path.normpath(os.path.join(HERE, '..', '..', '..'))  # rv32im-sys
 OUT = os.path.join(SYS, 'kernels', 'cuda', 'eval_check_ef.cu')
+OUT_HIP = os.path.join(SYS, 'kernels', 'cuda', 'eval_check_ef_hip.cu')
+HIP_LAST = 'remat_lu.py'
+# wmma_hip.py (after to_hip.py): the poly_mix chains on the gfx12 matrix units.
+WMMA_EXPECT = ('wmma_hip: 136 of 282 chains, 4672 of 4948 Fp links on the matrix units (wmin 6, 1 x 24 '
+               'slots, group 48), 0 chains without a free region')
+# hoist_hip.py (after wmma_hip.py): the trace loads issued one window of statements ahead of their uses.
+HOIST_EXPECT = 'hoist_hip: 22 functions, 3844 trace loads issued one window ahead (window 8)'
+# args_hip.py (last): 32-bit cycle/steps; the kernel pointers from ef_ptrs instead of call arguments.
+ARGS_EXPECT = 'args_hip: 32-bit cycle/steps, 101 signatures and 20 calls without 95 pointer arguments'
+# inline_hip.py (last): the chain functions inlined into ef_eval_split, one opaque row index each.
+INLINE_EXPECT = 'inline_hip: 21 chain functions inlined, 22 opaque row indices'
+# smem_hip.py (last): on gfx11 each phase's 32 most accessed slab words in LDS.
+SMEM_EXPECT = ('smem_hip: 22 functions; gfx11 LDS words: main 32 of 85 (539 of 751 accesses), LogUp 32 of 104 '
+               '(96 of 268)')
+# pmlag_hip.py (last): the scalar links' constants loaded <= 4 links ahead, the FpExt-term links' and
+# chained closures' constant rows not before the accumulator they depend on; in the gfx12 variant the
+# plain links (outside the WMMA chains) only.
+PMLAG_EXPECT = ('pmlag_hip: 22 functions, 5034 links and 157 closures with lagged constants (W 4)')
+PMLAG_GFX12_EXPECT = ('pmlag_hip: 22 functions, 364 plain links and 157 closures with lagged constants (W 4)')
+# opq_hip.py (both variants; the barriers are empty outside gfx11)
+OPQ_EXPECT = 'opq_hip: EF_OPQ64 at 5 multiply-accumulate sites (gfx11)'
+# The gfx12 variant (archsel_hip.py): 12 WMMA staging slots per wave (7.5 KB of LDS per block) and
+# smem_hip.py's LDS words on gfx12 too, 16 per phase (8 KB).
+WMMA_GFX12_SLOTS = 12
+SMEM_GFX12_WORDS = 16
+# ... and 31 LogUp words: the 15 past ef_sm's 16 rows in the WMMA staging array (unused by LogUp blocks).
+SMEM_GFX12_LU_WORDS = 31
+WMMA_GFX12_EXPECT = ('wmma_hip: 136 of 282 chains, 4672 of 4948 Fp links on the matrix units (wmin 6, 1 x 12 slots, group 60), 0 chains without a free region')
+HOIST_GFX12_EXPECT = HOIST_EXPECT
+SMEM_GFX12_EXPECT = ('smem_hip: 22 functions; gfx11 LDS words: main 16 of 85 (334 of 751 accesses), LogUp 31 of 104 (93 of 268)')
+ARCHSEL_EXPECT = ('archsel_hip: 3496 runs of 9531 lines selected by __GFX12__')
 NS = 'namespace risc0::circuit::rv32im_v2 {'
 
 # mksub.py cut points: function, body lines, cut line, live values passed to the tail (+ input
@@ -114,6 +178,41 @@ POST_HEADER = '''//
 // (mksm2.py) and every chain function split in two at its narrowest point
 // (mksub.py). The rematerialisation relies on data, accum and mix being
 // read-only for the whole kernel.
+'''
+HIP_POST_HEADER = '''//
+// ROCm build (kernels/cuda/evalfast/regen.py): the CUDA post-passes through
+// remat_lu.py (remat, lazyfp, close and linkext with the C++ 64-bit
+// multiply-adds, accfirst_cuda, the mksplit2 phase split, remat_lu), without
+// mksm2.py's shared-memory slab words, which cap the occupancy on RDNA, or
+// mksub.py's splits, in to_hip.py's HIP forms, with ef_fpext.h's lazy FpExt
+// multiply. On gfx12 (RDNA4) the poly_mix chains run on the matrix units
+// (wmma_hip.py: int8 WMMAs over LDS-staged constraint values, bit-exact; other
+// targets compile the scalar chains), then the trace loads issued one window of
+// statements ahead (hoist_hip.py), narrower chain-function calls (args_hip.py),
+// every chain function inlined into the kernel (inline_hip.py), with the trace
+// loads through per-32-column buffer resources (to_hip.py) and, on gfx11, the
+// hottest slab words in LDS (smem_hip.py). gfx12 compiles its own variant of
+// the lines that differ (archsel_hip.py): 12 WMMA staging slots per wave and
+// 16 LDS slab words per phase (~134 instead of ~137 ms on an RX 9070 XT), 15
+// more LogUp words in the WMMA staging area, which LogUp blocks do not use
+// (smem_hip.py), the WMMA A operands through an opaque SGPR base (wmma_hip.py)
+// and the poly_mix constants of the plain chain links, the FpExt-term links and
+// the closures loaded no earlier than pmlag_hip.py allows (~130.8 ms); other
+// targets, and the host pass, read the default: 24 slots, 32 words on gfx11,
+// where each scalar chain link's poly_mix constant is loaded at most 4 links
+// ahead (pmlag_hip.py: ~123.5 instead of ~136 ms on an RX 7900 XTX, no
+// v_readlane-restored SGPR spills; FpExt-term links and closures too, ~2 ms
+// less), the lazy 64-bit accumulators are not reassociated (opq_hip.py, ~5 ms
+// less) and the kernel runs 3 blocks per SIMD (build.rs: EF_MINB_GFX11, ~115.7
+// ms before pmlag_hip.py's closures and opq_hip.py). At po2 20 with 64-wide waves and EF_MINB
+// 4 (build.rs): ~139 ms on an RX 7900 XTX (gfx1100) and ~137 ms on an RX 9070 XT
+// (gfx1201), against ~156 and 141 ms inlined with global loads and the scratch
+// slab, 160 and 169 ms with the chain functions called (callee-saved register
+// saves around every call), 217 and 236 ms
+// before the uniform addressing, hoist_hip, args_hip and the shift-add / v_min
+// reductions, and 326 and 454 ms for the first ROCm kernel (the generator's output
+// before its CUDA post-passes). The rematerialisation relies on data, accum and
+// mix being read-only for the whole kernel.
 '''
 HEADER_END = '// kernel happens to tolerate them.\n'
 
@@ -179,30 +278,83 @@ def main():
                     sys.exit('regen: EXPECT failed: %s did not print\n  %s\nit printed:\n%s'
                              % (tool, line, log))
             gen = nxt
+            if tool == HIP_LAST:
+                with open(gen, newline='') as f:
+                    hip = f.read()
         with open(gen, newline='') as f:
             new = f.read()
-    assert new.count(HEADER_END) == 1
-    new = new.replace(HEADER_END, HEADER_END + POST_HEADER)
-    bad = [i + 1 for i, l in enumerate(new.split('\n')) if l != l.rstrip()]
-    if bad:
-        sys.exit('regen: trailing whitespace on %d generated lines (first: %d)' % (len(bad), bad[0]))
-    try:
-        with open(OUT, newline='') as f:
-            old = f.read()
-    except FileNotFoundError:
-        old = ''
-    if check:
-        if old != new:
-            diff = difflib.unified_diff(old.splitlines(True), new.splitlines(True),
-                                        'committed/eval_check_ef.cu', 'regenerated/eval_check_ef.cu')
-            sys.stdout.writelines(list(diff)[:200])
-            sys.exit('regen: kernels/cuda/eval_check_ef.cu is out of date; '
-                     'run kernels/cuda/evalfast/regen.py and commit the result')
-        print('regen: kernels/cuda/eval_check_ef.cu is up to date')
-    else:
-        with open(OUT, 'w', newline='') as f:
-            f.write(new)
-        print('regen: wrote %s' % OUT)
+    outputs = []
+
+    def chain(hip, slots, wmma_expect, nhot, nlu, hoist_expect, smem_expect, plain, lag_expect):
+        wstats = []
+        hip = wmma_hip.convert(hip, slots=slots, stats=wstats)
+        if wstats != [wmma_expect]:
+            sys.exit('regen: EXPECT failed: wmma_hip.py printed\n  %s\nnot\n  %s' % (wstats, wmma_expect))
+        hstats = []
+        hip = hoist_hip.convert(hip, stats=hstats)
+        if hstats != [hoist_expect]:
+            sys.exit('regen: EXPECT failed: hoist_hip.py printed\n  %s\nnot\n  %s' % (hstats, hoist_expect))
+        astats = []
+        hip = args_hip.convert(hip, stats=astats)
+        if astats != [ARGS_EXPECT]:
+            sys.exit('regen: EXPECT failed: args_hip.py printed\n  %s\nnot\n  %s' % (astats, ARGS_EXPECT))
+        istats = []
+        hip = inline_hip.convert(hip, stats=istats)
+        if istats != [INLINE_EXPECT]:
+            sys.exit('regen: EXPECT failed: inline_hip.py printed\n  %s\nnot\n  %s' % (istats, INLINE_EXPECT))
+        sstats = []
+        hip = smem_hip.convert(hip, nmain=nhot, nlu=nlu, gfx12=True, lu_alias=nlu > nhot, stats=sstats)
+        if sstats != [smem_expect]:
+            sys.exit('regen: EXPECT failed: smem_hip.py printed\n  %s\nnot\n  %s' % (sstats, smem_expect))
+        pstats = []
+        hip = pmlag_hip.convert(hip, plain=plain, stats=pstats)
+        if pstats != [lag_expect]:
+            sys.exit('regen: EXPECT failed: pmlag_hip.py printed\n  %s\nnot\n  %s' % (pstats, lag_expect))
+        ostats = []
+        hip = opq_hip.convert(hip, stats=ostats)
+        if ostats != [OPQ_EXPECT]:
+            sys.exit('regen: EXPECT failed: opq_hip.py printed\n  %s\nnot\n  %s' % (ostats, OPQ_EXPECT))
+        return hip
+    hip = to_hip.convert(hip)
+    # gfx12 (RDNA4) devices compile the variant, every other target the default (archsel_hip.py).
+    default = chain(hip, 24, WMMA_EXPECT, 32, 32, HOIST_EXPECT, SMEM_EXPECT, False, PMLAG_EXPECT)
+    variant = chain(hip, WMMA_GFX12_SLOTS, WMMA_GFX12_EXPECT, SMEM_GFX12_WORDS, SMEM_GFX12_LU_WORDS,
+                    HOIST_GFX12_EXPECT, SMEM_GFX12_EXPECT, True, PMLAG_GFX12_EXPECT)
+    mstats = []
+    hip = archsel_hip.merge(default, variant, '__GFX12__', stats=mstats)
+    if mstats != [ARCHSEL_EXPECT]:
+        sys.exit('regen: EXPECT failed: archsel_hip.py printed\n  %s\nnot\n  %s' % (mstats, ARCHSEL_EXPECT))
+    for path, text, post in ((OUT, new, POST_HEADER), (OUT_HIP, hip, HIP_POST_HEADER)):
+        assert text.count(HEADER_END) == 1
+        text = text.replace(HEADER_END, HEADER_END + post)
+        bad = [i + 1 for i, l in enumerate(text.split('\n')) if l != l.rstrip()]
+        if bad:
+            sys.exit('regen: trailing whitespace on %d generated lines of %s (first: %d)'
+                     % (len(bad), os.path.basename(path), bad[0]))
+        outputs.append((path, text))
+    stale = []
+    for path, text in outputs:
+        name = 'kernels/cuda/' + os.path.basename(path)
+        try:
+            with open(path, newline='') as f:
+                old = f.read()
+        except FileNotFoundError:
+            old = ''
+        if check:
+            if old != text:
+                diff = difflib.unified_diff(old.splitlines(True), text.splitlines(True),
+                                            'committed/' + name, 'regenerated/' + name)
+                sys.stdout.writelines(list(diff)[:200])
+                stale.append(name)
+            else:
+                print('regen: %s is up to date' % name)
+        else:
+            with open(path, 'w', newline='') as f:
+                f.write(text)
+            print('regen: wrote %s' % path)
+    if stale:
+        sys.exit('regen: %s out of date; run kernels/cuda/evalfast/regen.py and commit the result'
+                 % ' and '.join(stale))
 
 
 if __name__ == '__main__':

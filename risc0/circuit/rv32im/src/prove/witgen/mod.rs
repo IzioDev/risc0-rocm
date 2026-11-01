@@ -14,7 +14,7 @@
 
 pub(crate) mod bigint;
 pub(crate) mod byte_poly;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub(crate) mod cuda_stage;
 pub(crate) mod paged_map;
 pub(crate) mod poseidon2;
@@ -29,13 +29,14 @@ use anyhow::{Context, Result};
 
 static VERBOSE: LazyLock<bool> = LazyLock::new(|| std::env::var("RISC0_VERBOSE").is_ok());
 
-/// On CUDA the witgen kernel writes the five per-cycle columns (CYCLE_COLS) from the uploaded
-/// cycles, so the host injector leaves them out (5 of its ~5.1 entries per row at po2=20).
-/// Part of the witgen staging feature (`RISC0_CUDA_WITGEN_STAGE=0` keeps them in the injector).
+/// On CUDA and ROCm the witgen kernel writes the five per-cycle columns (CYCLE_COLS) from the
+/// uploaded cycles, so the host injector leaves them out (5 of its ~5.1 entries per row at
+/// po2=20). Part of the witgen staging feature (`RISC0_CUDA_WITGEN_STAGE=0` keeps them in the
+/// injector).
 static DEFER_CYCLE_COLS: LazyLock<bool> = LazyLock::new(|| {
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     return cuda_stage::enabled();
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(any(feature = "cuda", feature = "rocm")))]
     false
 });
 
@@ -107,7 +108,7 @@ impl PreflightResults {
         let (injector, bigint_rows) = build_injector(&trace, cycles);
         // Stage the trace for the GPU upload here, on the preflight thread, off the critical path.
         let tp2 = std::time::Instant::now();
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
         {
             trace.staged = cuda_stage::stage(&trace);
         }
@@ -171,10 +172,32 @@ pub(crate) struct WitnessGenerator<H: Hal> {
     bigint_rows: Vec<usize>,
 }
 
+/// Once a segment's witgen buffers are freed: let the HAL refill them in the background (beside
+/// eval_check) for a next segment of the same size, as `hal_generate_witness` (data) and `accum`
+/// allocate them. A no-op on HALs without `prefill_elem` (all but HIP), and above po2 21, where
+/// eval_check needs that memory back.
+pub(crate) fn prefill_next_segment<H, C>(hal: &H, circuit_hal: &C, cycles: usize)
+where
+    H: Hal<Field = CircuitField, Elem = Val, ExtElem = ExtVal>,
+    C: CircuitWitnessGenerator<H>,
+{
+    if cycles > 1 << 21 {
+        return;
+    }
+    let zero_data = cfg!(feature = "cuda") || circuit_hal.takes_zeroed_data();
+    let data_init = if zero_data { Val::ZERO } else { Val::INVALID };
+    hal.prefill_elem(cycles * REGCOUNT_DATA, data_init);
+    hal.prefill_elem(cycles * REGCOUNT_ACCUM, Val::INVALID);
+}
+
 impl<H> WitnessGenerator<H>
 where
     H: Hal<Field = CircuitField, Elem = Val, ExtElem = ExtVal>,
 {
+    pub fn cycles(&self) -> usize {
+        self.cycles
+    }
+
     pub fn new<C: CircuitWitnessGenerator<H>>(
         hal: &H,
         circuit_hal: &C,
@@ -273,10 +296,11 @@ where
         };
         let code = MetaBuffer::new("code", hal, cycles, REGCOUNT_CODE, false);
         let tw1 = std::time::Instant::now();
-        // On CUDA, zero-fill the data buffer instead of INVALID-filling it, so the zeroize
-        // pass over it after witgen can be skipped: the cells witgen doesn't write end up 0
-        // either way (replay-verified: the witness after zeroize is unchanged).
-        let zero_data = cfg!(feature = "cuda");
+        // On CUDA (and with circuit HALs that take it, e.g. HIP), zero-fill the data buffer
+        // instead of INVALID-filling it, so the zeroize pass over it after witgen can be skipped:
+        // the cells witgen doesn't write end up 0 either way (replay-verified: the witness after
+        // zeroize is unchanged). Not for the CPU HAL: its checked sets expect INVALID.
+        let zero_data = cfg!(feature = "cuda") || circuit_hal.takes_zeroed_data();
         let data = scope!("alloc(data)", {
             if zero_data {
                 MetaBuffer {

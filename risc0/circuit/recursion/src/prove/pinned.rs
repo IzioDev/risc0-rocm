@@ -34,8 +34,9 @@ fn host_free(ptr: usize) {
     let _ = risc0_sys::ffi_wrap(|| unsafe { risc0_circuit_recursion_cuda_host_free(p) });
 }
 
-/// HAL release hook (`risc0_zkp::hal::cuda::register_release_hook`): unless `device_only`,
-/// unpin the pooled and retired buffers (re-pinned on demand). Never blocks on the pool's lock.
+/// HAL release hook (`risc0_zkp::hal::cuda::register_release_hook`, or `hal::hip`'s): unless
+/// `device_only`, unpin the pooled and retired buffers (re-pinned on demand). Never blocks on the
+/// pool's lock.
 pub(crate) fn release(device_only: bool) {
     if device_only {
         return;
@@ -128,6 +129,22 @@ impl Drop for Pinned {
 pub(crate) struct PinnedTrace {
     buf: Pinned,
     off: [usize; 8],
+    /// ROCm: handed to the witgen upload-ahead (`stage`); forgotten there before `buf` returns
+    /// to the pool.
+    #[cfg(feature = "rocm")]
+    staged: bool,
+}
+
+#[cfg(feature = "rocm")]
+impl Drop for PinnedTrace {
+    fn drop(&mut self) {
+        if self.staged {
+            let wom = self.ptr::<u8>(0) as *const std::ffi::c_void;
+            let _ = risc0_sys::ffi_wrap(|| unsafe {
+                risc0_circuit_recursion_sys::risc0_circuit_recursion_hip_unstage(wom)
+            });
+        }
+    }
 }
 
 fn copy_par(dst: *mut u8, src: &[u8]) {
@@ -193,7 +210,51 @@ impl PinnedTrace {
                 copy_par(unsafe { buf.base().add(off[i]) }, p);
             }
         }
-        Some(PinnedTrace { buf, off })
+        Some(PinnedTrace {
+            buf,
+            off,
+            #[cfg(feature = "rocm")]
+            staged: false,
+        })
+    }
+
+    /// ROCm: start uploading these inputs to the device for the witgen of this preflight (the
+    /// sizes are the witgen's: the same arrays, and as many rows as it reads), while the GPU
+    /// proves the previous proof. Best effort: unstaged, the witgen uploads them itself.
+    #[cfg(feature = "rocm")]
+    pub(crate) fn stage(
+        &mut self,
+        num_woms: u32,
+        num_cycles: u32,
+        num_iops: u32,
+        chains: Option<&super::witgen::HostChains>,
+    ) {
+        use risc0_circuit_recursion_sys::{RawHostChains, RawPreflightTrace};
+        let trace = RawPreflightTrace {
+            wom: self.ptr(0),
+            cycles: self.ptr(1),
+            iops: self.ptr(2),
+            num_woms,
+            num_cycles,
+            num_iops,
+        };
+        let raw = chains.filter(|hc| !hc.heads.is_empty()).map(|hc| RawHostChains {
+            heads: self.ptr(3),
+            num_heads: hc.heads.len() as u32,
+            cycles: self.ptr(4),
+            rows: self.ptr(5),
+            wom_idx: self.ptr(6),
+            wom_rows: self.ptr(7),
+            num_rows: hc.cycles.len() as u32,
+            data_cols: (hc.rows.len() / hc.cycles.len().max(1)) as u32,
+        });
+        let hc = raw.as_ref().map_or(std::ptr::null(), |r| r as *const RawHostChains);
+        // Set first (unstage is a no-op for inputs that were not staged: a failed call waits
+        // for its own copies).
+        self.staged = true;
+        let _ = risc0_sys::ffi_wrap(|| unsafe {
+            risc0_circuit_recursion_sys::risc0_circuit_recursion_hip_stage(&trace, hc)
+        });
     }
 
     pub(crate) fn ptr<T>(&self, i: usize) -> *const T {

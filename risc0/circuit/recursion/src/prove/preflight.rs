@@ -128,7 +128,7 @@ pub struct Preflight {
     pub(crate) host_chains: std::sync::Mutex<Option<super::witgen::HostChains>>,
 
     /// Page-locked copy of the trace and host chains (see `host_prep_enabled`).
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     pub(crate) pinned: std::sync::Mutex<Option<super::pinned::PinnedTrace>>,
 }
 
@@ -156,7 +156,7 @@ impl Preflight {
             iop_idx: 0,
             host_witness: std::sync::Mutex::new(None),
             host_chains: std::sync::Mutex::new(None),
-            #[cfg(feature = "cuda")]
+            #[cfg(any(feature = "cuda", feature = "rocm"))]
             pinned: std::sync::Mutex::new(None),
         }
     }

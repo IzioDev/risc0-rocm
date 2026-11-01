@@ -315,7 +315,7 @@ fn build_cuda_kernels() {
 
     // Step 1: Compile eval_check_ef.cu WITHOUT -dc (standalone mode). It is the
     // generated evalfast kernel (kernels/cuda/evalfast/regen.py); ROCm builds
-    // eval_check_ef_hip.cu, an earlier output of it. Standalone,
+    // eval_check_ef_hip.cu, its ROCm output. Standalone,
     // NVCC sees the whole poly_fp call chain in one translation unit; with -dc it would
     // compile relocatable code.
     //
@@ -551,8 +551,9 @@ fn build_rocm_kernels() {
 
     // Step 1: Compile eval_check standalone with hipcc: the evalfast kernel
     // (eval_check_ef_hip.cu, see its header) unless RISC0_HIP_EVAL_CHECK=combined selects the original
-    // eval_check_combined.cu. On an RX 9070 XT (gfx1201) evalfast needs 9.3 KB of scratch per
-    // lane against the original's 16.8 KB, and a po2 20 eval_check takes ~470 ms against 845 ms.
+    // eval_check_combined.cu. A po2 20 eval_check takes ~235 ms on an RX 9070 XT (gfx1201; its poly_mix
+    // chains on the matrix units, ~257 ms without) against the original's 845 ms, and ~214 ms on an
+    // RX 7900 XTX (gfx1100).
     // For the original, -mllvm -amdgpu-early-inline-all=false prevents OOM on this large kernel
     // (21 functions, 2154 column reads).
     //
@@ -604,11 +605,14 @@ fn build_rocm_kernels() {
         "-Wno-unused-parameter",
     ];
     if evalfast {
-        // Measured on an RX 9070 XT at po2 20: 64-wide waves and an occupancy target of 4 blocks
-        // (EF_MINB, the launch bounds' minimum) take eval_check from 603 to ~470 ms. Not 8, the
-        // fastest (392 ms): ROCm 7.2 miscompiles that combination, and nearly every call after
-        // the first few returns wrong values (5, 6 and 10 were correct in 300 calls each).
-        eval_check_flags.extend(["-mwavefrontsize64", "-DEF_MINB=4"]);
+        // 64-wide waves and an occupancy target of 4 blocks (EF_MINB, the launch bounds' minimum):
+        // the fastest at po2 20 on both an RX 7900 XTX and an RX 9070 XT (3 and 5 within 2%,
+        // 32-wide waves 5-20% slower). On the previous kernel, ROCm 7.2 miscompiled EF_MINB 8:
+        // nearly every call after the first few returned wrong values (5, 6 and 10 were correct
+        // in 300 calls each). gfx11 runs 3 (EF_MINB_GFX11: 252 VGPRs, less scratch spilling) since
+        // the inlined kernel with pmlag_hip.py: ~115.7 instead of ~123.6 ms on an RX 7900 XTX (ef
+        // harness, po2 20, bit-exact); gfx12 keeps 4 (3 is ~13 ms slower on an RX 9070 XT).
+        eval_check_flags.extend(["-mwavefrontsize64", "-DEF_MINB=4", "-DEF_MINB_GFX11=3"]);
     } else {
         eval_check_flags.extend([
             "-mllvm",
@@ -652,23 +656,27 @@ fn build_rocm_kernels() {
         &format!("{eval_check_flags:?}"),
         &hipcc_key,
     ]);
-    risc0_build_kernel::cached_compile(
-        &cache_dir,
-        "eval_check_combined_standalone",
-        obj_ext,
-        &eval_check_key,
-        &eval_check_obj,
-        |out| {
-            risc0_build_kernel::hip_compile(
-                &hipcc,
-                &eval_check_flags,
-                Path::new(eval_check_src),
-                out,
-                &hip_arches,
-                Some(Path::new("kernels/cuda")),
-            )
-        },
-    );
+    // The compiles below run concurrently (each is one hipcc process; eval_check is the long
+    // pole), see the thread scope after Step 2.
+    let compile_eval_check = || {
+        risc0_build_kernel::cached_compile(
+            &cache_dir,
+            "eval_check_combined_standalone",
+            obj_ext,
+            &eval_check_key,
+            &eval_check_obj,
+            |out| {
+                risc0_build_kernel::hip_compile(
+                    &hipcc,
+                    &eval_check_flags,
+                    Path::new(eval_check_src),
+                    out,
+                    &hip_arches,
+                    Some(Path::new("kernels/cuda")),
+                )
+            },
+        )
+    };
 
     // Step 2: Single-TU amalgamation for remaining .cu files.
     // This avoids -fgpu-rdc and the problematic HIP device link step entirely.
@@ -695,7 +703,42 @@ fn build_rocm_kernels() {
             )
         })
         .collect();
-    let separate_files: Vec<PathBuf> = glob_paths("kernels/cuda/ffi_supra.cu");
+    // accum_tu.cu: stepAccum's call graph force-inlined in its own TU, as on CUDA (Step 1b).
+    // witgen_tu.cu: par_stepExec's call graph in its own TU with global buffer accesses (ffi.cu,
+    // hipWitgenTu): witgen_tu2 (the default) force-inlined with launch bounds (256, 1), and
+    // witgen_tu (RISC0_HIP_WITGEN_TU=1) inlined at the compiler's discretion with (256, 8) (the
+    // same 192-VGPR cap as par_stepExec).
+    let separate_files: Vec<(PathBuf, String, Vec<&str>)> = [
+        ("kernels/cuda/ffi_supra.cu", "ffi_supra", vec![]),
+        ("kernels/cuda/accum_tu.cu", "accum_tu", vec![]),
+        (
+            "kernels/cuda/witgen_tu.cu",
+            "witgen_tu",
+            vec![
+                "-DRISC0_HIP_GLOBAL_BUFS",
+                "-DWITGEN_TU_LB=256,8",
+                "-DWITGEN_TU_FNATTR=",
+            ],
+        ),
+        (
+            "kernels/cuda/witgen_tu.cu",
+            "witgen_tu2",
+            vec![
+                "-DRISC0_HIP_GLOBAL_BUFS",
+                "-DWITGEN_TU_LB=256,1",
+                "-DWITGEN_TU_FNATTR=__forceinline__",
+                "-DWITGEN_TU_KERNEL=par_stepExecW2",
+                "-DWITGEN_TU_LAUNCH=risc0_rv32im_launch_par_stepExecTU2",
+            ],
+        ),
+    ]
+    .into_iter()
+    .flat_map(|(p, stem, extra)| {
+        glob_paths(p)
+            .into_iter()
+            .map(move |f| (f, stem.to_string(), extra.clone()))
+    })
+    .collect();
 
     let amalg_path = out_dir.join("remaining_kernels_rocm.cu");
     let mut amalg = String::new();
@@ -729,6 +772,14 @@ fn build_rocm_kernels() {
         "-I",
         kernel_dir_str,
     ];
+    // witgen.h's non-virtual buffer objects (one indirect call less per witness access) on
+    // Linux; Windows builds, and RISC0_HIP_WITGEN_VIRTUAL=1, keep the virtual ones.
+    println!("cargo:rerun-if-env-changed=RISC0_HIP_WITGEN_VIRTUAL");
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows")
+        && env::var("RISC0_HIP_WITGEN_VIRTUAL").as_deref() != Ok("1")
+    {
+        local_flags.push("-DRISC0_HIP_DIRECT_BUFS");
+    }
     local_flags.extend(risc0_build_kernel::hip_host_flags());
     let local_sources_key = risc0_build_kernel::kernel_sources_key(
         &[
@@ -750,42 +801,57 @@ fn build_rocm_kernels() {
         &format!("{local_flags:?}"),
         &hipcc_key,
     ]);
-    risc0_build_kernel::cached_compile(
-        &cache_dir,
-        "remaining_kernels_rocm",
-        obj_ext,
-        &remaining_key,
-        &remaining_obj,
-        |out| {
-            risc0_build_kernel::hip_compile(
-                &hipcc,
-                &local_flags,
-                &amalg_path,
-                out,
-                &hip_arches,
-                None,
-            )
-        },
-    );
 
-    // Compile ffi_supra.cu separately (uses sppark types, can't be in same TU)
+    // Compile ffi_supra.cu (uses sppark types, can't be in same TU) and the TUs above separately.
     // Also cached
-    let mut all_objs = vec![eval_check_obj.clone(), remaining_obj];
-    for cu in &separate_files {
-        let stem = cu.file_stem().unwrap().to_str().unwrap();
-        let obj = out_dir.join(format!("{stem}.{obj_ext}"));
-        let key = risc0_build_kernel::hash_key(&[
-            "rv32im-rocm-separate-v1",
-            &local_sources_key,
-            &cu.to_string_lossy(),
-            &format!("{local_flags:?}"),
-            &hipcc_key,
-        ]);
-        risc0_build_kernel::cached_compile(&cache_dir, stem, obj_ext, &key, &obj, |out| {
-            risc0_build_kernel::hip_compile(&hipcc, &local_flags, cu, out, &hip_arches, None)
+    let separate_jobs: Vec<(PathBuf, String, PathBuf, Vec<&str>, String)> = separate_files
+        .iter()
+        .map(|(cu, stem, extra)| {
+            let obj = out_dir.join(format!("{stem}.{obj_ext}"));
+            let mut flags = local_flags.clone();
+            flags.extend(extra.iter().copied());
+            let key = risc0_build_kernel::hash_key(&[
+                "rv32im-rocm-separate-v1",
+                &local_sources_key,
+                &cu.to_string_lossy(),
+                &format!("{flags:?}"),
+                &hipcc_key,
+            ]);
+            (cu.clone(), stem.clone(), obj, flags, key)
+        })
+        .collect();
+    std::thread::scope(|sc| {
+        sc.spawn(compile_eval_check);
+        sc.spawn(|| {
+            risc0_build_kernel::cached_compile(
+                &cache_dir,
+                "remaining_kernels_rocm",
+                obj_ext,
+                &remaining_key,
+                &remaining_obj,
+                |out| {
+                    risc0_build_kernel::hip_compile(
+                        &hipcc,
+                        &local_flags,
+                        &amalg_path,
+                        out,
+                        &hip_arches,
+                        None,
+                    )
+                },
+            )
         });
-        all_objs.push(obj);
-    }
+        for (cu, stem, obj, flags, key) in &separate_jobs {
+            let (cache_dir, hipcc, hip_arches) = (&cache_dir, &hipcc, &hip_arches);
+            sc.spawn(move || {
+                risc0_build_kernel::cached_compile(cache_dir, stem, obj_ext, key, obj, |out| {
+                    risc0_build_kernel::hip_compile(hipcc, flags, cu, out, hip_arches, None)
+                })
+            });
+        }
+    });
+    let mut all_objs = vec![eval_check_obj.clone(), remaining_obj];
+    all_objs.extend(separate_jobs.iter().map(|j| j.2.clone()));
 
     // Step 3: Archive all objects
     let _ = std::fs::remove_file(out_dir.join(format!("lib{output}.a")));

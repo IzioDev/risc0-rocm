@@ -157,6 +157,10 @@ impl ProverImpl {
                 *warmup = CudaWarmup::Running(spawn_cuda_warmup());
             }
         }
+        // ROCm: pick the per-arch HW queue count on this thread, before
+        // the warmup threads make the first HIP call.
+        #[cfg(feature = "rocm")]
+        risc0_zkp::hal::hip::auto_configure_hw_queues();
         // Parse the Groth16 witness graph (and build its parallel schedule) while the guest
         // executes instead of beside the STARK.
         #[cfg(feature = "cuda")]
@@ -641,17 +645,30 @@ impl ProverImpl {
             .as_ref()
             .ok_or_else(|| anyhow!("segment receipt verifier parameters missing from context"))?
             .digest();
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
         type LiftPrepOpt = Option<rec_pipe::Prep>;
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(any(feature = "cuda", feature = "rocm")))]
         type LiftPrepOpt = Option<()>;
         let mut pending_receipt: Option<
             std::thread::JoinHandle<Result<(SegmentReceipt, LiftPrepOpt)>>,
         > = None;
-        // Lift/join during segment proving (see rec_pipe).
-        #[cfg(feature = "cuda")]
+        // Lift/join during segment proving (see rec_pipe). On ROCm only when RISC0_CUDA_REC_PIPE=1
+        // asks for it, and not with a recursion device (the multi-GPU recursion worker below lifts
+        // and joins instead). There a segment proof finalizes inline (prove_begin returns with
+        // the GPU done), so lifting between segments overlaps no GPU work: it saved ~0.1 s of
+        // 20 s on fib 1M on an RX 7900 XTX and nothing on general-compute, and on a 16 GB RX 9070
+        // XT with the Groth16 prover resident (a succinct proof after a Groth16 wrap) it made
+        // every segment ~40 ms slower (presumably the buffer pool, whose segment and recursion
+        // buffers no longer fit side by side; see release_pool_unless_fits).
+        #[cfg(feature = "rocm")]
+        let rec_pipe_ok = risc0_zkp::hal::hip::recursion_device().is_none()
+            && std::env::var("RISC0_CUDA_REC_PIPE").as_deref() == Ok("1");
+        #[cfg(all(feature = "cuda", not(feature = "rocm")))]
+        let rec_pipe_ok = true;
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
         let mut rec_pipe: Option<rec_pipe::RecPipe> = {
             if rec_pipe::enabled()
+                && rec_pipe_ok
                 && self.opts.receipt_kind != ReceiptKind::Composite
                 && session.povw_job_id.is_none()
                 && session.assumptions.is_empty()
@@ -669,13 +686,13 @@ impl ProverImpl {
                 None
             }
         };
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
         let lift_opts: Option<ProverOpts> = rec_pipe.as_ref().map(|p| p.opts());
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
         let early_seal = rec_pipe.is_some();
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(any(feature = "cuda", feature = "rocm")))]
         let early_seal = false;
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(any(feature = "cuda", feature = "rocm")))]
         let lift_opts: Option<ProverOpts> = None;
         // Metadata from the previous iteration, paired with the seal returned by prove_begin.
         let mut prev_seal_meta: Option<(u32, u32, Option<Output>, String)> = None;
@@ -798,7 +815,7 @@ impl ProverImpl {
             } else {
                 // First segment: compute synchronously.
                 let segment = segment_ref.resolve()?;
-                #[cfg(feature = "cuda")]
+                #[cfg(any(feature = "cuda", feature = "rocm"))]
                 let results = if rec_pipe.is_some() {
                     // Commit the recursion ctrl groups on the idle GPU while the CPU runs the
                     // first segment's preflight (for the recursion pipe, which lifts during the
@@ -839,6 +856,7 @@ impl ProverImpl {
                         if let Some(handle) = warmup_handle.take() {
                             let _ = handle.join();
                         }
+                        #[cfg(feature = "cuda")]
                         join_cuda_rec_warmup();
                         let tw = t.elapsed().as_secs_f64() * 1e3;
                         let r = crate::host::recursion::prove::Prover::prewarm(&[po2], &ropts, g16);
@@ -857,7 +875,7 @@ impl ProverImpl {
                 } else {
                     self.segment_preflight(&segment)?
                 };
-                #[cfg(not(feature = "cuda"))]
+                #[cfg(not(any(feature = "cuda", feature = "rocm")))]
                 let results = self.segment_preflight(&segment)?;
                 (segment, results)
             };
@@ -948,12 +966,12 @@ impl ProverImpl {
                     if let Some(ref tx) = recursion_tx {
                         let _ = tx.send(receipt.clone());
                     }
-                    #[cfg(feature = "cuda")]
+                    #[cfg(any(feature = "cuda", feature = "rocm"))]
                     if let (Some(p), Some(prep)) = (rec_pipe.as_mut(), _prep) {
                         p.add(segments.len(), prep, Some(receipt.claim.clone()));
                     }
                     segments.push(receipt);
-                    #[cfg(feature = "cuda")]
+                    #[cfg(any(feature = "cuda", feature = "rocm"))]
                     if let Some(p) = rec_pipe.as_mut() {
                         p.poll()?;
                     }
@@ -977,10 +995,10 @@ impl ProverImpl {
                         claim,
                         verifier_parameters: vp_digest,
                     };
-                    #[cfg(feature = "cuda")]
+                    #[cfg(any(feature = "cuda", feature = "rocm"))]
                     let prep =
                         lift_opts_copy.map(|o| rec_pipe::spawn_lift_prep(receipt.clone(), o));
-                    #[cfg(not(feature = "cuda"))]
+                    #[cfg(not(any(feature = "cuda", feature = "rocm")))]
                     let prep = {
                         let _ = lift_opts_copy;
                         None
@@ -1031,7 +1049,7 @@ impl ProverImpl {
                 let (receipt, _prep) = handle
                     .join()
                     .map_err(|_| anyhow!("receipt thread panicked"))??;
-                #[cfg(feature = "cuda")]
+                #[cfg(any(feature = "cuda", feature = "rocm"))]
                 if let (Some(p), Some(prep)) = (rec_pipe.as_mut(), _prep) {
                     p.add(segments.len(), prep, None);
                     p.poll()?;
@@ -1313,7 +1331,7 @@ impl ProverImpl {
                     let unwrapped = self.unwrap_povw(&work_receipt)?;
                     (unwrapped, Some(work_receipt), None)
                 }
-                #[cfg(feature = "cuda")]
+                #[cfg(any(feature = "cuda", feature = "rocm"))]
                 false if rec_pipe.is_some() => {
                     let n = composite_receipt.segments.len();
                     let last = composite_receipt.segments.last().unwrap().claim.clone();
@@ -1820,6 +1838,37 @@ impl ProverServer for ProverImpl {
                 } else {
                     None
                 };
+            // ROCm: the programs' first use, off the GPU's critical path. A background thread
+            // loads the join program and the other segment po2s' lift programs and builds their
+            // host ctrl (else ~15 ms of program load on this thread before the first join and
+            // before the last lift, and ~15 ms of host ctrl in each one's first witgen), and this
+            // thread uploads and commits lift0's program's ctrl while the first preparations run
+            // (the GPU idles until lift0's is done). RISC0_REC_WARM=0: off.
+            #[cfg(feature = "rocm")]
+            if std::env::var("RISC0_REC_WARM").as_deref() != Ok("0") {
+                let mut po2s: Vec<usize> = Vec::new();
+                for seg in segments.iter() {
+                    if let Ok(p) = RecursionProverJob::lift_po2(seg) {
+                        if !po2s.contains(&p) {
+                            po2s.push(p);
+                        }
+                    }
+                }
+                let rest: Vec<usize> = po2s.iter().skip(1).copied().collect();
+                let opts = recursion_opts.clone();
+                let _ = std::thread::Builder::new()
+                    .name("rec-preload".into())
+                    .spawn(move || {
+                        if let Err(e) = RecursionProverJob::preload(&rest, &opts) {
+                            tracing::debug!("recursion preload: {e}");
+                        }
+                    });
+                if let Some(&p) = po2s.first() {
+                    if let Err(e) = RecursionProverJob::prewarm_lift(p, &recursion_opts) {
+                        tracing::debug!("recursion prewarm: {e}");
+                    }
+                }
+            }
             let mut acc = finish_lift(h0, 0)?;
             let mut cur = finish_lift(h1, 1)?;
             if *VERBOSE {
@@ -1934,7 +1983,7 @@ impl ProverServer for ProverImpl {
         }
 
         eprintln!(
-            "[composite_to_succinct] lift/join done: {:.1}s",
+            "[composite_to_succinct] lift/join done: {:.3}s",
             t_pipeline.elapsed().as_secs_f64()
         );
 
@@ -2018,7 +2067,7 @@ fn release_pool_on_po2_growth(po2: u32) {
 /// every preparation (preflight + host chains) on background threads. Each join's preparation
 /// starts as soon as its left input exists (streaming the right input in when its lift
 /// finishes), and ready joins run before lifts.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 mod rec_pipe {
     use super::*;
     use crate::host::recursion::prove::{make_succinct_receipt, Prover as Job};
@@ -2152,6 +2201,7 @@ mod rec_pipe {
 
         fn warm(&mut self) {
             if !self.warmed {
+                #[cfg(feature = "cuda")]
                 join_cuda_rec_warmup();
                 self.warmed = true;
             }
@@ -2349,6 +2399,13 @@ mod rec_pipe {
                 t.elapsed().as_secs_f64() * 1e3,
                 self.gpu_ms,
                 now_ms()
+            );
+            // ROCm: like composite_to_succinct's "lift/join done" line, for the benchmarks.
+            #[cfg(feature = "rocm")]
+            eprintln!(
+                "[rec_pipe] {num_segments} segments: tail {:.3}s, lift/join runs {:.3}s",
+                t.elapsed().as_secs_f64(),
+                self.gpu_ms / 1e3
             );
             self.acc
                 .take()

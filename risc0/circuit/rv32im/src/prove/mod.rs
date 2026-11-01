@@ -110,6 +110,7 @@ pub fn segment_prover() -> Result<Box<dyn SegmentProver>> {
 pub fn rocm_warmup() {
     use risc0_sys::ffi_wrap;
     // Initialize HIP runtime and select the thread's device.
+    risc0_zkp::hal::hip::auto_configure_hw_queues();
     unsafe {
         risc0_sys::hip::hipInit(0);
         risc0_sys::hip::hipSetDevice(risc0_zkp::hal::hip::get_device_for_thread());

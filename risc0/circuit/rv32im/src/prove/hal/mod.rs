@@ -54,7 +54,7 @@ use risc0_zkp::{
 };
 
 use super::{
-    witgen::{preflight::PreflightTrace, PreflightResults, WitnessGenerator},
+    witgen::{preflight::PreflightTrace, prefill_next_segment, PreflightResults, WitnessGenerator},
     Seal, SegmentProver,
 };
 use crate::{
@@ -109,6 +109,13 @@ pub(crate) trait CircuitWitnessGenerator<H: Hal> {
     /// Whether `generate_witness` writes the per-cycle columns (witgen::CYCLE_COLS) itself
     /// when the trace defers them (`PreflightTrace::cycle_cols_deferred`).
     fn writes_cycle_cols(&self) -> bool {
+        false
+    }
+
+    /// Whether `generate_witness` can take a zero-filled data buffer instead of an INVALID-filled
+    /// one (see `WitnessGenerator::hal_generate_witness`): its writes are not checked against
+    /// the cells' initial value.
+    fn takes_zeroed_data(&self) -> bool {
         false
     }
 
@@ -349,7 +356,9 @@ where
             // but that keeps witgen live across eval_check's peak VRAM use.
             // Free the host-side trace while eval_check runs (see prove_begin).
             let trace = std::mem::take(&mut witgen.trace);
+            let cycles = witgen.cycles();
             drop(witgen);
+            prefill_next_segment(hal.as_ref(), circuit_hal.as_ref(), cycles);
 
             let t3 = std::time::Instant::now();
             let result = prover.finalize_with_hook(
@@ -471,7 +480,9 @@ where
         // which runs while eval_check is on the GPU, not on the critical path
         // (~13 ms/segment at po2=20 on Intel).
         let trace = std::mem::take(&mut witgen.trace);
+        let cycles = witgen.cycles();
         drop(witgen);
+        prefill_next_segment(hal.as_ref(), circuit_hal.as_ref(), cycles);
 
         let t_main = t0.elapsed();
 

@@ -20,9 +20,9 @@ extern __constant__ FpExt poly_mix[158];
 
 namespace risc0::circuit::recursion::cuda {
 
-#ifndef __HIPCC__
 // eval_check_split.cu: the same polynomial in several smaller kernels (RISC0_CUDA_REC_KERNELS=0
-// restores the single kernel; the same switch controls the inlined accum kernels in ffi.cu).
+// restores the single kernel; the same switch controls the inlined accum kernels in
+// ffi.cu).
 void eval_check_split(cudaStream_t stream, Fp* check, const Fp* ctrl, const Fp* data, const Fp* accum,
                       const Fp* mix, const Fp* out, Fp rou, uint32_t po2, uint32_t domain,
                       const void* poly_mix_host);
@@ -30,7 +30,6 @@ static bool use_split() {
   static const bool on = [] { const char* e = getenv("RISC0_CUDA_REC_KERNELS"); return !(e && e[0] == '0'); }();
   return on;
 }
-#endif
 
 __device__ FpExt poly_fp(uint32_t idx,
                          uint32_t size,
@@ -84,6 +83,12 @@ extern "C" const char* risc0_circuit_recursion_cuda_eval_check(Fp* check,
   try {
     cudaStream_t stream = getPersistentStream();
     LaunchConfig cfg = getSimpleConfig(domain);
+    if (risc0::circuit::recursion::cuda::use_split()) {
+      // Uploads poly_mix to its own module's symbol (this one's is not read).
+      risc0::circuit::recursion::cuda::eval_check_split(stream, check, ctrl, data, accum, mix, out, rou,
+                                                        po2, domain, poly_mix_pows);
+      return nullptr;
+    }
 #ifdef __HIPCC__
     {
       void* dev_ptr = nullptr;
@@ -91,12 +96,6 @@ extern "C" const char* risc0_circuit_recursion_cuda_eval_check(Fp* check,
       hipMemcpyAsync(dev_ptr, poly_mix_pows, sizeof(poly_mix), hipMemcpyHostToDevice, stream);
     }
 #else
-    if (risc0::circuit::recursion::cuda::use_split()) {
-      // Uploads poly_mix to its own module's symbol (this one's is not read).
-      risc0::circuit::recursion::cuda::eval_check_split(stream, check, ctrl, data, accum, mix, out, rou,
-                                                        po2, domain, poly_mix_pows);
-      return nullptr;
-    }
     // Async memcpy on the same stream avoids a host-blocking sync that
     // serializes the persistent stream against the host. Stage into a
     // persistent host buffer so the source remains valid across the async

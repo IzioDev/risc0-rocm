@@ -17,7 +17,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use risc0_circuit_rv32im_sys::{
     risc0_circuit_rv32im_cuda_accum, risc0_circuit_rv32im_cuda_eval_check,
-    risc0_circuit_rv32im_cuda_witgen, RawAccumBuffers, RawBuffer, RawExecBuffers,
+    risc0_circuit_rv32im_cuda_witgen_v2, RawAccumBuffers, RawBuffer, RawExecBuffers,
     RawPreflightTrace,
 };
 use risc0_core::{
@@ -53,11 +53,27 @@ pub struct HipCircuitHal<HH: HipHash> {
 
 impl<HH: HipHash> HipCircuitHal<HH> {
     pub fn new(_hal: Arc<HipHal<HH>>) -> Self {
+        risc0_zkp::hal::hip::register_release_hook(super::super::witgen::cuda_stage::release);
+        // RISC0_HIP_PREFETCH_ROWS=1: also start the next segment's staged preflight copy at the
+        // row hashes of a commit (rows_k, tens of ms), as soon as it is staged. On an RX 9070 XT
+        // the copy (~8.7 ms at po2=20) slows every short kernel beside it (~2 -> ~125 us each),
+        // which before eval_check stretches its prologue by ~1-2 ms.
+        if matches!(std::env::var("RISC0_HIP_PREFETCH_ROWS").as_deref(), Ok(v) if v.starts_with('1')) {
+            risc0_zkp::hal::hip::register_hash_rows_hook(super::super::witgen::cuda_stage::prefetch_ready);
+        }
         Self { _hal }
     }
 }
 
 impl<HH: HipHash> CircuitWitnessGenerator<HipHal<HH>> for HipCircuitHal<HH> {
+    fn writes_cycle_cols(&self) -> bool {
+        true
+    }
+
+    fn takes_zeroed_data(&self) -> bool {
+        true
+    }
+
     fn generate_witness(
         &self,
         mode: StepMode,
@@ -99,6 +115,17 @@ impl<HH: HipHash> CircuitWitnessGenerator<HipHal<HH>> for HipCircuitHal<HH> {
             },
         };
 
+        // The staged slot is owned by `preflight` (the trace), which outlives the stream work.
+        let (staged, staged_id) = preflight
+            .staged
+            .as_ref()
+            .and_then(|s| s.ptr_for(preflight).map(|p| (p, s.id)))
+            .unwrap_or((std::ptr::null(), 0));
+        let cycle_cols = if preflight.cycle_cols_deferred {
+            crate::prove::witgen::CYCLE_COLS.as_ptr()
+        } else {
+            std::ptr::null()
+        };
         let preflight = RawPreflightTrace {
             cycles: preflight.cycles.as_ptr(),
             txns: preflight.txns.as_ptr(),
@@ -108,7 +135,15 @@ impl<HH: HipHash> CircuitWitnessGenerator<HipHal<HH>> for HipCircuitHal<HH> {
             table_split_cycle: preflight.table_split_cycle,
         };
         ffi_wrap(|| unsafe {
-            risc0_circuit_rv32im_cuda_witgen(mode as u32, &buffers, &preflight, cycles as u32)
+            risc0_circuit_rv32im_cuda_witgen_v2(
+                mode as u32,
+                &buffers,
+                &preflight,
+                cycles as u32,
+                staged,
+                cycle_cols,
+                staged_id,
+            )
         })
     }
 }
@@ -164,6 +199,10 @@ impl<HH: HipHash> CircuitAccumulator<HipHal<HH>> for HipCircuitHal<HH> {
             table_split_cycle: preflight.table_split_cycle,
         };
         ffi_wrap(|| unsafe { risc0_circuit_rv32im_cuda_accum(&buffers, &preflight, cycles as u32) })
+    }
+
+    fn step_accum_zeroizes(&self) -> bool {
+        unsafe { risc0_circuit_rv32im_sys::risc0_circuit_rv32im_cuda_accum_zeroizes() != 0 }
     }
 }
 
@@ -221,6 +260,10 @@ impl<HH: HipHash> CircuitHal<HipHal<HH>> for HipCircuitHal<HH> {
                 .try_into()
                 .unwrap();
 
+        // Start the next segment's staged preflight copy (~8.7 ms at po2=20) here, so it overlaps
+        // eval_check (one kernel the host waits for, ~290 ms on an RX 7900 XTX) rather than the
+        // finalize as on CUDA. Traces staged later still go at eval_check_dep.
+        crate::prove::witgen::cuda_stage::prefetch_ready();
         ffi_wrap(|| unsafe {
             risc0_circuit_rv32im_cuda_eval_check(
                 check.as_device_ptr(),
@@ -243,6 +286,9 @@ impl<HH: HipHash> CircuitHal<HipHal<HH>> for HipCircuitHal<HH> {
             fn risc0_circuit_rv32im_cuda_eval_check_dep() -> *const std::os::raw::c_char;
         }
         risc0_sys::ffi_wrap(|| unsafe { risc0_circuit_rv32im_cuda_eval_check_dep() }).unwrap();
+        // eval_check is done: copy the next segment's staged preflight (if the preflight thread
+        // has finished it) while this segment's finalize kernels run.
+        crate::prove::witgen::cuda_stage::prefetch_ready();
     }
 }
 

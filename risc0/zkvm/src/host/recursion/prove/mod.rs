@@ -695,6 +695,19 @@ impl Prover {
         Ok(prover)
     }
 
+    /// The po2 of the lift program for `segment` (its rv32im seal's po2), as `new_lift` reads it.
+    pub fn lift_po2(segment: &SegmentReceipt) -> Result<usize> {
+        let inner_hash_suite = hash_suite_from_name(&segment.hashfn)
+            .ok_or_else(|| anyhow!("unsupported hash function: {}", segment.hashfn))?;
+        ensure!(
+            segment.seal.first() == Some(&RV32IM_SEAL_VERSION),
+            "seal version mismatch"
+        );
+        let mut iop = ReadIOP::new(&segment.seal[1..], inner_hash_suite.rng.as_ref());
+        iop.read_field_elem_slice::<BabyBearElem>(risc0_circuit_rv32im::CircuitImpl::OUTPUT_SIZE)?;
+        Ok(*iop.read_u32s(1)?.first().unwrap() as usize)
+    }
+
     /// Initialize a recursion prover with the lift program to transform an rv32im segment receipt
     /// into a recursion receipt.
     ///
@@ -1129,6 +1142,24 @@ impl Prover {
             risc0_circuit_recursion::prove::Prover::new(program, "poseidon_254").prewarm()?;
         }
         Ok(())
+    }
+
+    /// Load the join program and the lift programs of `po2s` and build their host ctrl (no
+    /// device work, for a background thread: [Self::prewarm_lift] does the device part).
+    pub fn preload(po2s: &[usize], opts: &ProverOpts) -> Result<()> {
+        let (program, _) = zkr::join(&opts.hashfn)?;
+        risc0_circuit_recursion::prove::Prover::new(program, &opts.hashfn).prewarm_host();
+        for &po2 in po2s {
+            let (program, _) = zkr::lift(po2, &opts.hashfn)?;
+            risc0_circuit_recursion::prove::Prover::new(program, &opts.hashfn).prewarm_host();
+        }
+        Ok(())
+    }
+
+    /// Upload and commit the ctrl of the lift program of `po2` on this thread's cached prover.
+    pub fn prewarm_lift(po2: usize, opts: &ProverOpts) -> Result<()> {
+        let (program, _) = zkr::lift(po2, &opts.hashfn)?;
+        risc0_circuit_recursion::prove::Prover::new(program, &opts.hashfn).prewarm()
     }
 
     /// Pre-compute the CPU preflight for pipelining. Can be called from any thread.

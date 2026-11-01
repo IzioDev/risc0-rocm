@@ -51,11 +51,13 @@ struct ExecContext {
   size_t cycle;
 };
 
-#ifdef __HIPCC__
-// HIP keeps the virtual buffer objects: with the non-virtual ones below, HIP (7.2, gfx1201)
-// witness generation differs from the CPU's in a fraction of the data cells, although
-// every object is constructed with its own kind. Not root-caused; the change is a CUDA
-// optimization.
+#if defined(__HIPCC__) && !defined(RISC0_HIP_ROWS_PRIVATE) && !defined(RISC0_HIP_DIRECT_BUFS)
+// HIP keeps the virtual buffer objects unless build.rs defines RISC0_HIP_DIRECT_BUFS (Linux):
+// with the non-virtual ones below, HIP SDK 7.2 (gfx1201) witness generation differed from the
+// CPU's in a fraction of the data cells, although every object is constructed with its own
+// kind. Not root-caused. With ROCm 7.2.4 on Linux they match the CPU (hip_matches_cpu) and
+// prove (gfx1100, gfx1201), at a third less par_stepExec time. A TU that reads no row another
+// thread of its launch writes (accum_tu.cu) defines RISC0_HIP_ROWS_PRIVATE and gets them too.
 struct BufferObj {
   __device__ virtual Val load(ExecContext& ctx, size_t col, size_t back) = 0;
   __device__ virtual void store(ExecContext& ctx, size_t col, Val val) = 0;
