@@ -73,6 +73,15 @@ static bool p254_large_grf(sycl::queue& q) {
     return large;
 }
 
+// Threads for n outputs, 16 per thread, in a multiple of 16 threads: from 1024 threads on, SYCL
+// otherwise launches the range-rounding wrapper kernel, which the driver fails to build for these
+// kernels (UR_RESULT_ERROR_PROGRAM_LINK_FAILURE, "Internal linker error", after 105 s on an Arc
+// B580). The extra threads return at the kernels' bounds checks. Power-of-two sizes from 256 up
+// are already a multiple.
+static uint32_t p254_threads(uint32_t n) {
+    return ((n + 15) / 16 + 15) / 16 * 16;
+}
+
 // Each kernel is an unnamed lambda in a launcher templated on the GRF size, which gives each size a
 // kernel of its own. Named kernels would cost a card's first proof: the compiler puts a named
 // kernel and SYCL's range-rounding wrapper of it into one device image, and the driver compiles
@@ -81,7 +90,7 @@ static bool p254_large_grf(sycl::queue& q) {
 template <int GRF>
 static void poseidon254_fold_launch(sycl::queue& q, uint32_t* d_out,
                                     const uint32_t* d_in, uint32_t count) {
-    uint32_t num_threads = (count + 15) / 16;
+    uint32_t num_threads = p254_threads(count);
     const uint32_t* pc = g_d_p254_sparse;
 
     q.parallel_for(sycl::range<1>(num_threads),
@@ -137,7 +146,7 @@ template <int GRF>
 static void poseidon254_rows_launch(sycl::queue& q, uint32_t* d_out,
                                     const uint32_t* d_matrix,
                                     uint32_t row_size, uint32_t col_size) {
-    uint32_t num_threads = (row_size + 15) / 16;
+    uint32_t num_threads = p254_threads(row_size);
     const uint32_t* pc = g_d_p254_sparse;
 
     q.parallel_for(sycl::range<1>(num_threads),
