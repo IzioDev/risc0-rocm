@@ -11,6 +11,9 @@
 #include <cstdlib>
 #include <algorithm>
 #include <deque>
+#include <atomic>
+#include <chrono>
+#include <thread>
 
 // On Windows, Level Zero's USM pool off, set while this library loads (before any thread runs,
 // and before SYCL initializes Level Zero, which reads it then). The HAL pools device buffers
@@ -211,6 +214,49 @@ extern "C" {
 static sycl::device* g_shared_device = nullptr;
 static sycl::context* g_shared_context = nullptr;
 
+// Keep-alive on Windows: a thread that fills 4 bytes on its own queue in the shared context every
+// RISC0_INTEL_KEEPALIVE_MS (default 50; 0 turns it off).
+//
+// On an Arc A770 under Windows (driver 32.0.101.9150), about one proof in three stalled once for
+// 71 s: the waiting thread sat in the driver's fence wait (urEventWait ->
+// NtGdiDdDDIWaitForSynchronizationObjectFromCpu) with the CPU and GPU idle, then went on. Nothing
+// else completes on the engine while the prover waits, so a completion signal the wait misses is
+// only noticed when the driver times out. With the fills completing every 50 ms: no stall in 8
+// runs of the six benchmark programs (48 proofs), against 5 stalls in 8 runs without, and no
+// measurable cost (440 s per run either way).
+#ifdef _WIN32
+static std::atomic<bool> g_keepalive_stop{false};
+static std::atomic<bool> g_keepalive_done{false};
+
+static void start_keepalive() {
+    const char* s = std::getenv("RISC0_INTEL_KEEPALIVE_MS");
+    const int ms = s ? std::atoi(s) : 50;
+    if (ms <= 0) return;
+    std::thread([ms] {
+        try {
+            sycl::queue q(*g_shared_context, *g_shared_device, sycl::property_list{
+                sycl::property::queue::in_order{}});
+            uint32_t* p = sycl::malloc_device<uint32_t>(1, q);
+            while (!g_keepalive_stop.load()) {
+                q.memset(p, 0, sizeof(uint32_t)).wait();
+                std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+            }
+            sycl::free(p, q);
+        } catch (...) {
+        }
+        g_keepalive_done.store(true);
+    }).detach();
+    // Stop it at exit, before the SYCL runtime is torn down under it.
+    std::atexit([] {
+        g_keepalive_stop.store(true);
+        for (int i = 0; i < 100 && !g_keepalive_done.load(); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    });
+}
+#else
+static void start_keepalive() {}
+#endif
+
 void* esimd_create_queue() {
     try {
         if (!g_shared_device) {
@@ -221,6 +267,7 @@ void* esimd_create_queue() {
                     name.find("0xe2") != std::string::npos) {
                     g_shared_device = new sycl::device(d);
                     g_shared_context = new sycl::context(*g_shared_device);
+                    start_keepalive();
                     break;
                 }
             }
