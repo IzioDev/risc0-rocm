@@ -41,6 +41,9 @@ extern "C" {
 
     pub fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> c_int;
 
+    pub fn hipHostMalloc(ptr: *mut *mut c_void, size: usize, flags: u32) -> c_int;
+    pub fn hipHostFree(ptr: *mut c_void) -> c_int;
+
     pub fn hipGetErrorString(error: c_int) -> *const std::os::raw::c_char;
     pub fn hipGetLastError() -> c_int;
 }

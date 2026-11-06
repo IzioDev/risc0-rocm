@@ -103,6 +103,27 @@ pub fn segment_prover() -> Result<Box<dyn SegmentProver>> {
     }
 }
 
+/// Make one pinned host allocation, once per process, before HIP work goes to other threads.
+///
+/// On Windows, HIP deadlocks when a process's first pinned host allocation (`hipHostMalloc`)
+/// races its first kernel launch and stream sync on another thread: both wait for good on a
+/// runtime lock, with the CPU and GPU idle. `prove_session_impl` hits exactly that: the
+/// `rocm_warmup` thread launches and syncs while segment 0's preflight allocates its pinned
+/// witgen slots, so every proof hung on an RX 9070 XT. One allocation first (on any thread,
+/// before the race) avoids it; `hipInit` and `hipSetDevice` alone do not.
+#[cfg(feature = "rocm")]
+pub fn rocm_prime_host_alloc() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        risc0_sys::hip::hipInit(0);
+        risc0_sys::hip::hipSetDevice(risc0_zkp::hal::hip::get_device_for_thread());
+        let mut p = std::ptr::null_mut();
+        if risc0_sys::hip::hipHostMalloc(&mut p, 1 << 20, 0) == risc0_sys::hip::HIP_SUCCESS {
+            risc0_sys::hip::hipHostFree(p);
+        }
+    });
+}
+
 /// Trigger HIP module loading so the first kernel launch doesn't stall.
 /// This is a no-op on non-ROCm builds. Mirrors cuda_warmup() but adds
 /// hipInit/hipSetDevice for HIP runtime initialization.
