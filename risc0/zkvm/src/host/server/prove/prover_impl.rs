@@ -196,6 +196,8 @@ impl ProverImpl {
         };
 
         // Warmup both GPUs sequentially (sppark init has shared static state).
+        #[cfg(target_os = "windows")]
+        risc0_circuit_rv32im::prove::rocm_prime_host_alloc();
         let warmup0 = std::thread::spawn(|| {
             risc0_zkp::hal::hip::switch_to_device(0);
             risc0_circuit_rv32im::prove::rocm_warmup();
@@ -590,6 +592,10 @@ impl ProverImpl {
                 ));
             }
         }
+        // Windows HIP deadlocks if the warmup's first launch races segment 0's first pinned
+        // allocation (see `rocm_prime_host_alloc`).
+        #[cfg(all(feature = "rocm", target_os = "windows"))]
+        risc0_circuit_rv32im::prove::rocm_prime_host_alloc();
         #[cfg(feature = "rocm")]
         let mut warmup_handle = Some(std::thread::spawn(|| {
             risc0_circuit_rv32im::prove::rocm_warmup();
