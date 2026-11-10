@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(unix)]
 mod actors;
+#[cfg(unix)]
 mod api;
 
 use std::{io, net::SocketAddr, path::PathBuf, rc::Rc};
@@ -24,6 +26,7 @@ use risc0_zkvm::{
     ProverServer, VerifierContext,
 };
 
+#[cfg(unix)]
 use self::actors::protocol::TaskKind;
 
 /// Runs a RISC-V ELF binary within the RISC Zero ZKVM.
@@ -125,6 +128,7 @@ struct Mode {
     manager: bool,
 
     /// Start a worker.
+    #[cfg(unix)]
     #[arg(long, value_enum, value_delimiter(','))]
     worker: Vec<TaskKind>,
 
@@ -153,6 +157,13 @@ enum ReceiptKind {
 pub fn main() {
     let args = Cli::parse();
 
+    #[cfg(not(unix))]
+    if args.mode.manager || args.mode.rpc || args.mode.config.is_some() {
+        eprintln!("Manager, worker, and RPC modes require Unix");
+        std::process::exit(2);
+    }
+
+    #[cfg(unix)]
     if args.mode.manager || !args.mode.worker.is_empty() || args.mode.config.is_some() {
         self::actors::async_main(&args).unwrap();
         return;
@@ -162,6 +173,7 @@ pub fn main() {
         .with_env_filter(tracing_subscriber::filter::EnvFilter::from_default_env())
         .init();
 
+    #[cfg(unix)]
     if args.mode.rpc {
         self::actors::rpc_main(args.num_gpus).unwrap();
         return;
