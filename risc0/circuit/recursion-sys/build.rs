@@ -487,7 +487,7 @@ fn build_rocm_kernels() {
     }
     let hipcc = risc0_build_kernel::find_hipcc();
     let out_dir = env::var("OUT_DIR").map(PathBuf::from).unwrap();
-    let kernel_dir = std::fs::canonicalize("kernels/cuda").unwrap();
+    let kernel_dir = std::path::absolute("kernels/cuda").unwrap();
 
     // Single-TU approach: amalgamate all .cu files EXCEPT ffi_supra.cu, eval_check.cu, sppark.cu
     // and eval_check_split.cu (which use sppark types that conflict with risc0's fpext.h in the
