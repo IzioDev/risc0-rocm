@@ -612,7 +612,10 @@ fn build_rocm_kernels() {
         // in 300 calls each). gfx11 runs 3 (EF_MINB_GFX11: 252 VGPRs, less scratch spilling) since
         // the inlined kernel with pmlag_hip.py: ~115.7 instead of ~123.6 ms on an RX 7900 XTX (ef
         // harness, po2 20, bit-exact); gfx12 keeps 4 (3 is ~13 ms slower on an RX 9070 XT).
-        eval_check_flags.extend(["-mwavefrontsize64", "-DEF_MINB=4", "-DEF_MINB_GFX11=3"]);
+        if !cfg!(windows) {
+            eval_check_flags.push("-mwavefrontsize64");
+        }
+        eval_check_flags.extend(["-DEF_MINB=4", "-DEF_MINB_GFX11=3"]);
     } else {
         eval_check_flags.extend([
             "-mllvm",
